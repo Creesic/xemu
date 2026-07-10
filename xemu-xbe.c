@@ -135,3 +135,8 @@ struct xbe *xemu_get_xbe_info(void)
 
     return &xbe;
 }
+
+ssize_t xemu_virt_dma_memory_read(uint32_t vaddr, void *buf, size_t len)
+{
+    return virt_dma_memory_read(vaddr, buf, len);
+}

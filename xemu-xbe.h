@@ -23,6 +23,7 @@
 #define XEMU_XBE_H
 
 #include <stdint.h>
+#include <sys/types.h>
 
 // http://www.caustik.com/cxbx/download/xbe.htm
 #pragma pack(1)
@@ -107,6 +108,10 @@ extern "C" {
 
 // Get current XBE info
 struct xbe *xemu_get_xbe_info(void);
+
+// Read guest-virtual memory (page-by-page translation). Returns bytes
+// read, or -1 if any page is unmapped.
+ssize_t xemu_virt_dma_memory_read(uint32_t vaddr, void *buf, size_t len);
 
 #ifdef __cplusplus
 }

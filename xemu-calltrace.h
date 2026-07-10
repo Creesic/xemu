@@ -45,6 +45,13 @@ bool xemu_calltrace_truncated(void);
 /* Hot path; called from the TCG helper on the vCPU thread. */
 void xemu_calltrace_record(uint32_t call_site, uint32_t callee);
 
+/*
+ * Write the recording to <dir>/<Title>-<timestamp>.xct. Returns the
+ * g_malloc'd output path on success (caller frees), or NULL with
+ * *err_msg set to a g_malloc'd message (caller frees).
+ */
+char *xemu_calltrace_save(const char *dir, char **err_msg);
+
 #ifdef __cplusplus
 }
 #endif

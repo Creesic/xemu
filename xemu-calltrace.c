@@ -18,10 +18,13 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "cpu.h"
 #include "exec/tb-flush.h"
+#include "xemu-xbe.h"
 #include "xemu-calltrace.h"
 #include "xemu-calltrace-map.h"
+#include "xemu-calltrace-kexports.h"
 
 #define CT_KERNEL_SPACE 0x80000000u
 
@@ -80,4 +83,253 @@ void xemu_calltrace_record(uint32_t call_site, uint32_t callee)
     if (!ct_map_add(&ct_map, call_site, callee)) {
         ct_truncated = true;
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* .xct writer                                                        */
+/* ------------------------------------------------------------------ */
+
+#define XBOX_KERNEL_BASE 0x80010000u
+#define XBE_ENTRY_XOR_RETAIL 0xA8FC57ABu
+#define XBE_ENTRY_XOR_DEBUG 0x94859D4Bu
+
+/* XBE section header layout (http://www.caustik.com/cxbx/download/xbe.htm) */
+#pragma pack(1)
+struct xbe_section_header {
+    uint32_t flags;
+    uint32_t virtual_addr;
+    uint32_t virtual_size;
+    uint32_t raw_addr;
+    uint32_t raw_size;
+    uint32_t section_name_addr;
+    uint32_t section_name_ref_count;
+    uint32_t head_shared_page_ref_count_addr;
+    uint32_t tail_shared_page_ref_count_addr;
+    uint8_t section_digest[20];
+};
+#pragma pack()
+
+typedef struct SectionRec {
+    uint32_t name_off;
+    uint32_t start;
+    uint32_t size;
+} SectionRec;
+
+typedef struct KImport {
+    uint32_t addr;
+    uint32_t name_off;
+} KImport;
+
+static uint32_t strtab_add(GByteArray *st, const char *s)
+{
+    if (!s || !*s) {
+        return 0;
+    }
+    uint32_t off = st->len;
+    g_byte_array_append(st, (const guint8 *)s, strlen(s) + 1);
+    return off;
+}
+
+static bool read_guest_u32(uint32_t va, uint32_t *val)
+{
+    uint32_t v;
+    if (xemu_virt_dma_memory_read(va, &v, 4) != 4) {
+        return false;
+    }
+    *val = le32_to_cpu(v);
+    return true;
+}
+
+static GArray *collect_sections(struct xbe *xbe, GByteArray *strtab)
+{
+    GArray *arr = g_array_new(FALSE, FALSE, sizeof(SectionRec));
+    uint32_t base = ldl_le_p(&xbe->header->m_base);
+    uint32_t nsec = MIN(ldl_le_p(&xbe->header->m_sections), 256u);
+    uint32_t shdr_addr = ldl_le_p(&xbe->header->m_section_headers_addr);
+
+    for (uint32_t i = 0; i < nsec; i++) {
+        uint32_t off =
+            shdr_addr + i * sizeof(struct xbe_section_header) - base;
+        if (off + sizeof(struct xbe_section_header) > xbe->headers_len) {
+            break; /* section headers outside the copied header blob */
+        }
+        struct xbe_section_header *sh =
+            (struct xbe_section_header *)(xbe->headers + off);
+        char name[32] = "";
+        uint32_t name_off = ldl_le_p(&sh->section_name_addr) - base;
+        if (name_off < xbe->headers_len) {
+            g_strlcpy(name, (const char *)xbe->headers + name_off,
+                      MIN(sizeof(name),
+                          (size_t)(xbe->headers_len - name_off)));
+        }
+        SectionRec s = { strtab_add(strtab, name),
+                         ldl_le_p(&sh->virtual_addr),
+                         ldl_le_p(&sh->virtual_size) };
+        g_array_append_val(arr, s);
+    }
+    return arr;
+}
+
+/*
+ * Resolve kernel export addresses by walking the guest xboxkrnl.exe PE
+ * export directory (exports are by ordinal; names come from the static
+ * table in xemu-calltrace-kexports.h).
+ */
+static GArray *collect_kernel_exports(GByteArray *strtab)
+{
+    GArray *arr = g_array_new(FALSE, FALSE, sizeof(KImport));
+    uint16_t mz;
+    uint32_t e_lfanew, pesig, exp_rva, ord_base, nfuncs, aof_rva;
+
+    if (xemu_virt_dma_memory_read(XBOX_KERNEL_BASE, &mz, 2) != 2 ||
+        mz != 0x5A4D) {
+        return arr;
+    }
+    if (!read_guest_u32(XBOX_KERNEL_BASE + 0x3C, &e_lfanew) ||
+        e_lfanew > 0x1000) {
+        return arr;
+    }
+    if (!read_guest_u32(XBOX_KERNEL_BASE + e_lfanew, &pesig) ||
+        pesig != 0x00004550) {
+        return arr;
+    }
+    /* PE32 optional header: export directory RVA at PE + 0x78 */
+    if (!read_guest_u32(XBOX_KERNEL_BASE + e_lfanew + 0x78, &exp_rva) ||
+        !exp_rva) {
+        return arr;
+    }
+    uint32_t exp = XBOX_KERNEL_BASE + exp_rva;
+    if (!read_guest_u32(exp + 0x10, &ord_base) ||
+        !read_guest_u32(exp + 0x14, &nfuncs) ||
+        !read_guest_u32(exp + 0x1C, &aof_rva)) {
+        return arr;
+    }
+    nfuncs = MIN(nfuncs, 512u);
+    for (uint32_t i = 0; i < nfuncs; i++) {
+        uint32_t frva;
+        if (!read_guest_u32(XBOX_KERNEL_BASE + aof_rva + 4 * i, &frva) ||
+            !frva) {
+            continue;
+        }
+        uint32_t ord = ord_base + i;
+        const char *name = NULL;
+        char fallback[32];
+        if (ord < ARRAY_SIZE(xbox_kernel_export_names)) {
+            name = xbox_kernel_export_names[ord];
+        }
+        if (!name) {
+            snprintf(fallback, sizeof(fallback), "kernel_ordinal_%u", ord);
+            name = fallback;
+        }
+        KImport ki = { XBOX_KERNEL_BASE + frva, strtab_add(strtab, name) };
+        g_array_append_val(arr, ki);
+    }
+    return arr;
+}
+
+char *xemu_calltrace_save(const char *dir, char **err_msg)
+{
+    *err_msg = NULL;
+
+    if (!ct_map.slots || ct_map.num_entries == 0) {
+        *err_msg = g_strdup("No call trace data recorded");
+        return NULL;
+    }
+    struct xbe *xbe = xemu_get_xbe_info();
+    if (!xbe) {
+        *err_msg = g_strdup("No XBE is running");
+        return NULL;
+    }
+
+    GByteArray *strtab = g_byte_array_new();
+    guint8 zero = 0;
+    g_byte_array_append(strtab, &zero, 1); /* offset 0 = "" */
+
+    GArray *sections = collect_sections(xbe, strtab);
+    GArray *kimports = collect_kernel_exports(strtab);
+
+    /* Title name: UTF-16LE -> UTF-8 (pattern: ui/xui/main-menu.cc:1306) */
+    char title8[88] = { 0 };
+    char *title_utf8 =
+        g_utf16_to_utf8(xbe->cert->m_title_name, 40, NULL, NULL, NULL);
+    if (title_utf8) {
+        g_strlcpy(title8, title_utf8, sizeof(title8));
+    }
+
+    /* Entry point is XOR-obfuscated; try retail key, fall back to debug. */
+    uint32_t base = ldl_le_p(&xbe->header->m_base);
+    uint32_t image_size = ldl_le_p(&xbe->header->m_sizeof_image);
+    uint32_t raw_entry = ldl_le_p(&xbe->header->m_entry);
+    uint32_t entry = raw_entry ^ XBE_ENTRY_XOR_RETAIL;
+    if (entry < base || entry >= base + image_size) {
+        uint32_t dbg = raw_entry ^ XBE_ENTRY_XOR_DEBUG;
+        if (dbg >= base && dbg < base + image_size) {
+            entry = dbg;
+        }
+    }
+
+    /* Output path: <dir>/<SanitizedTitle>-<timestamp>.xct */
+    char stamp[32];
+    time_t now = time(NULL);
+    strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", localtime(&now));
+    char fname_title[48];
+    g_strlcpy(fname_title, title8[0] ? title8 : "recording",
+              sizeof(fname_title));
+    for (char *p = fname_title; *p; p++) {
+        if (!g_ascii_isalnum(*p)) {
+            *p = '_';
+        }
+    }
+    char *path = g_strdup_printf("%s/%s-%s.xct", (dir && *dir) ? dir : ".",
+                                 fname_title, stamp);
+
+    FILE *f = qemu_fopen(path, "wb");
+    bool ok = f != NULL;
+    if (ok) {
+        /* Host is little-endian on all supported platforms. */
+        uint32_t hdr[10] = { 0x52544358u,
+                             1,
+                             ct_truncated ? 1u : 0u,
+                             ldl_le_p(&xbe->cert->m_titleid),
+                             base,
+                             entry,
+                             sections->len,
+                             kimports->len,
+                             ct_map.num_entries,
+                             strtab->len };
+        ok = fwrite(hdr, sizeof(hdr), 1, f) == 1 &&
+             fwrite(title8, sizeof(title8), 1, f) == 1 &&
+             fwrite(strtab->data, strtab->len, 1, f) == 1;
+        if (ok && sections->len) {
+            ok = fwrite(sections->data, sizeof(SectionRec), sections->len,
+                        f) == sections->len;
+        }
+        if (ok && kimports->len) {
+            ok = fwrite(kimports->data, sizeof(KImport), kimports->len,
+                        f) == kimports->len;
+        }
+        for (uint32_t i = 0; ok && i < CT_MAP_CAPACITY; i++) {
+            CTEdge *e = &ct_map.slots[i];
+            if (!e->key) {
+                continue;
+            }
+            uint32_t addrs[2] = { (uint32_t)(e->key >> 32),
+                                  (uint32_t)e->key };
+            ok = fwrite(addrs, 8, 1, f) == 1 &&
+                 fwrite(&e->count, 8, 1, f) == 1;
+        }
+        fclose(f);
+    }
+
+    g_free(title_utf8);
+    g_byte_array_free(strtab, TRUE);
+    g_array_free(sections, TRUE);
+    g_array_free(kimports, TRUE);
+
+    if (!ok) {
+        *err_msg = g_strdup_printf("Failed to write %s", path);
+        g_free(path);
+        return NULL;
+    }
+    return path;
 }

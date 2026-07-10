@@ -239,8 +239,28 @@ void ShowMainMenu()
                             "Edge limit reached; new edges dropped");
                     }
                     ImGui::Separator();
-                    if (ImGui::MenuItem("Stop")) {
+                    if (ImGui::MenuItem("Stop & Save")) {
                         xemu_calltrace_stop();
+                        const char *dir = g_config.general.calltrace_dir;
+                        if (!strlen(dir)) {
+                            dir = g_config.general.screenshot_dir;
+                        }
+                        if (!strlen(dir)) {
+                            dir = ".";
+                        }
+                        char *err = NULL;
+                        char *path = xemu_calltrace_save(dir, &err);
+                        if (path) {
+                            char *msg = g_strdup_printf(
+                                "Call trace saved: %s", path);
+                            xemu_queue_notification(msg);
+                            g_free(msg);
+                            g_free(path);
+                        } else {
+                            xemu_queue_error_message(
+                                err ? err : "Call trace save failed");
+                            g_free(err);
+                        }
                     }
                 }
                 ImGui::EndMenu();
