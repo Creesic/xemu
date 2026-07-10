@@ -137,6 +137,7 @@ const NODE_STALE_ALPHA = 0.35, FADE_AFTER = 600, FADE_RAMP = 1200;
 let pulses = [];
 let nodeLastUsed = new Map();     // fn id -> last event index it was active
 let mutedFns = new Set();
+let collapsedFns = new Set();     // fn ids whose callees are hidden (subtree collapse)
 let lastLayoutKey = '';           // invalidates cached layout when discovery grows
 let rafId = 0, lastTs = 0;
 
@@ -414,6 +415,7 @@ async function loadRecording(buf, name) {
       (symbols.size ? `, ${symbols.size} symbols restored` : '');
   pulses = [];
   nodeLastUsed.clear();
+  collapsedFns.clear();
   if (model.timed) {
     timeline = { active: true, playhead: model.eventCount, playing: false,
                  speed: timeline.speed || 10, acc: 0 };
@@ -530,7 +532,7 @@ function computeLayout(m, edgeVisible) {
     nodes.set(id, n);
     if (!parent) rootNodes.push(n);
     const f = m.fns.get(id);
-    if (f) {
+    if (f && !collapsedFns.has(id)) {
       for (const calleeId of [...f.out.keys()].sort((a, b) => a - b)) {
         if (!edgeVisible(id, calleeId, f.out.get(calleeId))) continue;
         if (visit(calleeId, depth + 1, n)) {
@@ -631,9 +633,11 @@ function drawNode(ctx, n) {
   ctx.fill();
   ctx.stroke();
   ctx.fillStyle = '#eeeeee';
-  const glyph = expandable ? (expanded.has(n.id) ? '▾ ' : '▸ ') : '';
+  const collapsed = model.timed && timeline.active
+      ? collapsedFns.has(n.id) : !expanded.has(n.id);
+  const glyph = expandable ? (collapsed ? '▸ ' : '▾ ') : '';
   ctx.fillText(glyph + n.label, n.x + 7, n.y + 17, n.w - 14);
-  if (expandable && !expanded.has(n.id)) {
+  if (expandable && collapsed) {
     ctx.fillStyle = 'rgba(255,255,255,0.6)';
     ctx.fillText('+' + f.out.size, n.x + n.w - 30, n.y + 17);
   }
@@ -665,11 +669,12 @@ function draw() {
       ? (from, cid, edge) => edge.firstFire <= timeline.playhead
       : (from) => expanded.has(from);
   /* Recompute layout only when the visible set changes (cheap during play). */
+  const collapseKey = collapsedFns.size + ':' + [...collapsedFns].join(',');
   const visKey = model.timed && timeline.active
       ? 'tl:' + discoveredEdgeCount(model, timeline.playhead) + ':' +
-        mutedFns.size
+        mutedFns.size + ':' + collapseKey
       : 'manual:' + expanded.size + ':' + [...expanded].join(',') + ':' +
-        mutedFns.size;
+        mutedFns.size + ':' + collapseKey;
   if (visKey !== lastLayoutKey || !layoutNodes.size) {
     layoutNodes = computeLayout(model, edgeVisible);
     for (const n of layoutNodes.values()) {
@@ -679,6 +684,16 @@ function draw() {
     }
     lastLayoutKey = visKey;
   }
+  /* Viewport culling: only draw shapes that intersect the visible world
+   * rect. This is what makes zooming IN faster (fewer shapes on screen),
+   * not slower. */
+  const wl = -view.panX / view.zoom - 40;
+  const wr = (cv.width / dpr - view.panX) / view.zoom + 40;
+  const wt = -view.panY / view.zoom - 40;
+  const wb = (cv.height / dpr - view.panY) / view.zoom + 40;
+  const inView = (x, y, w, h) =>
+      x + w >= wl && x <= wr && y + h >= wt && y <= wb;
+
   for (const n of layoutNodes.values()) {
     const f = model.fns.get(n.id);
     if (!f) continue;
@@ -686,10 +701,16 @@ function draw() {
       if (!edgeVisible(n.id, calleeId, e)) continue;
       const t = layoutNodes.get(calleeId);
       if (!t) continue;
+      const bx = Math.min(n.x, t.x), by = Math.min(n.y, t.y);
+      const bw = Math.max(n.x + n.w, t.x + t.w) - bx;
+      const bh = Math.max(n.y + n.h, t.y + t.h) - by;
+      if (!inView(bx, by, bw, bh)) continue;
       drawEdge(ctx, n, t, e.count, t.parent !== n);
     }
   }
-  for (const n of layoutNodes.values()) drawNode(ctx, n);
+  for (const n of layoutNodes.values()) {
+    if (inView(n.x, n.y, n.w, n.h)) drawNode(ctx, n);
+  }
 
   if (timeline.active && pulses.length) {
     const now = performance.now();
@@ -697,6 +718,9 @@ function draw() {
     for (const p of pulses) {
       const a = layoutNodes.get(p.fromId), b = layoutNodes.get(p.toId);
       if (!a || !b) continue;
+      const bx = Math.min(a.x, b.x), by = Math.min(a.y, b.y);
+      if (!inView(bx, by, Math.abs(a.x - b.x) + a.w,
+                  Math.abs(a.y - b.y) + a.h)) continue;
       const t = (now - p.born) / PULSE_LIFE_MS, u = 1 - t;
       const x1 = a.x + a.w, y1 = a.y + a.h / 2, x2 = b.x, y2 = b.y + b.h / 2;
       const mx = (x1 + x2) / 2;
@@ -783,10 +807,19 @@ el('cv').addEventListener('click', ev => {
 el('cv').addEventListener('dblclick', ev => {
   if (!model) return;
   const n = nodeAt(worldPos(ev));
-  if (n) {
+  if (!n) return;
+  if (model.timed && timeline.active) {
+    /* Timeline mode: collapse/expand this node's subtree so a heavy caller
+     * (e.g. _cinit) can be folded without stretching the layout. */
+    if (n.id >= 0 || n.id === -2) {
+      if (collapsedFns.has(n.id)) collapsedFns.delete(n.id);
+      else collapsedFns.add(n.id);
+      lastLayoutKey = '';
+    }
+  } else {
     toggleExpand(n.id);
-    draw();
   }
+  draw();
 });
 el('cv').addEventListener('wheel', ev => {
   ev.preventDefault();
@@ -1252,6 +1285,19 @@ T('parse v2 header + inflate events', async () => {
   assertEq(ev.length, 13, 'inflated length');
   assertEq(ev[0], 0, 'ev0'); assertEq(ev[4], 3, 'ev4');
   assertEq(ev[11], 0, 'ev11');
+});
+T('collapse hides a subtree', async () => {
+  const rec = parseXCT(await buildTimedFixture());
+  const m = deriveModel(rec); m.events = await inflateEvents(rec);
+  buildTimeline(m);
+  const vis = () => computeLayout(m, (from, cid, e) => e.firstFire <= 13);
+  collapsedFns.clear();
+  assertEq(vis().has(0x14000), true, 'D1 shown when B expanded');
+  collapsedFns.add(0x12000);            /* collapse B (0x12000) */
+  const laid = vis();
+  assertEq(laid.has(0x14000), false, 'D1 hidden when B collapsed');
+  assertEq(laid.has(0x12000), true, 'B itself still shown');
+  collapsedFns.clear();
 });
 T('noise ranking by inbound calls', async () => {
   const rec = parseXCT(await buildTimedFixture());
