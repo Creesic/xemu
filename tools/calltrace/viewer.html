@@ -611,12 +611,7 @@ function drawEdge(ctx, a, b, count, cross) {
     ctx.lineTo(x2 - 7, y2 + 4);
     ctx.fill();
   }
-  /* Count label only when zoomed enough AND the label is on-screen — this is
-   * what made zooming in on a high-fan-out node (e.g. _cinit) slow. */
-  if (view.zoom > 0.7 && ptInView(mx, (y1 + y2) / 2)) {
-    ctx.fillStyle = 'rgba(200,200,200,0.75)';
-    ctx.fillText('×' + count, mx - 8, (y1 + y2) / 2 - 4);
-  }
+  /* Count labels are drawn in the separate fixed-size text pass in draw(). */
 }
 
 function nodeAlpha(n) {
@@ -630,8 +625,7 @@ function nodeAlpha(n) {
 }
 
 function drawNode(ctx, n) {
-  const f = model.fns.get(n.id);
-  const expandable = f && f.out.size > 0 && f.kind !== 'kernel';
+  /* Shape only; labels are drawn later at a fixed size (see draw()). */
   ctx.globalAlpha = nodeAlpha(n);
   ctx.fillStyle = nodeColor(n);
   ctx.strokeStyle = n.id === selected ? '#ffd24a' : 'rgba(255,255,255,0.25)';
@@ -639,16 +633,51 @@ function drawNode(ctx, n) {
   roundRect(ctx, n.x, n.y, n.w, n.h, 6);
   ctx.fill();
   ctx.stroke();
-  ctx.fillStyle = '#eeeeee';
-  const collapsed = model.timed && timeline.active
-      ? collapsedFns.has(n.id) : !expanded.has(n.id);
-  const glyph = expandable ? (collapsed ? '▸ ' : '▾ ') : '';
-  ctx.fillText(glyph + n.label, n.x + 7, n.y + 17, n.w - 14);
-  if (expandable && collapsed) {
-    ctx.fillStyle = 'rgba(255,255,255,0.6)';
-    ctx.fillText('+' + f.out.size, n.x + n.w - 30, n.y + 17);
+  ctx.globalAlpha = 1;
+}
+
+/*
+ * Draw all labels at a capped device size in screen space. Rendering text
+ * under the zoom transform makes glyphs huge at high zoom, and the browser
+ * re-uploads those big glyph bitmaps to the GPU every frame (the "Copy"
+ * engine spike). Capping the size at 1x keeps glyphs small and cached.
+ */
+function drawLabels(ctx, edgeLabels) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  const ts = Math.min(view.zoom, 1);            // text scale, capped at 1x
+  ctx.font = `${12 * ts * dpr}px monospace`;
+  ctx.textBaseline = 'middle';
+  const DX = wx => (wx * view.zoom + view.panX) * dpr;
+  const DY = wy => (wy * view.zoom + view.panY) * dpr;
+
+  ctx.textAlign = 'left';
+  for (const n of layoutNodes.values()) {
+    if (!(n.x + n.w >= vpL && n.x <= vpR && n.y + n.h >= vpT &&
+          n.y <= vpB)) continue;
+    const f = model.fns.get(n.id);
+    const expandable = f && f.out.size > 0 && f.kind !== 'kernel';
+    const collapsed = model.timed && timeline.active
+        ? collapsedFns.has(n.id) : !expanded.has(n.id);
+    const glyph = expandable ? (collapsed ? '▸ ' : '▾ ') : '';
+    const bx = DX(n.x), cy = DY(n.y + n.h / 2);
+    ctx.globalAlpha = nodeAlpha(n);
+    ctx.fillStyle = '#eeeeee';
+    ctx.fillText(glyph + n.label, bx + 7 * ts * dpr, cy,
+                 n.w * view.zoom * dpr - 14 * ts * dpr);
+    if (expandable && collapsed) {
+      ctx.fillStyle = 'rgba(255,255,255,0.6)';
+      ctx.textAlign = 'right';
+      ctx.fillText('+' + f.out.size, DX(n.x + n.w) - 8 * ts * dpr, cy);
+      ctx.textAlign = 'left';
+    }
   }
   ctx.globalAlpha = 1;
+  ctx.fillStyle = 'rgba(200,200,200,0.75)';
+  ctx.textAlign = 'center';
+  for (const L of edgeLabels) {
+    ctx.fillText('×' + L.count, DX(L.mx), DY(L.my));
+  }
+  ctx.textAlign = 'left';
 }
 
 function draw() {
@@ -701,6 +730,7 @@ function draw() {
   const inView = (x, y, w, h) =>
       x + w >= vpL && x <= vpR && y + h >= vpT && y <= vpB;
 
+  const edgeLabels = [];
   for (const n of layoutNodes.values()) {
     const f = model.fns.get(n.id);
     if (!f) continue;
@@ -713,11 +743,21 @@ function draw() {
       const bh = Math.max(n.y + n.h, t.y + t.h) - by;
       if (!inView(bx, by, bw, bh)) continue;
       drawEdge(ctx, n, t, e.count, t.parent !== n);
+      if (view.zoom > 0.7 && n !== t) {
+        const mx = (n.x + n.w + t.x) / 2;
+        const my = (n.y + n.h / 2 + t.y + t.h / 2) / 2;
+        if (mx >= vpL && mx <= vpR && my >= vpT && my <= vpB) {
+          edgeLabels.push({ mx, my, count: e.count });
+        }
+      }
     }
   }
   for (const n of layoutNodes.values()) {
     if (inView(n.x, n.y, n.w, n.h)) drawNode(ctx, n);
   }
+  drawLabels(ctx, edgeLabels);
+  ctx.setTransform(view.zoom * dpr, 0, 0, view.zoom * dpr,
+                   view.panX * dpr, view.panY * dpr);
 
   if (timeline.active && pulses.length) {
     const now = performance.now();
