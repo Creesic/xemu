@@ -28,6 +28,8 @@
 #include "compat.hh"
 #include "update.hh"
 #include "../xemu-os-utils.h"
+#include "../../xemu-xbe.h"
+#include "../../xemu-calltrace.h"
 
 extern float g_main_menu_height; // FIXME
 
@@ -220,6 +222,29 @@ void ShowMainMenu()
             ImGui::MenuItem("Monitor", "~", &monitor_window.is_open);
             ImGui::MenuItem("Audio", NULL, &apu_window.m_is_open);
             ImGui::MenuItem("Video", NULL, &video_window.m_is_open);
+            ImGui::Separator();
+            if (ImGui::BeginMenu("Call Trace")) {
+                if (!xemu_calltrace_armed) {
+                    bool have_xbe = xemu_get_xbe_info() != NULL;
+                    if (ImGui::MenuItem("Start Recording", NULL, false,
+                                        have_xbe)) {
+                        xemu_calltrace_start();
+                    }
+                } else {
+                    ImGui::Text("Recording: %llu unique edges",
+                                (unsigned long long)xemu_calltrace_edge_count());
+                    if (xemu_calltrace_truncated()) {
+                        ImGui::TextColored(
+                            ImVec4(1.0f, 0.6f, 0.1f, 1.0f),
+                            "Edge limit reached; new edges dropped");
+                    }
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Stop")) {
+                        xemu_calltrace_stop();
+                    }
+                }
+                ImGui::EndMenu();
+            }
 #ifdef CONFIG_RENDERDOC
             if (nv2a_dbg_renderdoc_available()) {
                 ImGui::MenuItem("RenderDoc: Capture", NULL, &g_capture_renderdoc_frame);
