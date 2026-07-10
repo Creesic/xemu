@@ -24,6 +24,7 @@
 #include "xemu-xbe.h"
 #include "xemu-calltrace.h"
 #include "xemu-calltrace-map.h"
+#include "xemu-calltrace-events.h"
 #include "xemu-calltrace-kexports.h"
 
 #define CT_KERNEL_SPACE 0x80000000u
@@ -33,9 +34,67 @@ bool xemu_calltrace_armed;
 static CTMap ct_map;
 static bool ct_truncated;
 
-void xemu_calltrace_start(void)
+#define CT_THROTTLE_FULL 256   /* log every call up to this many per edge */
+#define CT_THROTTLE_EVERY 64   /* then 1-in-this-many afterwards          */
+
+static CalltraceMode ct_mode;
+static CTEvents ct_events;
+static bool ct_events_trunc;
+
+/* Open-addressing set of callee addresses to ignore (0 = empty slot). */
+static uint32_t *ct_ignore;
+static uint32_t ct_ignore_cap;
+static uint32_t ct_ignore_n;
+
+static bool ct_ignore_has(uint32_t addr)
 {
-    if (xemu_calltrace_armed) {
+    if (!ct_ignore_cap || addr == 0) {
+        return false;
+    }
+    uint32_t i = (addr * 2654435761u) & (ct_ignore_cap - 1);
+    while (ct_ignore[i]) {
+        if (ct_ignore[i] == addr) {
+            return true;
+        }
+        i = (i + 1) & (ct_ignore_cap - 1);
+    }
+    return false;
+}
+
+static void ct_ignore_put(uint32_t addr)
+{
+    if (addr == 0) {
+        return;
+    }
+    /* grow/rehash at 50% load */
+    if ((ct_ignore_n + 1) * 2 > ct_ignore_cap) {
+        uint32_t newcap = ct_ignore_cap ? ct_ignore_cap * 2 : 1024;
+        uint32_t *old = ct_ignore;
+        uint32_t oldcap = ct_ignore_cap;
+        ct_ignore = g_malloc0(newcap * sizeof(uint32_t));
+        ct_ignore_cap = newcap;
+        ct_ignore_n = 0;
+        for (uint32_t k = 0; k < oldcap; k++) {
+            if (old && old[k]) {
+                ct_ignore_put(old[k]);
+            }
+        }
+        g_free(old);
+    }
+    uint32_t i = (addr * 2654435761u) & (ct_ignore_cap - 1);
+    while (ct_ignore[i]) {
+        if (ct_ignore[i] == addr) {
+            return;
+        }
+        i = (i + 1) & (ct_ignore_cap - 1);
+    }
+    ct_ignore[i] = addr;
+    ct_ignore_n++;
+}
+
+void xemu_calltrace_start_mode(CalltraceMode mode)
+{
+    if (xemu_calltrace_armed || mode == CT_OFF) {
         return;
     }
     if (ct_map.slots) {
@@ -44,10 +103,19 @@ void xemu_calltrace_start(void)
     if (!ct_map_init(&ct_map)) {
         return; /* allocation failed; stay disarmed */
     }
+    ct_events_free(&ct_events);
+    ct_events_init(&ct_events);
     ct_truncated = false;
+    ct_events_trunc = false;
+    ct_mode = mode;
     /* Arm before flushing so retranslated code is instrumented. */
     xemu_calltrace_armed = true;
     queue_tb_flush(qemu_get_cpu(0));
+}
+
+void xemu_calltrace_start(void)
+{
+    xemu_calltrace_start_mode(CT_EDGES);
 }
 
 void xemu_calltrace_stop(void)
@@ -60,6 +128,11 @@ void xemu_calltrace_stop(void)
     queue_tb_flush(qemu_get_cpu(0));
 }
 
+CalltraceMode xemu_calltrace_mode(void)
+{
+    return ct_mode;
+}
+
 uint64_t xemu_calltrace_edge_count(void)
 {
     return ct_map.slots ? ct_map.num_entries : 0;
@@ -68,6 +141,62 @@ uint64_t xemu_calltrace_edge_count(void)
 bool xemu_calltrace_truncated(void)
 {
     return ct_truncated;
+}
+
+uint64_t xemu_calltrace_event_count(void)
+{
+    return ct_events.count;
+}
+
+bool xemu_calltrace_events_truncated(void)
+{
+    return ct_events_trunc;
+}
+
+uint32_t xemu_calltrace_ignore_count(void)
+{
+    return ct_ignore_n;
+}
+
+void xemu_calltrace_clear_ignore(void)
+{
+    g_free(ct_ignore);
+    ct_ignore = NULL;
+    ct_ignore_cap = 0;
+    ct_ignore_n = 0;
+}
+
+void xemu_calltrace_load_ignore(const char *path, int *added, int *skipped)
+{
+    int a = 0, s = 0;
+    FILE *f = qemu_fopen(path, "r");
+    if (f) {
+        char line[128];
+        while (fgets(line, sizeof(line), f)) {
+            char *p = line;
+            while (*p == ' ' || *p == '\t') {
+                p++;
+            }
+            if (*p == '#' || *p == ';' || *p == '\n' || *p == '\r' ||
+                *p == '\0') {
+                continue;
+            }
+            uint32_t addr = (uint32_t)strtoul(p, NULL, 16);
+            if (addr) {
+                ct_ignore_put(addr);
+                a++;
+            } else {
+                s++;
+            }
+        }
+        fclose(f);
+    }
+    if (added) {
+        *added = a;
+    }
+    if (skipped) {
+        *skipped = s;
+    }
 }
 
 void xemu_calltrace_record(uint32_t call_site, uint32_t callee)
@@ -80,8 +209,23 @@ void xemu_calltrace_record(uint32_t call_site, uint32_t callee)
     if (call_site >= CT_KERNEL_SPACE && callee >= CT_KERNEL_SPACE) {
         return;
     }
-    if (!ct_map_add(&ct_map, call_site, callee)) {
-        ct_truncated = true;
+    if (ct_ignore_n && ct_ignore_has(callee)) {
+        return;
+    }
+    CTEdge *e = ct_map_add_indexed(&ct_map, call_site, callee);
+    if (!e) {
+        if (ct_map.num_entries >= CT_MAP_MAX_ENTRIES) {
+            ct_truncated = true;
+        }
+        return;
+    }
+    if (ct_mode == CT_TIMED) {
+        if (e->count <= CT_THROTTLE_FULL ||
+            (e->count % CT_THROTTLE_EVERY) == 0) {
+            if (!ct_events_append(&ct_events, e->index)) {
+                ct_events_trunc = true;
+            }
+        }
     }
 }
 

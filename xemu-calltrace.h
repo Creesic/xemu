@@ -37,10 +37,21 @@ extern "C" {
  */
 extern bool xemu_calltrace_armed;
 
-void xemu_calltrace_start(void);
+typedef enum { CT_OFF, CT_EDGES, CT_TIMED } CalltraceMode;
+
+void xemu_calltrace_start_mode(CalltraceMode mode);
+void xemu_calltrace_start(void); /* legacy: start in CT_EDGES */
 void xemu_calltrace_stop(void);
+CalltraceMode xemu_calltrace_mode(void);
 uint64_t xemu_calltrace_edge_count(void);
 bool xemu_calltrace_truncated(void);
+uint64_t xemu_calltrace_event_count(void);
+bool xemu_calltrace_events_truncated(void);
+
+/* Ignore-list: callee addresses to drop entirely from recording. */
+void xemu_calltrace_load_ignore(const char *path, int *added, int *skipped);
+void xemu_calltrace_clear_ignore(void);
+uint32_t xemu_calltrace_ignore_count(void);
 
 /* Hot path; called from the TCG helper on the vCPU thread. */
 void xemu_calltrace_record(uint32_t call_site, uint32_t callee);
