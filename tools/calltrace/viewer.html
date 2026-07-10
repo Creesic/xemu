@@ -822,7 +822,7 @@ function draw() {
 }
 
 function glXform() {
-  const cssW = el('glcv').clientWidth || 1, cssH = el('glcv').clientHeight || 1;
+  const cssW = el('glcv').width / dpr || 1, cssH = el('glcv').height / dpr || 1;
   return [2 * view.zoom / cssW, -2 * view.zoom / cssH,
           2 * view.panX / cssW - 1, 1 - 2 * view.panY / cssH];
 }
@@ -969,6 +969,7 @@ let glLastSel = undefined;
 
 function glDraw() {
   if (!gl) return;
+  const _t0 = performance.now();
   gl.viewport(0, 0, el('glcv').width, el('glcv').height);
   gl.clearColor(BG[0], BG[1], BG[2], 1);
   gl.clear(gl.COLOR_BUFFER_BIT);
@@ -979,11 +980,24 @@ function glDraw() {
   if (timeline.active && timeline.playing) glDirty = true;
   gl.useProgram(glProg);
   gl.uniform4fv(glLocXform, glXform());
+  const _tL = performance.now();
   if (glDirty) { glBuild(); glDirty = false; glBuildCount++; }
+  const _tB = performance.now();
   glDrawBuffer(glBufEdges, glEdgeVerts);
   glDrawBuffer(glBufNodes, glNodeVerts);
   glDrawPulses();
   textOverlay();
+  const _tE = performance.now();
+  perf.layout = ema(perf.layout, _tL - _t0);
+  perf.nodes = ema(perf.nodes, _tB - _tL);       /* glBuild (geometry fill) */
+  perf.edges = 0;
+  perf.labels = ema(perf.labels, _tE - _tB);     /* GL issue + text overlay */
+  perf.pulsesMs = 0;
+  perf.drawMs = ema(perf.drawMs, _tE - _t0);
+  perf.nNodes = glNodeVerts / 6 | 0;
+  perf.nEdges = glEdgeVerts / 6 | 0;
+  perf.nLabels = viewStatic ? layoutNodes.size : 0;
+  perf.nPulses = pulses.length;
   /* keep animating while pulses fade after playback stops */
   if (pulses.length && !timeline.playing && !rafId) {
     requestAnimationFrame(() => draw());
@@ -1072,7 +1086,7 @@ function textOverlay() {
   if (!viewStatic) return;                 /* motion: overlay already cleared */
   tctx.setTransform(1, 0, 0, 1, 0, 0);
   tctx.clearRect(0, 0, el('cvtext').width, el('cvtext').height);
-  const cssW = el('glcv').clientWidth || 1, cssH = el('glcv').clientHeight || 1;
+  const cssW = el('glcv').width / dpr || 1, cssH = el('glcv').height / dpr || 1;
   vpL = -view.panX / view.zoom - 40;
   vpR = (cssW - view.panX) / view.zoom + 40;
   vpT = -view.panY / view.zoom - 40;
@@ -1774,6 +1788,41 @@ T('DOT export', () => {
   assertEq(dot.includes('"KERNEL" -> "sub_00016000"'), true, 'root edge');
   assertEq(dot.startsWith('digraph calltrace {'), true, 'digraph header');
   model = null;
+});
+
+T('webgl: node color + pan/collapse rebuild caching', async () => {
+  initGL();
+  if (!glActive) return;                 /* no WebGL here; nothing to test */
+  dpr = 1; resScale = 1;
+  const glc = el('glcv'), tc = el('cvtext');
+  glc.width = 320; glc.height = 240; tc.width = 320; tc.height = 240;
+  textCtx2d = null;
+  await loadRecording(await buildTimedFixture(), 'gl');
+  view = { panX: 40, panY: 40, zoom: 1 };
+  glDirty = true; draw();
+  const built = glBuildCount;
+  const n = layoutNodes.get(0x11000);
+  const sx = (n.x + n.w / 2) * view.zoom + view.panX;
+  const sy = (n.y + n.h / 2) * view.zoom + view.panY;
+  const px = new Uint8Array(4);
+  gl.readPixels(Math.round(sx), Math.round(glc.height - sy), 1, 1,
+                gl.RGBA, gl.UNSIGNED_BYTE, px);
+  const exp = cssToRGB(nodeColor(n)).map(v => Math.round(v * 255));
+  assertEq(px[0], exp[0], 'node R');
+  assertEq(px[1], exp[1], 'node G');
+  view.panX += 25; draw();
+  assertEq(glBuildCount, built, 'pan does not rebuild geometry');
+  collapsedFns.add(0x12000); draw();
+  assertEq(glBuildCount, built + 1, 'collapse rebuilds geometry');
+  collapsedFns.clear(); draw();
+  model = null;
+});
+T('webgl: draw() falls back to 2D when GL is off', () => {
+  const saved = glActive;
+  glActive = false; model = null;
+  draw();                                /* must not throw via draw2d */
+  glActive = saved;
+  assertEq(true, true, 'fallback draw ok');
 });
 
 async function buildTimedFixture() {
