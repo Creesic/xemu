@@ -111,7 +111,9 @@ file-pick) a `.xct`.
 - Node labels: symbol name if mapped, else `sub_XXXXXXXX`; tinted by XBE
   section. Kernel leaves show the export name in a distinct style.
 - Details panel for the selected node: address, section, callers, callees,
-  per-edge call sites and counts.
+  per-edge call sites and counts. Call sites observed reaching multiple
+  distinct callees are flagged as indirect/polymorphic (likely vtable
+  dispatch or callback invocation).
 - Search by name or address; auto-expands the path from a root to the match.
 
 ### Symbol maps
