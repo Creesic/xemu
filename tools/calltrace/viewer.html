@@ -496,8 +496,146 @@ el('btn-reset').addEventListener('click', () => {
   draw();
 });
 
-// === [Task 9] DETAILS, SEARCH, SYMBOLS ===
-function showDetails(id) {}
+/* ---------------- details panel ---------------- */
+
+function showDetails(id) {
+  const d = el('details');
+  const f = model && model.fns.get(id);
+  if (!f) {
+    d.innerHTML = '<i>No selection</i>';
+    return;
+  }
+  const rows = [`<h3>${esc(fnName(model, id))}</h3>`];
+  if (id >= 0) {
+    rows.push(`<div class="kv">address <b>${hex(id)}</b></div>`);
+  }
+  if (id >= 0 && f.kind === 'fn') {
+    const sec = sectionOf(model, id);
+    if (sec) rows.push(`<div class="kv">section <b>${esc(sec)}</b></div>`);
+  }
+  if (f.kind === 'kernel') {
+    rows.push('<div class="kv">kernel export (leaf)</div>');
+  }
+  rows.push(`<h4>Callers (${f.inSet.size})</h4>`);
+  for (const cid of [...f.inSet].sort((a, b) => a - b)) {
+    rows.push(`<div class="lnk" data-id="${cid}">` +
+              `${esc(fnName(model, cid))}</div>`);
+  }
+  rows.push(`<h4>Callees (${f.out.size})</h4>`);
+  for (const [cid, e] of [...f.out].sort((a, b) => a[0] - b[0])) {
+    rows.push(`<div class="lnk" data-id="${cid}">` +
+              `${esc(fnName(model, cid))} ×${e.count}</div>`);
+    for (const [site, cnt] of e.sites) {
+      const poly = f.sites.get(site).size >= 2
+          ? ' <span class="poly">POLY</span>' : '';
+      rows.push(`<div class="site">from ${hex(site)} ×${cnt}` +
+                `${poly}</div>`);
+    }
+  }
+  d.innerHTML = rows.join('');
+  for (const a of d.querySelectorAll('.lnk')) {
+    a.onclick = () => revealNode(parseInt(a.dataset.id, 10));
+  }
+}
+
+/* ---------------- reveal & search ---------------- */
+
+function revealNode(id) {
+  if (!model || !model.fns.has(id)) return;
+  /* BFS from roots over the full graph to find an expandable path. */
+  const preds = new Map();
+  const seen = new Set(model.roots);
+  const queue = [...model.roots];
+  let found = model.roots.includes(id);
+  while (queue.length && !found) {
+    const cur = queue.shift();
+    const f = model.fns.get(cur);
+    if (!f) continue;
+    for (const cid of f.out.keys()) {
+      if (seen.has(cid)) continue;
+      seen.add(cid);
+      preds.set(cid, cur);
+      if (cid === id) { found = true; break; }
+      queue.push(cid);
+    }
+  }
+  if (found) {
+    for (let cur = preds.get(id); cur !== undefined;
+         cur = preds.get(cur)) {
+      expanded.add(cur);
+    }
+  } else if (!model.roots.includes(id)) {
+    model.roots.push(id);
+    showBanner('Not reachable from recorded roots — shown as a ' +
+               'temporary root', 'warn');
+  }
+  selected = id;
+  draw(); /* rebuild layout so the node exists */
+  const n = layoutNodes.get(id);
+  if (n) {
+    const r = el('cv').getBoundingClientRect();
+    view.panX = r.width / 2 - (n.x + n.w / 2) * view.zoom;
+    view.panY = r.height / 2 - (n.y + n.h / 2) * view.zoom;
+    draw();
+  }
+  showDetails(id);
+}
+
+function doSearch(text) {
+  if (!model) return;
+  const q = text.trim();
+  if (!q) return;
+  let id = null;
+  const m = q.match(/^(?:0x|sub_)?([0-9a-fA-F]{4,8})$/);
+  if (m) {
+    const addr = parseInt(m[1], 16);
+    if (model.fns.has(addr)) id = addr;
+  }
+  if (id === null) {
+    const needle = q.toLowerCase();
+    for (const fid of model.fns.keys()) {
+      if (fnName(model, fid).toLowerCase().includes(needle)) {
+        id = fid;
+        break;
+      }
+    }
+  }
+  if (id === null) {
+    showBanner('No match for "' + q + '"', 'warn');
+    return;
+  }
+  clearBanner();
+  revealNode(id);
+}
+el('search').addEventListener('keydown', ev => {
+  if (ev.key === 'Enter') doSearch(ev.target.value);
+});
+
+/* ---------------- symbol maps ---------------- */
+
+function loadSymbols(text) {
+  let applied = 0, skipped = 0;
+  for (const line of text.split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t || t.startsWith('#') || t.startsWith(';')) continue;
+    const m = t.match(/^(?:0x)?([0-9a-fA-F]{4,8})[\s:=,]+(\S+)/);
+    if (!m) { skipped++; continue; }
+    symbols.set(parseInt(m[1], 16), m[2]);
+    applied++;
+  }
+  if (model) {
+    localStorage.setItem('xct-syms-' + model.rec.titleId,
+                         JSON.stringify([...symbols]));
+  }
+  showBanner(`Symbols: ${applied} applied` +
+             (skipped ? `, ${skipped} lines skipped` : ''), 'info');
+  draw();
+  if (selected !== null) showDetails(selected);
+}
+el('symfile').onchange = ev => {
+  const f = ev.target.files[0];
+  if (f) f.text().then(loadSymbols);
+};
 
 // === [Task 10] EXPORT & HELP ===
 
