@@ -153,14 +153,25 @@ function getCtx() {
 let motionTimer = 0;
 let layoutNodes = new Map();      // id -> layout node (Task 8)
 
-/* Half-res while interacting, snap back to crisp full res when it settles.
- * This keeps motion smooth on paint/upload-bound machines without leaving
- * the static view blurry. */
+let viewStatic = true;            // GL path: labels only painted when settled
+/* GL path: hide labels while moving (software text-paint stays off the hot
+ * path), repaint crisp on settle. 2D path: drop to half res while moving. */
 function nudgeMotion() {
-  if (glActive || !autoRes) return;   /* GL renders full-res fast; no ½-res */
+  if (glActive) {
+    if (viewStatic) { viewStatic = false; clearTextOverlay(); }
+    clearTimeout(motionTimer);
+    motionTimer = setTimeout(() => { viewStatic = true; draw(); }, 160);
+    return;
+  }
+  if (!autoRes) return;
   if (resScale !== 0.5) { resScale = 0.5; fitCanvas(); }
   clearTimeout(motionTimer);
   motionTimer = setTimeout(() => { resScale = 1; fitCanvas(); }, 180);
+}
+function clearTextOverlay() {
+  const t = textCtx();
+  t.setTransform(1, 0, 0, 1, 0, 0);
+  t.clearRect(0, 0, el('cvtext').width, el('cvtext').height);
 }
 let timeline = { active: false, playhead: 0, playing: false, speed: 10,
                  acc: 0 };
@@ -1040,8 +1051,50 @@ function glDrawPulses() {
   glDrawBuffer(glBufPulses, i / 6);
 }
 
-/* Filled in WG5. */
-function textOverlay() {}
+/* Labels on the transparent overlay (screen space, capped size). Painted
+ * only when the view is static; hidden during motion by nudgeMotion. */
+function textOverlay() {
+  const tctx = textCtx();
+  if (!model) {
+    tctx.setTransform(1, 0, 0, 1, 0, 0);
+    tctx.clearRect(0, 0, el('cvtext').width, el('cvtext').height);
+    tctx.fillStyle = '#667';
+    tctx.font = `${16 * dpr}px system-ui`;
+    tctx.fillText('Open or drop an .xct recording to begin',
+                  30 * dpr, 50 * dpr);
+    tctx.fillStyle = '#556';
+    tctx.font = `${13 * dpr}px system-ui`;
+    tctx.fillText('Double-click a node to expand it · drag to pan · '
+                  + 'wheel to zoom · colors explained in the Legend →',
+                  30 * dpr, 78 * dpr);
+    return;
+  }
+  if (!viewStatic) return;                 /* motion: overlay already cleared */
+  tctx.setTransform(1, 0, 0, 1, 0, 0);
+  tctx.clearRect(0, 0, el('cvtext').width, el('cvtext').height);
+  const cssW = el('glcv').clientWidth || 1, cssH = el('glcv').clientHeight || 1;
+  vpL = -view.panX / view.zoom - 40;
+  vpR = (cssW - view.panX) / view.zoom + 40;
+  vpT = -view.panY / view.zoom - 40;
+  vpB = (cssH - view.panY) / view.zoom + 40;
+  const edgeVisible = edgeVisibleFn();
+  const edgeLabels = [];
+  for (const n of layoutNodes.values()) {
+    const f = model.fns.get(n.id);
+    if (!f) continue;
+    for (const [cid, e] of f.out) {
+      if (!edgeVisible(n.id, cid, e)) continue;
+      const t = layoutNodes.get(cid);
+      if (!t || n === t || view.zoom <= 0.7) continue;
+      const mx = (n.x + n.w + t.x) / 2;
+      const my = (n.y + n.h / 2 + t.y + t.h / 2) / 2;
+      if (mx >= vpL && mx <= vpR && my >= vpT && my <= vpB) {
+        edgeLabels.push({ mx, my, count: e.count });
+      }
+    }
+  }
+  drawLabels(tctx, edgeLabels);
+}
 
 function draw2d() {
   const cv = el('cv');
