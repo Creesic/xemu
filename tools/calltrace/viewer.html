@@ -140,6 +140,8 @@ let mutedFns = new Set();
 let collapsedFns = new Set();     // fn ids whose callees are hidden (subtree collapse)
 let lastLayoutKey = '';           // invalidates cached layout when discovery grows
 let rafId = 0, lastTs = 0;
+let vpL = 0, vpR = 0, vpT = 0, vpB = 0;   // visible world rect (set in draw)
+const ptInView = (x, y) => x >= vpL && x <= vpR && y >= vpT && y <= vpB;
 
 function showBanner(msg, kind) {
   const b = el('banner');
@@ -600,13 +602,18 @@ function drawEdge(ctx, a, b, count, cross) {
   ctx.moveTo(x1, y1);
   ctx.bezierCurveTo(mx, y1, mx, y2, x2, y2);
   ctx.stroke();
-  ctx.fillStyle = ctx.strokeStyle;
-  ctx.beginPath();
-  ctx.moveTo(x2, y2);
-  ctx.lineTo(x2 - 7, y2 - 4);
-  ctx.lineTo(x2 - 7, y2 + 4);
-  ctx.fill();
-  if (view.zoom > 0.7) {
+  /* Arrowhead only when the target end is on-screen. */
+  if (ptInView(x2, y2)) {
+    ctx.fillStyle = ctx.strokeStyle;
+    ctx.beginPath();
+    ctx.moveTo(x2, y2);
+    ctx.lineTo(x2 - 7, y2 - 4);
+    ctx.lineTo(x2 - 7, y2 + 4);
+    ctx.fill();
+  }
+  /* Count label only when zoomed enough AND the label is on-screen — this is
+   * what made zooming in on a high-fan-out node (e.g. _cinit) slow. */
+  if (view.zoom > 0.7 && ptInView(mx, (y1 + y2) / 2)) {
     ctx.fillStyle = 'rgba(200,200,200,0.75)';
     ctx.fillText('×' + count, mx - 8, (y1 + y2) / 2 - 4);
   }
@@ -687,12 +694,12 @@ function draw() {
   /* Viewport culling: only draw shapes that intersect the visible world
    * rect. This is what makes zooming IN faster (fewer shapes on screen),
    * not slower. */
-  const wl = -view.panX / view.zoom - 40;
-  const wr = (cv.width / dpr - view.panX) / view.zoom + 40;
-  const wt = -view.panY / view.zoom - 40;
-  const wb = (cv.height / dpr - view.panY) / view.zoom + 40;
+  vpL = -view.panX / view.zoom - 40;
+  vpR = (cv.width / dpr - view.panX) / view.zoom + 40;
+  vpT = -view.panY / view.zoom - 40;
+  vpB = (cv.height / dpr - view.panY) / view.zoom + 40;
   const inView = (x, y, w, h) =>
-      x + w >= wl && x <= wr && y + h >= wt && y <= wb;
+      x + w >= vpL && x <= vpR && y + h >= vpT && y <= vpB;
 
   for (const n of layoutNodes.values()) {
     const f = model.fns.get(n.id);
@@ -727,16 +734,18 @@ function draw() {
       /* cubic Bezier matching drawEdge: P0,(mx,y1),(mx,y2),P3 */
       const px = u*u*u*x1 + 3*u*u*t*mx + 3*u*t*t*mx + t*t*t*x2;
       const py = u*u*u*y1 + 3*u*u*t*y1 + 3*u*t*t*y2 + t*t*t*y2;
-      /* Bright orange spark with a glowing halo; stays vivid most of its life. */
+      /* Bright orange spark with a layered halo — no shadowBlur, which is
+       * very expensive and scales with zoom. Concentric circles fake the
+       * glow cheaply and look the same at any zoom. */
       const pa = Math.min(1, 1.3 - t);
-      ctx.shadowColor = 'rgba(255,140,0,1)';
-      ctx.shadowBlur = 14;
+      ctx.beginPath();
+      ctx.arc(px, py, 9, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(255,140,0,${0.18 * pa})`;
+      ctx.fill();
       ctx.beginPath();
       ctx.arc(px, py, 5, 0, Math.PI * 2);
       ctx.fillStyle = `rgba(255,150,30,${pa})`;
       ctx.fill();
-      ctx.shadowBlur = 0;
-      /* hot white-ish core */
       ctx.beginPath();
       ctx.arc(px, py, 2, 0, Math.PI * 2);
       ctx.fillStyle = `rgba(255,235,190,${pa})`;
