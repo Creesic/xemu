@@ -28,7 +28,12 @@ if not fs.exists(lib)
     message('Downloading dsp56300 @0@ for @1@...'.format(ver, rust_target))
     run_command(find_program('curl'), '-fsSL', url, '-o', src_archive, check: true)
   endif
-  run_command('tar', 'xzf', src_archive, '-C', meson.current_build_dir(), check: true)
+  # Extract with Python rather than tar: GNU tar misparses Windows-style
+  # C:/ paths as remote-host specs, breaking native Windows builds.
+  python = find_program('python3')
+  run_command(python, '-c',
+              'import sys, tarfile; tarfile.open(sys.argv[1]).extractall(sys.argv[2])',
+              src_archive, meson.current_build_dir(), check: true)
 endif
 
 link_args = []
