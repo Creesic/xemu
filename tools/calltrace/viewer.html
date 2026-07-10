@@ -138,6 +138,16 @@ let view = { panX: 40, panY: 40, zoom: 1 };
 let dpr = 1;
 let resScale = 1;                 // canvas backing-store resolution multiplier
 let autoRes = true;               // drop to half res only while moving
+let ctx2d = null;
+/* Opaque (no per-pixel blend) + low-latency canvas — cheap paint savings.
+ * Whether the browser accelerates 2D canvas at all is still its decision. */
+function getCtx() {
+  if (!ctx2d) {
+    ctx2d = el('cv').getContext('2d',
+                                { alpha: false, desynchronized: true });
+  }
+  return ctx2d;
+}
 let motionTimer = 0;
 let layoutNodes = new Map();      // id -> layout node (Task 8)
 
@@ -718,7 +728,7 @@ function drawLabels(ctx, edgeLabels) {
 
 function draw() {
   const cv = el('cv');
-  const ctx = cv.getContext('2d');
+  const ctx = getCtx();
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = '#14161a';
   ctx.fillRect(0, 0, cv.width, cv.height);
