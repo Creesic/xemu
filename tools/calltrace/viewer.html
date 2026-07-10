@@ -21,7 +21,10 @@
   #banner.info { display: block; background: #20405c; color: #a0d0ff; }
   #main { display: flex; flex: 1; min-height: 0; }
   #cvwrap { flex: 1; position: relative; min-width: 0; }
-  #cv { position: absolute; inset: 0; }
+  #glcv, #cv, #cvtext { position: absolute; inset: 0; }
+  #glcv { z-index: 1; }
+  #cv { z-index: 2; }
+  #cvtext { z-index: 3; pointer-events: none; }
   #perf { position: absolute; top: 8px; left: 8px; margin: 0; z-index: 5;
           background: rgba(10,12,16,0.82); color: #b6e3ff; padding: 8px 10px;
           border: 1px solid #345; border-radius: 5px; font: 12px/1.45 monospace;
@@ -105,7 +108,7 @@ for f in currentProgram.getFunctionManager().getFunctions(True):
   </div>
 </div>
 <div id="main">
-  <div id="cvwrap"><canvas id="cv"></canvas><pre id="perf" hidden></pre></div>
+  <div id="cvwrap"><canvas id="glcv"></canvas><canvas id="cv"></canvas><canvas id="cvtext"></canvas><pre id="perf" hidden></pre></div>
   <div id="details"><i>No selection</i></div>
 </div>
 <div id="stats">No recording loaded</div>
@@ -155,7 +158,7 @@ let layoutNodes = new Map();      // id -> layout node (Task 8)
  * This keeps motion smooth on paint/upload-bound machines without leaving
  * the static view blurry. */
 function nudgeMotion() {
-  if (!autoRes) return;
+  if (glActive || !autoRes) return;   /* GL renders full-res fast; no ½-res */
   if (resScale !== 0.5) { resScale = 0.5; fitCanvas(); }
   clearTimeout(motionTimer);
   motionTimer = setTimeout(() => { resScale = 1; fitCanvas(); }, 180);
@@ -726,7 +729,175 @@ function drawLabels(ctx, edgeLabels) {
   return nLabels + edgeLabels.length;
 }
 
+/* ---------------- WebGL renderer ---------------- */
+
+let gl = null, glActive = false, glProg = null;
+let glBufNodes = null, glBufEdges = null, glBufPulses = null;
+let glLocPos = -1, glLocColor = -1, glLocXform = null;
+let glNodeVerts = 0, glEdgeVerts = 0, glPulseVerts = 0;
+let glBuildCount = 0;             // bumped only when geometry is rebuilt
+let glDirty = true;               // geometry needs rebuild
+const BG = [0x14 / 255, 0x16 / 255, 0x1a / 255];
+
+const GL_VS = `
+attribute vec2 aPos;
+attribute vec4 aColor;
+uniform vec4 uXform;              /* zoomX, zoomY, panClipX, panClipY */
+varying vec4 vColor;
+void main() {
+  vec2 p = aPos * uXform.xy + uXform.zw;
+  gl_Position = vec4(p, 0.0, 1.0);
+  vColor = aColor;
+}`;
+const GL_FS = `
+precision mediump float;
+varying vec4 vColor;
+void main() { gl_FragColor = vec4(vColor.rgb * vColor.a, vColor.a); }`;
+
+function glCompile(vsSrc, fsSrc) {
+  const mk = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      console.error('shader', gl.getShaderInfoLog(s));
+      return null;
+    }
+    return s;
+  };
+  const vs = mk(gl.VERTEX_SHADER, vsSrc), fs = mk(gl.FRAGMENT_SHADER, fsSrc);
+  if (!vs || !fs) return null;
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    console.error('link', gl.getProgramInfoLog(p));
+    return null;
+  }
+  return p;
+}
+
+function initGL() {
+  const cv = el('glcv');
+  try {
+    gl = cv.getContext('webgl',
+                       { alpha: false, antialias: true, desynchronized: true })
+      || cv.getContext('experimental-webgl');
+  } catch (e) { gl = null; }
+  if (!gl) { glActive = false; return; }
+  glProg = glCompile(GL_VS, GL_FS);
+  if (!glProg) { gl = null; glActive = false; return; }
+  glLocPos = gl.getAttribLocation(glProg, 'aPos');
+  glLocColor = gl.getAttribLocation(glProg, 'aColor');
+  glLocXform = gl.getUniformLocation(glProg, 'uXform');
+  glBufNodes = gl.createBuffer();
+  glBufEdges = gl.createBuffer();
+  glBufPulses = gl.createBuffer();
+  gl.disable(gl.DEPTH_TEST);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);   /* premultiplied */
+  cv.addEventListener('webglcontextlost', ev => {
+    ev.preventDefault(); glActive = false; applyRenderer();
+  });
+  glActive = true;
+}
+
+/* Show the GL + text canvases when GL is active; otherwise the 2D canvas. */
+function applyRenderer() {
+  el('glcv').style.display = glActive ? 'block' : 'none';
+  el('cvtext').style.display = glActive ? 'block' : 'none';
+  el('cv').style.display = glActive ? 'none' : 'block';
+}
+
 function draw() {
+  if (glActive) { glDraw(); } else { draw2d(); }
+}
+
+function glXform() {
+  const cssW = el('glcv').clientWidth || 1, cssH = el('glcv').clientHeight || 1;
+  return [2 * view.zoom / cssW, -2 * view.zoom / cssH,
+          2 * view.panX / cssW - 1, 1 - 2 * view.panY / cssH];
+}
+
+/* Fill the node/edge geometry buffers from the current layout. Filled in
+ * later steps; for now leaves the buffers empty. */
+function glBuild() {
+  glNodeVerts = 0;
+  glEdgeVerts = 0;
+}
+
+function glDrawBuffer(buf, vertCount) {
+  if (!vertCount) return;
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.enableVertexAttribArray(glLocPos);
+  gl.vertexAttribPointer(glLocPos, 2, gl.FLOAT, false, 24, 0);
+  gl.enableVertexAttribArray(glLocColor);
+  gl.vertexAttribPointer(glLocColor, 4, gl.FLOAT, false, 24, 8);
+  gl.drawArrays(gl.TRIANGLES, 0, vertCount);
+}
+
+let glLastSel = undefined;
+
+function glDraw() {
+  if (!gl) return;
+  gl.viewport(0, 0, el('glcv').width, el('glcv').height);
+  gl.clearColor(BG[0], BG[1], BG[2], 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  if (!model) { textOverlay(); return; }
+  layoutTick(textCtx());        /* recompute layout + cache like draw2d */
+  if (selected !== glLastSel) { glLastSel = selected; glDirty = true; }
+  /* Fade animates during playback -> node colors change every frame. */
+  if (timeline.active && timeline.playing) glDirty = true;
+  gl.useProgram(glProg);
+  gl.uniform4fv(glLocXform, glXform());
+  if (glDirty) { glBuild(); glDirty = false; glBuildCount++; }
+  glDrawBuffer(glBufEdges, glEdgeVerts);
+  glDrawBuffer(glBufNodes, glNodeVerts);
+  glDrawPulses();
+  textOverlay();
+}
+
+/* Shared: 2D context of the text-overlay canvas (for measureText + labels). */
+let textCtx2d = null;
+function textCtx() {
+  if (!textCtx2d) textCtx2d = el('cvtext').getContext('2d');
+  return textCtx2d;
+}
+
+function edgeVisibleFn() {
+  return model.timed && timeline.active
+      ? (from, cid, edge) => edge.firstFire <= timeline.playhead
+      : (from) => expanded.has(from);
+}
+function visKeyStr() {
+  const collapseKey = collapsedFns.size + ':' + [...collapsedFns].join(',');
+  return model.timed && timeline.active
+      ? 'tl:' + discoveredEdgeCount(model, timeline.playhead) + ':' +
+        mutedFns.size + ':' + collapseKey
+      : 'manual:' + expanded.size + ':' + [...expanded].join(',') + ':' +
+        mutedFns.size + ':' + collapseKey;
+}
+/* Recompute layout only when the visible set changes; measure labels with the
+ * supplied 2D context. Marks GL geometry dirty on any rebuild. */
+function layoutTick(mctx) {
+  const visKey = visKeyStr();
+  if (visKey !== lastLayoutKey || !layoutNodes.size) {
+    layoutNodes = computeLayout(model, edgeVisibleFn());
+    mctx.font = '12px monospace';
+    for (const n of layoutNodes.values()) {
+      n.label = fnName(model, n.id);
+      n.w = Math.min(220, Math.max(120,
+                                   mctx.measureText(n.label).width + 40));
+    }
+    lastLayoutKey = visKey;
+    glDirty = true;
+  }
+}
+
+/* Filled in WG4/WG5. */
+function glDrawPulses() {}
+function textOverlay() {}
+
+function draw2d() {
   const cv = el('cv');
   const ctx = getCtx();
   ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -747,26 +918,9 @@ function draw() {
   ctx.setTransform(view.zoom * dpr, 0, 0, view.zoom * dpr,
                    view.panX * dpr, view.panY * dpr);
   ctx.font = '12px monospace';
-  const edgeVisible = model.timed && timeline.active
-      ? (from, cid, edge) => edge.firstFire <= timeline.playhead
-      : (from) => expanded.has(from);
-  /* Recompute layout only when the visible set changes (cheap during play). */
-  const collapseKey = collapsedFns.size + ':' + [...collapsedFns].join(',');
-  const visKey = model.timed && timeline.active
-      ? 'tl:' + discoveredEdgeCount(model, timeline.playhead) + ':' +
-        mutedFns.size + ':' + collapseKey
-      : 'manual:' + expanded.size + ':' + [...expanded].join(',') + ':' +
-        mutedFns.size + ':' + collapseKey;
+  const edgeVisible = edgeVisibleFn();
   const _tStart = performance.now();
-  if (visKey !== lastLayoutKey || !layoutNodes.size) {
-    layoutNodes = computeLayout(model, edgeVisible);
-    for (const n of layoutNodes.values()) {
-      n.label = fnName(model, n.id);
-      n.w = Math.min(220, Math.max(120,
-                                   ctx.measureText(n.label).width + 40));
-    }
-    lastLayoutKey = visKey;
-  }
+  layoutTick(ctx);
   const _tLayout = performance.now();
   /* Viewport culling: only draw shapes that intersect the visible world
    * rect. This is what makes zooming IN faster (fewer shapes on screen),
@@ -1505,20 +1659,25 @@ async function runSelfTests() {
 
 window.addEventListener('load', () => {
   if (location.search.includes('selftest')) { runSelfTests(); return; }
+  initGL();
+  applyRenderer();
   fitCanvas();
   window.addEventListener('resize', fitCanvas);
   showLegend();
 });
 function fitCanvas() {
-  const cv = el('cv');
-  const r = cv.parentElement.getBoundingClientRect();
-  /* resScale halves the backing-store resolution — the single biggest lever
-   * when rendering is paint/upload-bound (fewer pixels to raster + copy). */
-  dpr = (window.devicePixelRatio || 1) * resScale;
-  cv.width = Math.round(r.width * dpr);
-  cv.height = Math.round(r.height * dpr);
-  cv.style.width = r.width + 'px';
-  cv.style.height = r.height + 'px';
+  const r = el('cvwrap').getBoundingClientRect();
+  /* GL path renders at full dpr (it's fast). resScale only trims the 2D
+   * fallback when it's paint/upload-bound. */
+  dpr = (window.devicePixelRatio || 1) * (glActive ? 1 : resScale);
+  const W = Math.round(r.width * dpr), H = Math.round(r.height * dpr);
+  for (const id of ['glcv', 'cv', 'cvtext']) {
+    const c = el(id);
+    c.width = W; c.height = H;
+    c.style.width = r.width + 'px';
+    c.style.height = r.height + 'px';
+  }
+  textCtx2d = null;   /* re-fetch context after resize */
   draw();
 }
 el('btn-res').addEventListener('click', () => {
