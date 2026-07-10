@@ -103,6 +103,8 @@ const esc = s => s.replace(/[&<>"]/g,
  * report. The __XCT__ markers delimit the value for the packer.
  */
 const EMBEDDED_XCT = /*__XCT__*/""/*__XCT__*/;
+/* Optional inlined symbol map (base64 UTF-8), paired with EMBEDDED_XCT. */
+const EMBEDDED_SYMS = /*__SYMS__*/""/*__SYMS__*/;
 
 let model = null;
 let symbols = new Map();          // addr -> user symbol name
@@ -732,7 +734,9 @@ function loadSymbols(text) {
   for (const line of text.split(/\r?\n/)) {
     const t = line.trim();
     if (!t || t.startsWith('#') || t.startsWith(';')) continue;
-    const m = t.match(/^(?:0x)?([0-9a-fA-F]{4,8})[\s:=,]+(\S+)/);
+    /* address, a separator, then the rest of the line as the name
+     * (so qualified names like Foo::Bar and demangled names work). */
+    const m = t.match(/^(?:0x)?([0-9a-fA-F]{4,8})[\s:=,]+(.+?)\s*$/);
     if (!m) { skipped++; continue; }
     symbols.set(parseInt(m[1], 16), m[2]);
     applied++;
@@ -917,11 +921,18 @@ function runSelfTests() {
       esc(out.join('\n')) + '</pre>';
 }
 
-function loadEmbedded() {
-  const bin = atob(EMBEDDED_XCT);
+function b64ToBytes(b64) {
+  const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  loadRecording(bytes.buffer, 'embedded recording');
+  return bytes;
+}
+
+function loadEmbedded() {
+  loadRecording(b64ToBytes(EMBEDDED_XCT).buffer, 'embedded recording');
+  if (EMBEDDED_SYMS) {
+    loadSymbols(new TextDecoder().decode(b64ToBytes(EMBEDDED_SYMS)));
+  }
 }
 
 window.addEventListener('load', () => {
