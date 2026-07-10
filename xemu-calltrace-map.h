@@ -34,6 +34,7 @@
 typedef struct CTEdge {
     uint64_t key; /* (call_site << 32) | callee; 0 = empty slot */
     uint64_t count;
+    uint32_t index; /* stable first-seen ordinal; used by the event log */
 } CTEdge;
 
 typedef struct CTMap {
@@ -91,6 +92,39 @@ static inline bool ct_map_add(CTMap *m, uint32_t call_site, uint32_t callee)
             e->count = 1;
             m->num_entries++;
             return true;
+        }
+        idx = (idx + 1) & (CT_MAP_CAPACITY - 1);
+    }
+}
+
+/*
+ * Like ct_map_add, but returns the edge so callers can read its stable
+ * index and current count (for the timed event log). Returns NULL for the
+ * 0-key sentinel or when the map is full and the edge is new.
+ */
+static inline CTEdge *ct_map_add_indexed(CTMap *m, uint32_t call_site,
+                                         uint32_t callee)
+{
+    uint64_t key = ct_map_key(call_site, callee);
+    if (key == 0) {
+        return NULL;
+    }
+    uint32_t idx = ct_map_hash(key) & (CT_MAP_CAPACITY - 1);
+    for (;;) {
+        CTEdge *e = &m->slots[idx];
+        if (e->key == key) {
+            e->count++;
+            return e;
+        }
+        if (e->key == 0) {
+            if (m->num_entries >= CT_MAP_MAX_ENTRIES) {
+                return NULL;
+            }
+            e->key = key;
+            e->count = 1;
+            e->index = m->num_entries;
+            m->num_entries++;
+            return e;
         }
         idx = (idx + 1) & (CT_MAP_CAPACITY - 1);
     }

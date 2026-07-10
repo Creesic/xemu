@@ -44,6 +44,20 @@ int main(void)
 
     ct_map_free(&m);
     assert(m.slots == NULL);
+
+    /* ct_map_add_indexed assigns stable, dense indices */
+    CTMap m2;
+    assert(ct_map_init(&m2));
+    CTEdge *e0 = ct_map_add_indexed(&m2, 0xAAAA, 0xBBBB);
+    CTEdge *e1 = ct_map_add_indexed(&m2, 0xCCCC, 0xDDDD);
+    assert(e0 && e0->index == 0 && e0->count == 1);
+    assert(e1 && e1->index == 1 && e1->count == 1);
+    CTEdge *e0b = ct_map_add_indexed(&m2, 0xAAAA, 0xBBBB);
+    assert(e0b == e0 && e0b->index == 0 && e0b->count == 2);
+    assert(ct_map_add_indexed(&m2, 0, 0) == NULL); /* sentinel */
+    assert(m2.num_entries == 2);
+    ct_map_free(&m2);
+
     printf("PASS\n");
     return 0;
 }
