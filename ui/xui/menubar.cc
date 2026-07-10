@@ -226,13 +226,56 @@ void ShowMainMenu()
             if (ImGui::BeginMenu("Call Trace")) {
                 if (!xemu_calltrace_armed) {
                     bool have_xbe = xemu_get_xbe_info() != NULL;
-                    if (ImGui::MenuItem("Start Recording", NULL, false,
+                    if (ImGui::MenuItem("Start - Edges", NULL, false,
                                         have_xbe)) {
-                        xemu_calltrace_start();
+                        xemu_calltrace_start_mode(CT_EDGES);
+                    }
+                    if (ImGui::MenuItem("Start - Timed (call timeline)", NULL,
+                                        false, have_xbe)) {
+                        xemu_calltrace_start_mode(CT_TIMED);
+                    }
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Load ignore list...")) {
+                        const char *dir = g_config.general.calltrace_dir;
+                        if (!strlen(dir)) {
+                            dir = g_config.general.screenshot_dir;
+                        }
+                        if (!strlen(dir)) {
+                            dir = ".";
+                        }
+                        char *path = g_strdup_printf("%s/ignore.txt", dir);
+                        int added = 0, skipped = 0;
+                        xemu_calltrace_load_ignore(path, &added, &skipped);
+                        char *msg = g_strdup_printf(
+                            "Ignore list: %d loaded, %d skipped (%s)",
+                            added, skipped, path);
+                        xemu_queue_notification(msg);
+                        g_free(msg);
+                        g_free(path);
+                    }
+                    if (xemu_calltrace_ignore_count() > 0) {
+                        ImGui::Text("Ignoring %u addresses",
+                                    xemu_calltrace_ignore_count());
+                        if (ImGui::MenuItem("Clear ignore list")) {
+                            xemu_calltrace_clear_ignore();
+                        }
                     }
                 } else {
-                    ImGui::Text("Recording: %llu unique edges",
-                                (unsigned long long)xemu_calltrace_edge_count());
+                    bool timed = xemu_calltrace_mode() == CT_TIMED;
+                    ImGui::Text("Recording (%s): %llu edges",
+                                timed ? "Timed" : "Edges",
+                                (unsigned long long)
+                                    xemu_calltrace_edge_count());
+                    if (timed) {
+                        ImGui::Text("Events: %llu",
+                                    (unsigned long long)
+                                        xemu_calltrace_event_count());
+                        if (xemu_calltrace_events_truncated()) {
+                            ImGui::TextColored(
+                                ImVec4(1.0f, 0.6f, 0.1f, 1.0f),
+                                "Event cap reached; timeline is partial");
+                        }
+                    }
                     if (xemu_calltrace_truncated()) {
                         ImGui::TextColored(
                             ImVec4(1.0f, 0.6f, 0.1f, 1.0f),
