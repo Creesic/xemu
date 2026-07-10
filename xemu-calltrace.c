@@ -26,6 +26,7 @@
 #include "xemu-calltrace-map.h"
 #include "xemu-calltrace-events.h"
 #include "xemu-calltrace-kexports.h"
+#include <zlib.h>
 
 #define CT_KERNEL_SPACE 0x80000000u
 
@@ -371,6 +372,36 @@ static GArray *collect_kernel_exports(GByteArray *strtab)
     return arr;
 }
 
+/* Deflate the event log (u32 indices, in order) into a GByteArray. */
+static GByteArray *ct_deflate_events(void)
+{
+    GByteArray *out = g_byte_array_new();
+    z_stream zs = { 0 };
+    if (deflateInit(&zs, Z_DEFAULT_COMPRESSION) != Z_OK) {
+        return out;
+    }
+    guint8 obuf[65536];
+    for (CTEventChunk *c = ct_events.head; c; c = c->next) {
+        zs.next_in = (Bytef *)c->data;
+        zs.avail_in = c->fill * sizeof(uint32_t);
+        while (zs.avail_in) {
+            zs.next_out = obuf;
+            zs.avail_out = sizeof(obuf);
+            deflate(&zs, Z_NO_FLUSH);
+            g_byte_array_append(out, obuf, sizeof(obuf) - zs.avail_out);
+        }
+    }
+    int rc;
+    do {
+        zs.next_out = obuf;
+        zs.avail_out = sizeof(obuf);
+        rc = deflate(&zs, Z_FINISH);
+        g_byte_array_append(out, obuf, sizeof(obuf) - zs.avail_out);
+    } while (rc == Z_OK);
+    deflateEnd(&zs);
+    return out;
+}
+
 char *xemu_calltrace_save(const char *dir, char **err_msg)
 {
     *err_msg = NULL;
@@ -442,8 +473,9 @@ char *xemu_calltrace_save(const char *dir, char **err_msg)
     bool ok = f != NULL;
     if (ok) {
         /* Host is little-endian on all supported platforms. */
+        bool timed = ct_mode == CT_TIMED;
         uint32_t hdr[10] = { 0x52544358u,
-                             1,
+                             timed ? 2u : 1u,
                              ct_truncated ? 1u : 0u,
                              ldl_le_p(&xbe->cert->m_titleid),
                              base,
@@ -463,15 +495,39 @@ char *xemu_calltrace_save(const char *dir, char **err_msg)
             ok = fwrite(kimports->data, sizeof(KImport), kimports->len,
                         f) == kimports->len;
         }
-        for (uint32_t i = 0; ok && i < CT_MAP_CAPACITY; i++) {
-            CTEdge *e = &ct_map.slots[i];
-            if (!e->key) {
-                continue;
+        /* Emit edges in index order so events[k] indexes edges[k]. */
+        CTEdge **ordered = g_new(CTEdge *, ct_map.num_entries);
+        for (uint32_t i = 0; i < CT_MAP_CAPACITY; i++) {
+            if (ct_map.slots[i].key) {
+                ordered[ct_map.slots[i].index] = &ct_map.slots[i];
             }
+        }
+        for (uint32_t i = 0; ok && i < ct_map.num_entries; i++) {
+            CTEdge *e = ordered[i];
             uint32_t addrs[2] = { (uint32_t)(e->key >> 32),
                                   (uint32_t)e->key };
             ok = fwrite(addrs, 8, 1, f) == 1 &&
                  fwrite(&e->count, 8, 1, f) == 1;
+        }
+        g_free(ordered);
+
+        /* v2: trailing compressed event block. */
+        if (ok && timed) {
+            GByteArray *blob = ct_deflate_events();
+            uint64_t event_count = ct_events.count;
+            uint32_t event_flags = ct_events_trunc ? 1u : 0u;
+            uint32_t tfull = CT_THROTTLE_FULL, tevery = CT_THROTTLE_EVERY;
+            uint64_t raw_bytes = event_count * sizeof(uint32_t);
+            uint64_t comp_bytes = blob->len;
+            ok = fwrite(&event_count, 8, 1, f) == 1 &&
+                 fwrite(&event_flags, 4, 1, f) == 1 &&
+                 fwrite(&tfull, 4, 1, f) == 1 &&
+                 fwrite(&tevery, 4, 1, f) == 1 &&
+                 fwrite(&raw_bytes, 8, 1, f) == 1 &&
+                 fwrite(&comp_bytes, 8, 1, f) == 1 &&
+                 (comp_bytes == 0 ||
+                  fwrite(blob->data, blob->len, 1, f) == 1);
+            g_byte_array_free(blob, TRUE);
         }
         fclose(f);
     }
