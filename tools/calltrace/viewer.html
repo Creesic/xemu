@@ -22,6 +22,12 @@
   #main { display: flex; flex: 1; min-height: 0; }
   #cvwrap { flex: 1; position: relative; min-width: 0; }
   #cv { position: absolute; inset: 0; }
+  #perf { position: absolute; top: 8px; left: 8px; margin: 0; z-index: 5;
+          background: rgba(10,12,16,0.82); color: #b6e3ff; padding: 8px 10px;
+          border: 1px solid #345; border-radius: 5px; font: 12px/1.45 monospace;
+          white-space: pre; pointer-events: none; }
+  #perf .warn { color: #ffcf6b; }
+  #perf .hot { color: #ff8a8a; }
   #details { width: 300px; overflow-y: auto; background: #1d2026;
              border-left: 1px solid #333; padding: 10px; }
   #details h3 { font-size: 14px; word-break: break-all; margin-bottom: 6px; }
@@ -79,6 +85,7 @@
   <button id="btn-reset">Reset view</button>
   <button id="btn-legend">Legend</button>
   <button id="btn-noise">Noise</button>
+  <button id="btn-perf">Perf</button>
   <button onclick="el('helpbox').hidden = !el('helpbox').hidden">Help</button>
 </div>
 <div id="banner"></div>
@@ -97,7 +104,7 @@ for f in currentProgram.getFunctionManager().getFunctions(True):
   </div>
 </div>
 <div id="main">
-  <div id="cvwrap"><canvas id="cv"></canvas></div>
+  <div id="cvwrap"><canvas id="cv"></canvas><pre id="perf" hidden></pre></div>
   <div id="details"><i>No selection</i></div>
 </div>
 <div id="stats">No recording loaded</div>
@@ -142,6 +149,14 @@ let lastLayoutKey = '';           // invalidates cached layout when discovery gr
 let rafId = 0, lastTs = 0;
 let vpL = 0, vpR = 0, vpT = 0, vpB = 0;   // visible world rect (set in draw)
 const ptInView = (x, y) => x >= vpL && x <= vpR && y >= vpT && y <= vpB;
+
+/* Profiler: filled in by draw(), shown by the Perf overlay. */
+let perf = {
+  on: false, lastTs: 0, frameMs: 0, drawMs: 0,
+  layout: 0, edges: 0, nodes: 0, labels: 0, pulsesMs: 0,
+  nNodes: 0, nEdges: 0, nLabels: 0, nPulses: 0,
+};
+const ema = (prev, v) => prev ? prev * 0.9 + v * 0.1 : v;
 
 function showBanner(msg, kind) {
   const b = el('banner');
@@ -651,9 +666,11 @@ function drawLabels(ctx, edgeLabels) {
   const DY = wy => (wy * view.zoom + view.panY) * dpr;
 
   ctx.textAlign = 'left';
+  let nLabels = 0;
   for (const n of layoutNodes.values()) {
     if (!(n.x + n.w >= vpL && n.x <= vpR && n.y + n.h >= vpT &&
           n.y <= vpB)) continue;
+    nLabels++;
     const f = model.fns.get(n.id);
     const expandable = f && f.out.size > 0 && f.kind !== 'kernel';
     const collapsed = model.timed && timeline.active
@@ -678,6 +695,7 @@ function drawLabels(ctx, edgeLabels) {
     ctx.fillText('×' + L.count, DX(L.mx), DY(L.my));
   }
   ctx.textAlign = 'left';
+  return nLabels + edgeLabels.length;
 }
 
 function draw() {
@@ -711,6 +729,7 @@ function draw() {
         mutedFns.size + ':' + collapseKey
       : 'manual:' + expanded.size + ':' + [...expanded].join(',') + ':' +
         mutedFns.size + ':' + collapseKey;
+  const _tStart = performance.now();
   if (visKey !== lastLayoutKey || !layoutNodes.size) {
     layoutNodes = computeLayout(model, edgeVisible);
     for (const n of layoutNodes.values()) {
@@ -720,6 +739,7 @@ function draw() {
     }
     lastLayoutKey = visKey;
   }
+  const _tLayout = performance.now();
   /* Viewport culling: only draw shapes that intersect the visible world
    * rect. This is what makes zooming IN faster (fewer shapes on screen),
    * not slower. */
@@ -731,6 +751,7 @@ function draw() {
       x + w >= vpL && x <= vpR && y + h >= vpT && y <= vpB;
 
   const edgeLabels = [];
+  let nEdges = 0;
   for (const n of layoutNodes.values()) {
     const f = model.fns.get(n.id);
     if (!f) continue;
@@ -743,6 +764,7 @@ function draw() {
       const bh = Math.max(n.y + n.h, t.y + t.h) - by;
       if (!inView(bx, by, bw, bh)) continue;
       drawEdge(ctx, n, t, e.count, t.parent !== n);
+      nEdges++;
       if (view.zoom > 0.7 && n !== t) {
         const mx = (n.x + n.w + t.x) / 2;
         const my = (n.y + n.h / 2 + t.y + t.h / 2) / 2;
@@ -752,12 +774,17 @@ function draw() {
       }
     }
   }
+  const _tEdges = performance.now();
+  let nNodes = 0;
   for (const n of layoutNodes.values()) {
-    if (inView(n.x, n.y, n.w, n.h)) drawNode(ctx, n);
+    if (inView(n.x, n.y, n.w, n.h)) { drawNode(ctx, n); nNodes++; }
   }
-  drawLabels(ctx, edgeLabels);
+  const _tNodes = performance.now();
+  const nLabels = drawLabels(ctx, edgeLabels);
   ctx.setTransform(view.zoom * dpr, 0, 0, view.zoom * dpr,
                    view.panX * dpr, view.panY * dpr);
+  const _tLabels = performance.now();
+  let nPulses = 0;
 
   if (timeline.active && pulses.length) {
     const now = performance.now();
@@ -790,12 +817,23 @@ function draw() {
       ctx.arc(px, py, 2, 0, Math.PI * 2);
       ctx.fillStyle = `rgba(255,235,190,${pa})`;
       ctx.fill();
+      nPulses++;
     }
     /* keep fading after the last playback step */
     if (pulses.length && !timeline.playing && !rafId) {
       requestAnimationFrame(() => draw());
     }
   }
+
+  const _tEnd = performance.now();
+  perf.layout = ema(perf.layout, _tLayout - _tStart);
+  perf.edges = ema(perf.edges, _tEdges - _tLayout);
+  perf.nodes = ema(perf.nodes, _tNodes - _tEdges);
+  perf.labels = ema(perf.labels, _tLabels - _tNodes);
+  perf.pulsesMs = ema(perf.pulsesMs, _tEnd - _tLabels);
+  perf.drawMs = ema(perf.drawMs, _tEnd - _tStart);
+  perf.nNodes = nNodes; perf.nEdges = nEdges;
+  perf.nLabels = nLabels; perf.nPulses = nPulses;
 }
 
 /* ---------------- interaction ---------------- */
@@ -953,6 +991,57 @@ function exportIgnore() {
   URL.revokeObjectURL(a.href);
 }
 el('btn-noise').addEventListener('click', () => { showNoise(); });
+
+/* ---------------- profiler overlay ---------------- */
+
+function updatePerfOverlay() {
+  const fps = perf.frameMs ? 1000 / perf.frameMs : 0;
+  const gpu = Math.max(0, perf.frameMs - perf.drawMs);
+  const f = n => n.toFixed(2).padStart(6);
+  const cv = el('cv');
+  const budget = 1000 / 60;                 /* ~16.7 ms vsync frame budget */
+  const lines = [
+    `FPS ${fps.toFixed(0).padStart(3)}    frame ${f(perf.frameMs)} ms`,
+    `draw (JS)     ${f(perf.drawMs)} ms`,
+    `  layout      ${f(perf.layout)} ms`,
+    `  edges       ${f(perf.edges)} ms  x${perf.nEdges}`,
+    `  nodes       ${f(perf.nodes)} ms  x${perf.nNodes}`,
+    `  labels      ${f(perf.labels)} ms  x${perf.nLabels}`,
+    `  pulses      ${f(perf.pulsesMs)} ms  x${perf.nPulses}`,
+    `non-JS/frame  ${f(gpu)} ms  (paint+upload+vsync wait)`,
+    `zoom ${view.zoom.toFixed(2)}x  canvas ${cv.width}x${cv.height}  dpr ${dpr}`,
+  ];
+  /* Only "slow" if the frame overruns the vsync budget. Below that, the
+   * non-JS time is mostly idle waiting for the display, not a bottleneck. */
+  let hint;
+  if (perf.frameMs <= budget * 1.25) {
+    hint = 'smooth (vsync limited)';
+  } else if (perf.drawMs >= perf.frameMs * 0.4) {
+    hint = '<span class="warn">JS draw-bound: too many shapes/labels — ' +
+           'collapse or cull more.</span>';
+  } else {
+    hint = '<span class="hot">paint/upload-bound: JS is cheap but the ' +
+           'browser can\'t rasterize+upload the canvas fast enough. Reduce ' +
+           'painted pixels (canvas size/dpr, large fills).</span>';
+  }
+  el('perf').innerHTML = lines.map(esc).join('\n') + '\n' + hint;
+}
+
+function perfLoop(ts) {
+  if (!perf.on) { perf.lastTs = 0; return; }
+  if (perf.lastTs) perf.frameMs = ema(perf.frameMs, ts - perf.lastTs);
+  perf.lastTs = ts;
+  draw();                 /* force a redraw each frame to measure real cost */
+  updatePerfOverlay();
+  requestAnimationFrame(perfLoop);
+}
+
+el('btn-perf').addEventListener('click', () => {
+  perf.on = !perf.on;
+  el('perf').hidden = !perf.on;
+  el('btn-perf').textContent = perf.on ? 'Perf ■' : 'Perf';
+  if (perf.on) { perf.lastTs = 0; perf.frameMs = 0; requestAnimationFrame(perfLoop); }
+});
 
 /* ---------------- legend ---------------- */
 
