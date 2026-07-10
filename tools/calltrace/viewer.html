@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>xemu Call Trace Viewer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; }
+  body { display: flex; flex-direction: column; background: #14161a;
+         color: #ddd; font: 13px/1.4 system-ui, sans-serif; }
+  #toolbar { display: flex; gap: 8px; align-items: center; padding: 8px;
+             background: #1d2026; border-bottom: 1px solid #333;
+             flex-wrap: wrap; }
+  #toolbar button, #toolbar input[type=text] {
+    background: #2a2e36; color: #ddd; border: 1px solid #444;
+    border-radius: 4px; padding: 4px 10px; font: inherit; }
+  #toolbar button:hover { background: #363b45; cursor: pointer; }
+  #banner { display: none; padding: 6px 12px; font-weight: 600; }
+  #banner.error { display: block; background: #5c2020; color: #ffb0b0; }
+  #banner.warn { display: block; background: #5c4a20; color: #ffe0a0; }
+  #banner.info { display: block; background: #20405c; color: #a0d0ff; }
+  #main { display: flex; flex: 1; min-height: 0; }
+  #cvwrap { flex: 1; position: relative; min-width: 0; }
+  #cv { position: absolute; inset: 0; }
+  #details { width: 300px; overflow-y: auto; background: #1d2026;
+             border-left: 1px solid #333; padding: 10px; }
+  #details h3 { font-size: 14px; word-break: break-all; margin-bottom: 6px; }
+  #details h4 { margin: 10px 0 4px; color: #9ab; }
+  #details .kv { color: #aaa; }
+  #details .kv b { color: #ddd; font-family: monospace; }
+  #details .lnk { color: #7fb3ff; cursor: pointer; font-family: monospace;
+                  padding: 1px 0; }
+  #details .lnk:hover { text-decoration: underline; }
+  #details .site { color: #888; font-family: monospace; font-size: 12px;
+                   padding-left: 14px; }
+  #details .poly { color: #ffb84a; font-weight: 700; }
+  #stats { padding: 5px 12px; background: #1d2026; color: #999;
+           border-top: 1px solid #333; font-family: monospace; }
+  #help { font-size: 12px; color: #aaa; padding: 8px 12px; }
+  #help pre { background: #22262d; padding: 6px; margin: 4px 0;
+              overflow-x: auto; }
+</style>
+</head>
+<body>
+<div id="toolbar">
+  <button onclick="el('file').click()">Open .xct</button>
+  <input type="file" id="file" accept=".xct" hidden>
+  <button onclick="el('symfile').click()">Load symbols</button>
+  <input type="file" id="symfile" hidden>
+  <input type="text" id="search" placeholder="search name or address"
+         size="24">
+  <button id="btn-dot-visible">Export DOT (visible)</button>
+  <button id="btn-dot-full">Export DOT (full)</button>
+  <button id="btn-reset">Reset view</button>
+  <button onclick="el('helpbox').hidden = !el('helpbox').hidden">Help</button>
+</div>
+<div id="banner"></div>
+<div id="helpbox" hidden>
+  <div id="help">
+    <b>Open</b> a .xct recorded by xemu (Debug &gt; Call Trace), or drag it
+    onto this page. <b>Click</b> a node to inspect it; <b>double-click</b> to
+    expand/collapse its callees. Drag to pan, wheel to zoom.
+    <b>Symbol maps</b> are plain text, one <code>ADDRESS NAME</code> pair per
+    line. Export yours:
+    <pre>IDA (File &gt; Script command, Python):
+for f in idautils.Functions(): print("%X %s" % (f, idc.get_func_name(f)))</pre>
+    <pre>Ghidra (Window &gt; Script Manager, Python):
+for f in currentProgram.getFunctionManager().getFunctions(True):
+    print("%s %s" % (f.getEntryPoint(), f.getName()))</pre>
+  </div>
+</div>
+<div id="main">
+  <div id="cvwrap"><canvas id="cv"></canvas></div>
+  <div id="details"><i>No selection</i></div>
+</div>
+<div id="stats">No recording loaded</div>
+<script>
+'use strict';
+const KERNEL_BOUND = 0x80000000;
+const el = id => document.getElementById(id);
+const hex = a => (a >>> 0).toString(16).toUpperCase().padStart(8, '0');
+const esc = s => s.replace(/[&<>"]/g,
+    c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+
+let model = null;
+let symbols = new Map();          // addr -> user symbol name
+let expanded = new Set();         // expanded fn ids
+let selected = null;              // selected fn id
+let view = { panX: 40, panY: 40, zoom: 1 };
+let dpr = 1;
+let layoutNodes = new Map();      // id -> layout node (Task 8)
+
+function showBanner(msg, kind) {
+  const b = el('banner');
+  b.textContent = msg;
+  b.className = kind || 'info';
+}
+function clearBanner() { el('banner').className = ''; }
+
+/* ---------------- parsing & derivation ---------------- */
+
+function parseXCT(buf) {
+  if (buf.byteLength < 128) throw new Error('file too small');
+  const dv = new DataView(buf);
+  if (dv.getUint32(0, true) !== 0x52544358) {
+    throw new Error('bad magic (not an .xct file)');
+  }
+  const version = dv.getUint32(4, true);
+  if (version !== 1) throw new Error('unsupported version ' + version);
+  const flags = dv.getUint32(8, true);
+  const titleId = dv.getUint32(12, true);
+  const base = dv.getUint32(16, true);
+  const entry = dv.getUint32(20, true);
+  const nSec = dv.getUint32(24, true);
+  const nKimp = dv.getUint32(28, true);
+  const nEdge = dv.getUint32(32, true);
+  const strtabSize = dv.getUint32(36, true);
+  if (128 + strtabSize + nSec * 12 + nKimp * 8 + nEdge * 16 >
+      buf.byteLength) {
+    throw new Error('truncated file');
+  }
+  const title = new TextDecoder().decode(new Uint8Array(buf, 40, 88))
+      .replace(/\0[\s\S]*$/, '');
+  let off = 128;
+  const strBytes = new Uint8Array(buf, off, strtabSize);
+  off += strtabSize;
+  const str = o => {
+    let e = o;
+    while (e < strBytes.length && strBytes[e]) e++;
+    return new TextDecoder().decode(strBytes.subarray(o, e));
+  };
+  const sections = [];
+  for (let i = 0; i < nSec; i++, off += 12) {
+    sections.push({ name: str(dv.getUint32(off, true)),
+                    start: dv.getUint32(off + 4, true),
+                    size: dv.getUint32(off + 8, true) });
+  }
+  const kimports = new Map();
+  for (let i = 0; i < nKimp; i++, off += 8) {
+    kimports.set(dv.getUint32(off, true), str(dv.getUint32(off + 4, true)));
+  }
+  const edges = [];
+  for (let i = 0; i < nEdge; i++, off += 16) {
+    edges.push({ site: dv.getUint32(off, true),
+                 callee: dv.getUint32(off + 4, true),
+                 count: Number(dv.getBigUint64(off + 8, true)) });
+  }
+  return { title, titleId, base, entry, sections, kimports, edges,
+           truncated: !!(flags & 1) };
+}
+
+function deriveModel(rec) {
+  /* Function entries: every game-space callee, plus the XBE entry. */
+  const entrySet = new Set([rec.entry]);
+  for (const e of rec.edges) {
+    if (e.callee < KERNEL_BOUND) entrySet.add(e.callee);
+  }
+  const entries = Uint32Array.from([...entrySet].sort((a, b) => a - b));
+  /* Nearest-preceding-entry attribution for call sites. */
+  const fnOf = site => {
+    let lo = 0, hi = entries.length - 1, best = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (entries[mid] <= site) { best = entries[mid]; lo = mid + 1; }
+      else hi = mid - 1;
+    }
+    return best;
+  };
+  const fns = new Map();
+  const getFn = (id, kind) => {
+    let f = fns.get(id);
+    if (!f) {
+      f = { id, kind, out: new Map(), inSet: new Set(), sites: new Map() };
+      fns.set(id, f);
+    }
+    return f;
+  };
+  for (const e of rec.edges) {
+    let callerId, callerKind;
+    if (e.site >= KERNEL_BOUND) { callerId = -2; callerKind = 'kroot'; }
+    else {
+      callerId = fnOf(e.site);
+      callerKind = 'fn';
+      if (callerId < 0) { callerId = -3; callerKind = 'unattr'; }
+    }
+    const callee =
+        getFn(e.callee, e.callee >= KERNEL_BOUND ? 'kernel' : 'fn');
+    const caller = getFn(callerId, callerKind);
+    let edge = caller.out.get(e.callee);
+    if (!edge) {
+      edge = { count: 0, sites: new Map() };
+      caller.out.set(e.callee, edge);
+    }
+    edge.count += e.count;
+    edge.sites.set(e.site, (edge.sites.get(e.site) || 0) + e.count);
+    callee.inSet.add(callerId);
+    let siteTargets = caller.sites.get(e.site);
+    if (!siteTargets) {
+      siteTargets = new Set();
+      caller.sites.set(e.site, siteTargets);
+    }
+    siteTargets.add(e.callee);
+  }
+  getFn(rec.entry, 'fn'); /* entry exists even if it never calls out */
+  const roots = [rec.entry];
+  if (fns.has(-2)) roots.push(-2);
+  return { fns, entries, roots, rec };
+}
+
+function fnName(m, id) {
+  if (id === -2) return 'KERNEL';
+  if (id === -3) return '(unattributed)';
+  const f = m.fns.get(id);
+  if (f && f.kind === 'kernel') {
+    return m.rec.kimports.get(id) || ('kernel_' + hex(id));
+  }
+  return symbols.get(id) || ('sub_' + hex(id));
+}
+
+function sectionIndexOf(m, addr) {
+  for (let i = 0; i < m.rec.sections.length; i++) {
+    const s = m.rec.sections[i];
+    if (addr >= s.start && addr < s.start + s.size) return i;
+  }
+  return -1;
+}
+function sectionOf(m, addr) {
+  const i = sectionIndexOf(m, addr);
+  return i < 0 ? '' : m.rec.sections[i].name;
+}
+
+/* ---------------- loading ---------------- */
+
+function loadRecording(buf, name) {
+  let rec;
+  try {
+    rec = parseXCT(buf);
+  } catch (err) {
+    showBanner('Failed to load ' + name + ': ' + err.message, 'error');
+    return;
+  }
+  model = deriveModel(rec);
+  symbols = new Map();
+  const saved = localStorage.getItem('xct-syms-' + rec.titleId);
+  if (saved) {
+    try { symbols = new Map(JSON.parse(saved)); } catch (e) {}
+  }
+  expanded = new Set([rec.entry]);
+  selected = null;
+  view = { panX: 40, panY: 40, zoom: 1 };
+  clearBanner();
+  if (rec.truncated) {
+    showBanner('Recording hit the edge limit in xemu; the graph is ' +
+               'incomplete.', 'warn');
+  }
+  el('stats').textContent =
+      `${rec.title || 'Untitled'} [${hex(rec.titleId)}] — ` +
+      `${model.fns.size} nodes, ${rec.edges.length} raw edges, ` +
+      `${rec.kimports.size} kernel imports` +
+      (symbols.size ? `, ${symbols.size} symbols restored` : '');
+  draw();
+}
+
+el('file').onchange = ev => {
+  const f = ev.target.files[0];
+  if (f) f.arrayBuffer().then(buf => loadRecording(buf, f.name));
+};
+window.addEventListener('dragover', ev => ev.preventDefault());
+window.addEventListener('drop', ev => {
+  ev.preventDefault();
+  const f = ev.dataTransfer.files[0];
+  if (f) f.arrayBuffer().then(buf => loadRecording(buf, f.name));
+});
+
+// === [Task 8] LAYOUT & RENDERING ===
+function draw() {}
+
+// === [Task 9] DETAILS, SEARCH, SYMBOLS ===
+function showDetails(id) {}
+
+// === [Task 10] EXPORT & HELP ===
+
+/* ---------------- selftest (?selftest=1) ---------------- */
+
+function buildFixture() {
+  const strtab = [0];
+  const addStr = s => {
+    if (!s) return 0;
+    const off = strtab.length;
+    for (const c of new TextEncoder().encode(s)) strtab.push(c);
+    strtab.push(0);
+    return off;
+  };
+  const sections = [[addStr('.text'), 0x11000, 0x8000]];
+  const kimports = [[0x80012345, addStr('KeQuerySystemTime')]];
+  const edges = [
+    [0x11010, 0x12000, 5], [0x11020, 0x13000, 1], [0x12040, 0x13000, 9],
+    [0x12050, 0x14000, 2], [0x12050, 0x15000, 4],
+    [0x13008, 0x80012345, 3], [0x13010, 0x13000, 2],
+    [0x80020000, 0x16000, 1], [0x16008, 0x12000, 7],
+  ];
+  const size = 128 + strtab.length + sections.length * 12 +
+               kimports.length * 8 + edges.length * 16;
+  const buf = new ArrayBuffer(size);
+  const dv = new DataView(buf);
+  const u8 = new Uint8Array(buf);
+  [0x52544358, 1, 0, 0x4D530001, 0x10000, 0x11000, sections.length,
+   kimports.length, edges.length, strtab.length]
+      .forEach((v, i) => dv.setUint32(i * 4, v, true));
+  u8.set(new TextEncoder().encode('Test Fixture'), 40);
+  u8.set(strtab, 128);
+  let off = 128 + strtab.length;
+  for (const [n, s, z] of sections) {
+    dv.setUint32(off, n, true); dv.setUint32(off + 4, s, true);
+    dv.setUint32(off + 8, z, true); off += 12;
+  }
+  for (const [a, n] of kimports) {
+    dv.setUint32(off, a, true); dv.setUint32(off + 4, n, true); off += 8;
+  }
+  for (const [s, c, cnt] of edges) {
+    dv.setUint32(off, s, true); dv.setUint32(off + 4, c, true);
+    dv.setBigUint64(off + 8, BigInt(cnt), true); off += 16;
+  }
+  return buf;
+}
+
+const selfTests = [];
+function T(name, fn) { selfTests.push([name, fn]); }
+function assertEq(got, want, what) {
+  if (got !== want) throw new Error(`${what}: got ${got}, want ${want}`);
+}
+
+T('parse header and tables', () => {
+  const r = parseXCT(buildFixture());
+  assertEq(r.title, 'Test Fixture', 'title');
+  assertEq(r.titleId, 0x4D530001, 'titleId');
+  assertEq(r.entry, 0x11000, 'entry');
+  assertEq(r.edges.length, 9, 'edge count');
+  assertEq(r.sections.length, 1, 'section count');
+  assertEq(r.sections[0].name, '.text', 'section name');
+  assertEq(r.kimports.get(0x80012345), 'KeQuerySystemTime', 'kimport');
+  assertEq(r.edges[2].count, 9, 'B->C count');
+  assertEq(r.truncated, false, 'truncated');
+});
+T('bad magic rejected', () => {
+  const b = buildFixture();
+  new DataView(b).setUint32(0, 0xdeadbeef, true);
+  let threw = false;
+  try { parseXCT(b); } catch (e) { threw = true; }
+  assertEq(threw, true, 'threw');
+});
+T('short file rejected', () => {
+  let threw = false;
+  try { parseXCT(new ArrayBuffer(64)); } catch (e) { threw = true; }
+  assertEq(threw, true, 'threw');
+});
+T('function derivation', () => {
+  const m = deriveModel(parseXCT(buildFixture()));
+  assertEq(m.entries.length, 6, 'derived function count');
+  assertEq(m.fns.get(0x11000).out.size, 2, 'A callee count');
+  assertEq(m.fns.get(0x12000).out.size, 3, 'B callee count');
+  assertEq(m.fns.get(0x12000).out.get(0x13000).count, 9, 'B->C count');
+  assertEq(m.fns.get(0x13000).out.has(0x13000), true, 'C recursion');
+  assertEq(m.fns.get(0x80012345).kind, 'kernel', 'kernel leaf kind');
+  assertEq(m.fns.get(0x80012345).inSet.has(0x13000), true, 'leaf caller');
+});
+T('polymorphic call site detection', () => {
+  const m = deriveModel(parseXCT(buildFixture()));
+  assertEq(m.fns.get(0x12000).sites.get(0x12050).size, 2, 'poly targets');
+  assertEq(m.fns.get(0x12000).sites.get(0x12040).size, 1, 'mono targets');
+});
+T('roots: entry + kernel pseudo-root', () => {
+  const m = deriveModel(parseXCT(buildFixture()));
+  assertEq(m.roots[0], 0x11000, 'entry root');
+  assertEq(m.roots[1], -2, 'kernel root');
+  assertEq(m.fns.get(-2).out.has(0x16000), true, 'thread root under KERNEL');
+});
+T('naming', () => {
+  const m = deriveModel(parseXCT(buildFixture()));
+  assertEq(fnName(m, 0x80012345), 'KeQuerySystemTime', 'kernel name');
+  assertEq(fnName(m, 0x12000), 'sub_00012000', 'default name');
+  symbols.set(0x12000, 'UpdateWorld');
+  assertEq(fnName(m, 0x12000), 'UpdateWorld', 'symbol override');
+  symbols.clear();
+  assertEq(fnName(m, -2), 'KERNEL', 'pseudo root name');
+});
+
+function runSelfTests() {
+  const out = [];
+  let fails = 0;
+  for (const [name, fn] of selfTests) {
+    try { fn(); out.push('PASS  ' + name); }
+    catch (e) { fails++; out.push('FAIL  ' + name + ' — ' + e.message); }
+  }
+  out.push('', fails ? `${fails} FAILED` : 'ALL PASS');
+  document.body.innerHTML =
+      '<pre style="color:#ddd;padding:20px;font-size:14px">' +
+      esc(out.join('\n')) + '</pre>';
+}
+
+window.addEventListener('load', () => {
+  if (location.search.includes('selftest')) { runSelfTests(); return; }
+  fitCanvas();
+  window.addEventListener('resize', fitCanvas);
+});
+function fitCanvas() {
+  const cv = el('cv');
+  const r = cv.parentElement.getBoundingClientRect();
+  dpr = window.devicePixelRatio || 1;
+  cv.width = r.width * dpr;
+  cv.height = r.height * dpr;
+  cv.style.width = r.width + 'px';
+  cv.style.height = r.height + 'px';
+  draw();
+}
+</script>
+</body>
+</html>
