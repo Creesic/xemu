@@ -818,10 +818,56 @@ function glXform() {
           2 * view.panX / cssW - 1, 1 - 2 * view.panY / cssH];
 }
 
-/* Fill the node/edge geometry buffers from the current layout. Filled in
- * later steps; for now leaves the buffers empty. */
+/* CSS color string -> [r,g,b] floats, via a scratch 2D context (handles
+ * hex / hsl / rgb uniformly). Cached. */
+const _colCanvas = document.createElement('canvas');
+const _colCtx = _colCanvas.getContext('2d');
+const _colCache = new Map();
+function cssToRGB(c) {
+  let v = _colCache.get(c);
+  if (v) return v;
+  _colCtx.fillStyle = '#000';
+  _colCtx.fillStyle = c;
+  const s = _colCtx.fillStyle;
+  if (s[0] === '#') {
+    v = [parseInt(s.slice(1, 3), 16) / 255, parseInt(s.slice(3, 5), 16) / 255,
+         parseInt(s.slice(5, 7), 16) / 255];
+  } else {
+    const p = s.match(/[\d.]+/g).map(Number);
+    v = [p[0] / 255, p[1] / 255, p[2] / 255];
+  }
+  _colCache.set(c, v);
+  return v;
+}
+
+/* Append one axis-aligned quad (2 triangles) with a flat color. Returns the
+ * next float write index. */
+function pushQuad(a, i, x, y, w, h, r, g, b, al) {
+  const X = x + w, Y = y + h;
+  const vx = [x, y, X, y, x, Y, X, y, X, Y, x, Y];
+  for (let k = 0; k < 12; k += 2) {
+    a[i++] = vx[k]; a[i++] = vx[k + 1];
+    a[i++] = r; a[i++] = g; a[i++] = b; a[i++] = al;
+  }
+  return i;
+}
+
+/* Fill the node geometry buffer from the current layout (edges: WG3). */
 function glBuild() {
-  glNodeVerts = 0;
+  const SEL = cssToRGB('#ffd24a');
+  const arr = new Float32Array((layoutNodes.size + 1) * 36);
+  let i = 0;
+  for (const n of layoutNodes.values()) {
+    if (n.id === selected) {                        /* selection border */
+      i = pushQuad(arr, i, n.x - 3, n.y - 3, n.w + 6, n.h + 6,
+                   SEL[0], SEL[1], SEL[2], 1);
+    }
+    const c = cssToRGB(nodeColor(n));
+    i = pushQuad(arr, i, n.x, n.y, n.w, n.h, c[0], c[1], c[2], nodeAlpha(n));
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, glBufNodes);
+  gl.bufferData(gl.ARRAY_BUFFER, arr.subarray(0, i), gl.DYNAMIC_DRAW);
+  glNodeVerts = i / 6;
   glEdgeVerts = 0;
 }
 
