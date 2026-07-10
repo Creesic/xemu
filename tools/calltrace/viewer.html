@@ -96,16 +96,6 @@ const hex = a => (a >>> 0).toString(16).toUpperCase().padStart(8, '0');
 const esc = s => s.replace(/[&<>"]/g,
     c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
 
-/*
- * Optional inlined recording. Empty in the source viewer (which loads
- * files via the picker / drag-and-drop). pack_viewer.py replaces the
- * empty string with a base64 .xct to produce a one-file, self-opening
- * report. The __XCT__ markers delimit the value for the packer.
- */
-const EMBEDDED_XCT = /*__XCT__*/""/*__XCT__*/;
-/* Optional inlined symbol map (base64 UTF-8), paired with EMBEDDED_XCT. */
-const EMBEDDED_SYMS = /*__SYMS__*/""/*__SYMS__*/;
-
 let model = null;
 let symbols = new Map();          // addr -> user symbol name
 let expanded = new Set();         // expanded fn ids
@@ -921,26 +911,11 @@ function runSelfTests() {
       esc(out.join('\n')) + '</pre>';
 }
 
-function b64ToBytes(b64) {
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return bytes;
-}
-
-function loadEmbedded() {
-  loadRecording(b64ToBytes(EMBEDDED_XCT).buffer, 'embedded recording');
-  if (EMBEDDED_SYMS) {
-    loadSymbols(new TextDecoder().decode(b64ToBytes(EMBEDDED_SYMS)));
-  }
-}
-
 window.addEventListener('load', () => {
   if (location.search.includes('selftest')) { runSelfTests(); return; }
   fitCanvas();
   window.addEventListener('resize', fitCanvas);
   showLegend();
-  if (EMBEDDED_XCT) loadEmbedded();
 });
 function fitCanvas() {
   const cv = el('cv');
