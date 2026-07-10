@@ -637,7 +637,44 @@ el('symfile').onchange = ev => {
   if (f) f.text().then(loadSymbols);
 };
 
-// === [Task 10] EXPORT & HELP ===
+/* ---------------- DOT export ---------------- */
+
+function dotSource(full) {
+  const inc = id => full || layoutNodes.has(id);
+  const q = s => '"' + s.replace(/"/g, '\\"') + '"';
+  const lines = ['digraph calltrace {', '  rankdir=LR;',
+                 '  node [shape=box fontname="monospace"];'];
+  for (const [id, f] of model.fns) {
+    if (!inc(id)) continue;
+    if (f.kind === 'kernel') {
+      lines.push(`  ${q(fnName(model, id))} ` +
+                 '[style=filled fillcolor=khaki];');
+    }
+    for (const [cid, e] of f.out) {
+      if (!inc(cid)) continue;
+      lines.push(`  ${q(fnName(model, id))} -> ` +
+                 `${q(fnName(model, cid))} [label="${e.count}"];`);
+    }
+  }
+  lines.push('}');
+  return lines.join('\n');
+}
+
+function exportDot(full) {
+  if (!model) {
+    showBanner('Load a recording first', 'warn');
+    return;
+  }
+  const blob = new Blob([dotSource(full)], { type: 'text/vnd.graphviz' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = (model.rec.title ? model.rec.title.replace(/\W+/g, '_')
+                                : 'calltrace') + '.dot';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+el('btn-dot-visible').addEventListener('click', () => exportDot(false));
+el('btn-dot-full').addEventListener('click', () => exportDot(true));
 
 /* ---------------- selftest (?selftest=1) ---------------- */
 
@@ -742,6 +779,15 @@ T('naming', () => {
   assertEq(fnName(m, 0x12000), 'UpdateWorld', 'symbol override');
   symbols.clear();
   assertEq(fnName(m, -2), 'KERNEL', 'pseudo root name');
+});
+T('DOT export', () => {
+  model = deriveModel(parseXCT(buildFixture()));
+  const dot = dotSource(true);
+  assertEq(dot.includes('"sub_00013000" -> "KeQuerySystemTime" ' +
+                        '[label="3"]'), true, 'kernel edge');
+  assertEq(dot.includes('"KERNEL" -> "sub_00016000"'), true, 'root edge');
+  assertEq(dot.startsWith('digraph calltrace {'), true, 'digraph header');
+  model = null;
 });
 
 function runSelfTests() {
