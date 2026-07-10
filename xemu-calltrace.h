@@ -1,0 +1,52 @@
+/*
+ * xemu guest call tracing
+ *
+ * Records the running game's dynamic call graph as deduplicated
+ * (call_site -> callee) edges for offline visualization.
+ *
+ * Copyright (C) 2026 xemu contributors
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#ifndef XEMU_CALLTRACE_H
+#define XEMU_CALLTRACE_H
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ * True while recording. Read by the x86 translator, which only emits
+ * trace helper calls into translated code while this is set; toggling
+ * flushes the TB cache so stale code never lingers.
+ */
+extern bool xemu_calltrace_armed;
+
+void xemu_calltrace_start(void);
+void xemu_calltrace_stop(void);
+uint64_t xemu_calltrace_edge_count(void);
+bool xemu_calltrace_truncated(void);
+
+/* Hot path; called from the TCG helper on the vCPU thread. */
+void xemu_calltrace_record(uint32_t call_site, uint32_t callee);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
