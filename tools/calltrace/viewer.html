@@ -973,6 +973,10 @@ function glDraw() {
   glDrawBuffer(glBufNodes, glNodeVerts);
   glDrawPulses();
   textOverlay();
+  /* keep animating while pulses fade after playback stops */
+  if (pulses.length && !timeline.playing && !rafId) {
+    requestAnimationFrame(() => draw());
+  }
 }
 
 /* Shared: 2D context of the text-overlay canvas (for measureText + labels). */
@@ -1012,8 +1016,31 @@ function layoutTick(mctx) {
   }
 }
 
-/* Filled in WG4/WG5. */
-function glDrawPulses() {}
+function glDrawPulses() {
+  if (!timeline.active || !pulses.length) return;
+  const now = performance.now();
+  pulses = pulses.filter(p => now - p.born < PULSE_LIFE_MS);
+  if (!pulses.length) return;
+  const arr = new Float32Array(pulses.length * 36);
+  let i = 0;
+  const s = 5;                                   /* half-size, world units */
+  for (const p of pulses) {
+    if (mutedFns.has(p.fromId) || mutedFns.has(p.toId)) continue;
+    const a = layoutNodes.get(p.fromId), b = layoutNodes.get(p.toId);
+    if (!a || !b) continue;
+    const t = (now - p.born) / PULSE_LIFE_MS;
+    const ax = a.x + a.w, ay = a.y + a.h / 2, bx = b.x, by = b.y + b.h / 2;
+    const px = ax + (bx - ax) * t, py = ay + (by - ay) * t;
+    i = pushQuad(arr, i, px - s, py - s, 2 * s, 2 * s,
+                 1.0, 150 / 255, 30 / 255, Math.min(1, 1.3 - t));
+  }
+  if (!i) return;
+  gl.bindBuffer(gl.ARRAY_BUFFER, glBufPulses);
+  gl.bufferData(gl.ARRAY_BUFFER, arr.subarray(0, i), gl.DYNAMIC_DRAW);
+  glDrawBuffer(glBufPulses, i / 6);
+}
+
+/* Filled in WG5. */
 function textOverlay() {}
 
 function draw2d() {
