@@ -52,11 +52,15 @@
   #timeline { display: none; align-items: center; gap: 8px; padding: 6px 12px;
               background: #1d2026; border-top: 1px solid #333; }
   #timeline.on { display: flex; }
-  #timeline input[type=range] { flex: 1; }
+  #timeline input[type=range] { flex: 1; min-width: 0; }
   #timeline button, #timeline select { background: #2a2e36; color: #ddd;
               border: 1px solid #444; border-radius: 4px; padding: 2px 10px; }
-  #tl-readout { font-family: monospace; color: #9ab; min-width: 160px;
-              text-align: right; }
+  #tl-play { flex: none; width: 42px; text-align: center; }
+  #tl-speed { flex: none; width: 74px; }
+  /* Fixed width so a changing "last:" name never reflows the slider. */
+  #tl-readout { flex: none; width: 300px; font-family: monospace;
+              color: #9ab; white-space: nowrap; overflow: hidden;
+              text-overflow: ellipsis; }
   #help { font-size: 12px; color: #aaa; padding: 8px 12px; }
   #help pre { background: #22262d; padding: 6px; margin: 4px 0;
               overflow-x: auto; }
@@ -101,9 +105,10 @@ for f in currentProgram.getFunctionManager().getFunctions(True):
   <button id="tl-play">▶</button>
   <input type="range" id="tl-scrub" min="0" max="0" value="0" step="1">
   <select id="tl-speed">
+    <option value="0.1">0.1×</option>
     <option value="1">1×</option>
-    <option value="10">10×</option>
-    <option value="100" selected>100×</option>
+    <option value="10" selected>10×</option>
+    <option value="100">100×</option>
     <option value="1000">1000×</option>
     <option value="10000">10000×</option>
   </select>
@@ -124,9 +129,13 @@ let selected = null;              // selected fn id
 let view = { panX: 40, panY: 40, zoom: 1 };
 let dpr = 1;
 let layoutNodes = new Map();      // id -> layout node (Task 8)
-let timeline = { active: false, playhead: 0, playing: false, speed: 100 };
-const MAX_PULSES = 200, PULSE_LIFE_MS = 400;
+let timeline = { active: false, playhead: 0, playing: false, speed: 10,
+                 acc: 0 };
+const MAX_PULSES = 200, PULSE_LIFE_MS = 550;
+/* Nodes fade toward NODE_STALE_ALPHA after FADE_AFTER steps of no activity. */
+const NODE_STALE_ALPHA = 0.35, FADE_AFTER = 600, FADE_RAMP = 1200;
 let pulses = [];
+let nodeLastUsed = new Map();     // fn id -> last event index it was active
 let mutedFns = new Set();
 let lastLayoutKey = '';           // invalidates cached layout when discovery grows
 let rafId = 0, lastTs = 0;
@@ -403,9 +412,11 @@ async function loadRecording(buf, name) {
       `${model.fns.size} nodes, ${rec.edges.length} raw edges, ` +
       `${rec.kimports.size} kernel imports` +
       (symbols.size ? `, ${symbols.size} symbols restored` : '');
+  pulses = [];
+  nodeLastUsed.clear();
   if (model.timed) {
     timeline = { active: true, playhead: model.eventCount, playing: false,
-                 speed: timeline.speed || 100 };
+                 speed: timeline.speed || 10, acc: 0 };
     el('tl-scrub').max = String(model.eventCount);
     el('tl-scrub').value = String(model.eventCount);
     el('timeline').classList.add('on');
@@ -430,29 +441,39 @@ function updateReadout() {
 }
 el('tl-scrub').addEventListener('input', ev => {
   timeline.playhead = parseInt(ev.target.value, 10);
+  timeline.acc = 0;
+  nodeLastUsed.clear();   /* a manual jump shows an un-faded view */
   updateReadout();
   draw();
 });
 el('tl-speed').addEventListener('change', ev => {
-  timeline.speed = parseInt(ev.target.value, 10);
+  timeline.speed = parseFloat(ev.target.value);
 });
 
 function spawnPulsesForRange(p0, p1) {
   const ev = model.events;
   for (let k = p0; k < p1; k++) {
-    if (pulses.length >= MAX_PULSES) break;
     const ef = model.edgeFn[ev[k]];
     if (!ef) continue;
     if (mutedFns.has(ef.calleeId) || mutedFns.has(ef.callerId)) continue;
-    pulses.push({ fromId: ef.callerId, toId: ef.calleeId, born: lastTs });
+    /* Mark both endpoints active as of this step (drives node fade). */
+    nodeLastUsed.set(ef.callerId, p1);
+    nodeLastUsed.set(ef.calleeId, p1);
+    if (pulses.length < MAX_PULSES) {
+      pulses.push({ fromId: ef.callerId, toId: ef.calleeId, born: lastTs });
+    }
   }
 }
 function tick(ts) {
   if (!timeline.playing) { rafId = 0; return; }
   const p0 = timeline.playhead;
-  const p1 = Math.min(model.eventCount, p0 + timeline.speed);
+  /* Fractional accumulator so speeds < 1 event/frame (e.g. 0.1x) work. */
+  timeline.acc += timeline.speed;
+  const step = Math.floor(timeline.acc);
+  timeline.acc -= step;
+  const p1 = Math.min(model.eventCount, p0 + step);
   lastTs = ts;
-  spawnPulsesForRange(p0, p1);
+  if (p1 > p0) spawnPulsesForRange(p0, p1);
   timeline.playhead = p1;
   el('tl-scrub').value = String(p1);
   updateReadout();
@@ -465,7 +486,11 @@ function tick(ts) {
 }
 el('tl-play').addEventListener('click', () => {
   if (!model || !model.timed) return;
-  if (timeline.playhead >= model.eventCount) timeline.playhead = 0;
+  if (timeline.playhead >= model.eventCount) {
+    timeline.playhead = 0;
+    nodeLastUsed.clear();
+  }
+  timeline.acc = 0;
   timeline.playing = !timeline.playing;
   el('tl-play').textContent = timeline.playing ? '❚❚' : '▶';
   if (timeline.playing && !rafId) rafId = requestAnimationFrame(tick);
@@ -585,9 +610,20 @@ function drawEdge(ctx, a, b, count, cross) {
   }
 }
 
+function nodeAlpha(n) {
+  /* During timeline play, dim nodes that haven't been active recently. */
+  if (!timeline.active || !nodeLastUsed.size || n.id === selected) return 1;
+  const lu = nodeLastUsed.get(n.id);
+  if (lu === undefined) return 1;
+  const age = timeline.playhead - lu;
+  if (age <= FADE_AFTER) return 1;
+  return Math.max(NODE_STALE_ALPHA, 1 - (age - FADE_AFTER) / FADE_RAMP);
+}
+
 function drawNode(ctx, n) {
   const f = model.fns.get(n.id);
   const expandable = f && f.out.size > 0 && f.kind !== 'kernel';
+  ctx.globalAlpha = nodeAlpha(n);
   ctx.fillStyle = nodeColor(n);
   ctx.strokeStyle = n.id === selected ? '#ffd24a' : 'rgba(255,255,255,0.25)';
   ctx.lineWidth = n.id === selected ? 2 : 1;
@@ -601,6 +637,7 @@ function drawNode(ctx, n) {
     ctx.fillStyle = 'rgba(255,255,255,0.6)';
     ctx.fillText('+' + f.out.size, n.x + n.w - 30, n.y + 17);
   }
+  ctx.globalAlpha = 1;
 }
 
 function draw() {
@@ -666,13 +703,20 @@ function draw() {
       /* cubic Bezier matching drawEdge: P0,(mx,y1),(mx,y2),P3 */
       const px = u*u*u*x1 + 3*u*u*t*mx + 3*u*t*t*mx + t*t*t*x2;
       const py = u*u*u*y1 + 3*u*u*t*y1 + 3*u*t*t*y2 + t*t*t*y2;
+      /* Bright orange spark with a glowing halo; stays vivid most of its life. */
+      const pa = Math.min(1, 1.3 - t);
+      ctx.shadowColor = 'rgba(255,140,0,1)';
+      ctx.shadowBlur = 14;
       ctx.beginPath();
-      ctx.arc(px, py, 3.5, 0, Math.PI * 2);
-      ctx.fillStyle = `rgba(140,200,255,${1 - t})`;
-      ctx.shadowColor = 'rgba(140,200,255,0.9)';
-      ctx.shadowBlur = 8;
+      ctx.arc(px, py, 5, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(255,150,30,${pa})`;
       ctx.fill();
       ctx.shadowBlur = 0;
+      /* hot white-ish core */
+      ctx.beginPath();
+      ctx.arc(px, py, 2, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(255,235,190,${pa})`;
+      ctx.fill();
     }
     /* keep fading after the last playback step */
     if (pulses.length && !timeline.playing && !rafId) {
