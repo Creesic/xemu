@@ -49,6 +49,14 @@
                    line-height: 1.5; }
   #stats { padding: 5px 12px; background: #1d2026; color: #999;
            border-top: 1px solid #333; font-family: monospace; }
+  #timeline { display: none; align-items: center; gap: 8px; padding: 6px 12px;
+              background: #1d2026; border-top: 1px solid #333; }
+  #timeline.on { display: flex; }
+  #timeline input[type=range] { flex: 1; }
+  #timeline button, #timeline select { background: #2a2e36; color: #ddd;
+              border: 1px solid #444; border-radius: 4px; padding: 2px 10px; }
+  #tl-readout { font-family: monospace; color: #9ab; min-width: 160px;
+              text-align: right; }
   #help { font-size: 12px; color: #aaa; padding: 8px 12px; }
   #help pre { background: #22262d; padding: 6px; margin: 4px 0;
               overflow-x: auto; }
@@ -88,6 +96,18 @@ for f in currentProgram.getFunctionManager().getFunctions(True):
   <div id="details"><i>No selection</i></div>
 </div>
 <div id="stats">No recording loaded</div>
+<div id="timeline" hidden>
+  <button id="tl-play">▶</button>
+  <input type="range" id="tl-scrub" min="0" max="0" value="0" step="1">
+  <select id="tl-speed">
+    <option value="1">1×</option>
+    <option value="10">10×</option>
+    <option value="100" selected>100×</option>
+    <option value="1000">1000×</option>
+    <option value="10000">10000×</option>
+  </select>
+  <span id="tl-readout">0 / 0</span>
+</div>
 <script>
 'use strict';
 const KERNEL_BOUND = 0x80000000;
@@ -103,6 +123,7 @@ let selected = null;              // selected fn id
 let view = { panX: 40, panY: 40, zoom: 1 };
 let dpr = 1;
 let layoutNodes = new Map();      // id -> layout node (Task 8)
+let timeline = { active: false, playhead: 0, playing: false, speed: 100 };
 
 function showBanner(msg, kind) {
   const b = el('banner');
@@ -277,8 +298,14 @@ async function inflateEvents(rec) {
 function buildTimeline(m) {
   const rec = m.rec;
   m.edgeFn = rec.edges.map(e => {
-    const caller = e.site >= KERNEL_BOUND ? -2 : fnOfSite(m, e.site);
-    return { callerId: caller < 0 ? -3 : caller, calleeId: e.callee };
+    let callerId;
+    if (e.site >= KERNEL_BOUND) {
+      callerId = -2;                    /* KERNEL pseudo-root */
+    } else {
+      const f = fnOfSite(m, e.site);
+      callerId = f < 0 ? -3 : f;        /* -3 = unattributed */
+    }
+    return { callerId, calleeId: e.callee };
   });
   for (const f of m.fns.values()) {
     for (const edge of f.out.values()) edge.firstFire = Infinity;
@@ -344,9 +371,13 @@ async function loadRecording(buf, name) {
     return;
   }
   model = deriveModel(rec);
+  model.timed = false;
   if (rec.timed) {
     model.events = await inflateEvents(rec);
-    buildTimeline(model);
+    if (model.events) {
+      buildTimeline(model);
+      model.timed = true;
+    }
   }
   symbols = new Map();
   const saved = localStorage.getItem('xct-syms-' + rec.titleId);
@@ -366,9 +397,39 @@ async function loadRecording(buf, name) {
       `${model.fns.size} nodes, ${rec.edges.length} raw edges, ` +
       `${rec.kimports.size} kernel imports` +
       (symbols.size ? `, ${symbols.size} symbols restored` : '');
+  if (model.timed) {
+    timeline = { active: true, playhead: model.eventCount, playing: false,
+                 speed: timeline.speed || 100 };
+    el('tl-scrub').max = String(model.eventCount);
+    el('tl-scrub').value = String(model.eventCount);
+    el('timeline').classList.add('on');
+    updateReadout();
+  } else {
+    timeline.active = false;
+    el('timeline').classList.remove('on');
+  }
   draw();
   showLegend();
 }
+
+function updateReadout() {
+  const p = timeline.playhead;
+  let last = '';
+  if (model && model.events && p > 0) {
+    const e = model.edgeFn[model.events[p - 1]];
+    last = ' · last: ' + (e ? fnName(model, e.calleeId) : '');
+  }
+  el('tl-readout').textContent =
+      `${p} / ${model ? model.eventCount : 0}${last}`;
+}
+el('tl-scrub').addEventListener('input', ev => {
+  timeline.playhead = parseInt(ev.target.value, 10);
+  updateReadout();
+  draw();
+});
+el('tl-speed').addEventListener('change', ev => {
+  timeline.speed = parseInt(ev.target.value, 10);
+});
 
 el('file').onchange = ev => {
   const f = ev.target.files[0];
@@ -393,7 +454,7 @@ function sectionColor(i) {
   return `hsl(${((i * 137.508) % 360).toFixed(0)}, 42%, 44%)`;
 }
 
-function computeLayout(m) {
+function computeLayout(m, edgeVisible) {
   const nodes = new Map();
   const rootNodes = [];
   const visit = (id, depth, parent) => {
@@ -402,13 +463,12 @@ function computeLayout(m) {
                 w: 160, h: NODE_H };
     nodes.set(id, n);
     if (!parent) rootNodes.push(n);
-    if (expanded.has(id)) {
-      const f = m.fns.get(id);
-      if (f) {
-        for (const calleeId of [...f.out.keys()].sort((a, b) => a - b)) {
-          if (visit(calleeId, depth + 1, n)) {
-            n.treeKids.push(nodes.get(calleeId));
-          }
+    const f = m.fns.get(id);
+    if (f) {
+      for (const calleeId of [...f.out.keys()].sort((a, b) => a - b)) {
+        if (!edgeVisible(id, calleeId, f.out.get(calleeId))) continue;
+        if (visit(calleeId, depth + 1, n)) {
+          n.treeKids.push(nodes.get(calleeId));
         }
       }
     }
@@ -523,16 +583,19 @@ function draw() {
   ctx.setTransform(view.zoom * dpr, 0, 0, view.zoom * dpr,
                    view.panX * dpr, view.panY * dpr);
   ctx.font = '12px monospace';
-  layoutNodes = computeLayout(model);
+  const edgeVisible = model.timed && timeline.active
+      ? (from, cid, edge) => edge.firstFire <= timeline.playhead
+      : (from) => expanded.has(from);
+  layoutNodes = computeLayout(model, edgeVisible);
   for (const n of layoutNodes.values()) {
     n.label = fnName(model, n.id);
     n.w = Math.min(220, Math.max(120, ctx.measureText(n.label).width + 40));
   }
   for (const n of layoutNodes.values()) {
-    if (!expanded.has(n.id)) continue;
     const f = model.fns.get(n.id);
     if (!f) continue;
     for (const [calleeId, e] of f.out) {
+      if (!edgeVisible(n.id, calleeId, e)) continue;
       const t = layoutNodes.get(calleeId);
       if (!t) continue;
       drawEdge(ctx, n, t, e.count, t.parent !== n);
@@ -1012,6 +1075,9 @@ T('firstFire + edgeFn derivation', async () => {
   buildTimeline(m);
   assertEq(m.fns.get(0x11000).out.get(0x12000).firstFire, 0, 'A->B ff');
   assertEq(m.fns.get(0x12000).out.get(0x15000).firstFire, 6, 'B->D2 ff');
+  /* KERNEL(-2)->T edge must attribute to -2, not clobber to -3 */
+  assertEq(m.edgeFn[7].callerId, -2, 'kernel caller id');
+  assertEq(m.fns.get(-2).out.get(0x16000).firstFire, 9, 'KERNEL->T ff');
   assertEq(discoveredEdgeCount(m, 0), 1, 'discovered at 0');
   assertEq(discoveredEdgeCount(m, 6) >= 4, true, 'discovered at 6');
 });
