@@ -154,13 +154,18 @@ let motionTimer = 0;
 let layoutNodes = new Map();      // id -> layout node (Task 8)
 
 let viewStatic = true;            // GL path: labels only painted when settled
-/* GL path: hide labels while moving (software text-paint stays off the hot
- * path), repaint crisp on settle. 2D path: drop to half res while moving. */
+let textDirty = true;             // labels need a repaint (content/layout changed)
+/* GL path: hide labels while the *view* moves (pan/zoom/scrub) — software
+ * text-paint stays off the hot path — and repaint crisp on settle. Playback
+ * does NOT call this: the view is static during playback, so labels stay and
+ * are only repainted when the visible set changes. 2D path: drop to ½ res. */
 function nudgeMotion() {
   if (glActive) {
     if (viewStatic) { viewStatic = false; clearTextOverlay(); }
     clearTimeout(motionTimer);
-    motionTimer = setTimeout(() => { viewStatic = true; draw(); }, 160);
+    motionTimer = setTimeout(() => {
+      viewStatic = true; textDirty = true; draw();
+    }, 160);
     return;
   }
   if (!autoRes) return;
@@ -499,6 +504,7 @@ el('tl-scrub').addEventListener('input', ev => {
   timeline.playhead = parseInt(ev.target.value, 10);
   timeline.acc = 0;
   nodeLastUsed.clear();   /* a manual jump shows an un-faded view */
+  nudgeMotion();          /* scrubbing is view-motion: hide labels until settle */
   updateReadout();
   draw();
 });
@@ -522,7 +528,7 @@ function spawnPulsesForRange(p0, p1) {
 }
 function tick(ts) {
   if (!timeline.playing) { rafId = 0; return; }
-  nudgeMotion();          /* keep playback at half res; snap crisp on pause */
+  if (!glActive) nudgeMotion();   /* 2D: ½ res during play. GL: keep labels. */
   const p0 = timeline.playhead;
   /* Fractional accumulator so speeds < 1 event/frame (e.g. 0.1x) work. */
   timeline.acc += timeline.speed;
@@ -1038,6 +1044,7 @@ function layoutTick(mctx) {
     }
     lastLayoutKey = visKey;
     glDirty = true;
+    textDirty = true;             /* visible set changed -> labels need repaint */
   }
 }
 
@@ -1084,6 +1091,8 @@ function textOverlay() {
     return;
   }
   if (!viewStatic) return;                 /* motion: overlay already cleared */
+  if (!textDirty) return;                  /* labels unchanged since last paint */
+  textDirty = false;
   tctx.setTransform(1, 0, 0, 1, 0, 0);
   tctx.clearRect(0, 0, el('cvtext').width, el('cvtext').height);
   const cssW = el('glcv').width / dpr || 1, cssH = el('glcv').height / dpr || 1;
@@ -1629,6 +1638,7 @@ function loadSymbols(text) {
   }
   showBanner(`Symbols: ${applied} applied` +
              (skipped ? `, ${skipped} lines skipped` : ''), 'info');
+  glDirty = true; textDirty = true;   /* names changed: rebuild + relabel */
   draw();
   if (selected !== null) showDetails(selected);
 }
