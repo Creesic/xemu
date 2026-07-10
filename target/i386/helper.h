@@ -233,3 +233,5 @@ DEF_HELPER_1(emms, void, env)
 #include "tcg/ops_sse_header.h.inc"
 
 DEF_HELPER_1(rdrand, tl, env)
+
+DEF_HELPER_FLAGS_2(xemu_calltrace_call, TCG_CALL_NO_RWG, void, tl, tl)

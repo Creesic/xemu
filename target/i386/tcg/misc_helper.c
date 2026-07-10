@@ -142,3 +142,11 @@ target_ulong HELPER(rdpid)(CPUX86State *env)
     return 0;
 #endif
 }
+
+/* xemu: guest call tracing (see xemu-calltrace.c) */
+void xemu_calltrace_record(uint32_t call_site, uint32_t callee);
+
+void HELPER(xemu_calltrace_call)(target_ulong call_site, target_ulong callee)
+{
+    xemu_calltrace_record((uint32_t)call_site, (uint32_t)callee);
+}
