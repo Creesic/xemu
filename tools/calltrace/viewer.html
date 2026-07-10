@@ -124,6 +124,11 @@ let view = { panX: 40, panY: 40, zoom: 1 };
 let dpr = 1;
 let layoutNodes = new Map();      // id -> layout node (Task 8)
 let timeline = { active: false, playhead: 0, playing: false, speed: 100 };
+const MAX_PULSES = 200, PULSE_LIFE_MS = 400;
+let pulses = [];
+let mutedFns = new Set();
+let lastLayoutKey = '';           // invalidates cached layout when discovery grows
+let rafId = 0, lastTs = 0;
 
 function showBanner(msg, kind) {
   const b = el('banner');
@@ -431,6 +436,40 @@ el('tl-speed').addEventListener('change', ev => {
   timeline.speed = parseInt(ev.target.value, 10);
 });
 
+function spawnPulsesForRange(p0, p1) {
+  const ev = model.events;
+  for (let k = p0; k < p1; k++) {
+    if (pulses.length >= MAX_PULSES) break;
+    const ef = model.edgeFn[ev[k]];
+    if (!ef) continue;
+    if (mutedFns.has(ef.calleeId) || mutedFns.has(ef.callerId)) continue;
+    pulses.push({ fromId: ef.callerId, toId: ef.calleeId, born: lastTs });
+  }
+}
+function tick(ts) {
+  if (!timeline.playing) { rafId = 0; return; }
+  const p0 = timeline.playhead;
+  const p1 = Math.min(model.eventCount, p0 + timeline.speed);
+  lastTs = ts;
+  spawnPulsesForRange(p0, p1);
+  timeline.playhead = p1;
+  el('tl-scrub').value = String(p1);
+  updateReadout();
+  if (p1 >= model.eventCount) {
+    timeline.playing = false;
+    el('tl-play').textContent = '▶';
+  }
+  draw();
+  rafId = timeline.playing ? requestAnimationFrame(tick) : 0;
+}
+el('tl-play').addEventListener('click', () => {
+  if (!model || !model.timed) return;
+  if (timeline.playhead >= model.eventCount) timeline.playhead = 0;
+  timeline.playing = !timeline.playing;
+  el('tl-play').textContent = timeline.playing ? '❚❚' : '▶';
+  if (timeline.playing && !rafId) rafId = requestAnimationFrame(tick);
+});
+
 el('file').onchange = ev => {
   const f = ev.target.files[0];
   if (f) f.arrayBuffer().then(buf => loadRecording(buf, f.name));
@@ -586,10 +625,20 @@ function draw() {
   const edgeVisible = model.timed && timeline.active
       ? (from, cid, edge) => edge.firstFire <= timeline.playhead
       : (from) => expanded.has(from);
-  layoutNodes = computeLayout(model, edgeVisible);
-  for (const n of layoutNodes.values()) {
-    n.label = fnName(model, n.id);
-    n.w = Math.min(220, Math.max(120, ctx.measureText(n.label).width + 40));
+  /* Recompute layout only when the visible set changes (cheap during play). */
+  const visKey = model.timed && timeline.active
+      ? 'tl:' + discoveredEdgeCount(model, timeline.playhead) + ':' +
+        mutedFns.size
+      : 'manual:' + expanded.size + ':' + [...expanded].join(',') + ':' +
+        mutedFns.size;
+  if (visKey !== lastLayoutKey || !layoutNodes.size) {
+    layoutNodes = computeLayout(model, edgeVisible);
+    for (const n of layoutNodes.values()) {
+      n.label = fnName(model, n.id);
+      n.w = Math.min(220, Math.max(120,
+                                   ctx.measureText(n.label).width + 40));
+    }
+    lastLayoutKey = visKey;
   }
   for (const n of layoutNodes.values()) {
     const f = model.fns.get(n.id);
@@ -602,6 +651,32 @@ function draw() {
     }
   }
   for (const n of layoutNodes.values()) drawNode(ctx, n);
+
+  if (timeline.active && pulses.length) {
+    const now = performance.now();
+    pulses = pulses.filter(p => now - p.born < PULSE_LIFE_MS);
+    for (const p of pulses) {
+      const a = layoutNodes.get(p.fromId), b = layoutNodes.get(p.toId);
+      if (!a || !b) continue;
+      const t = (now - p.born) / PULSE_LIFE_MS, u = 1 - t;
+      const x1 = a.x + a.w, y1 = a.y + a.h / 2, x2 = b.x, y2 = b.y + b.h / 2;
+      const mx = (x1 + x2) / 2;
+      /* cubic Bezier matching drawEdge: P0,(mx,y1),(mx,y2),P3 */
+      const px = u*u*u*x1 + 3*u*u*t*mx + 3*u*t*t*mx + t*t*t*x2;
+      const py = u*u*u*y1 + 3*u*u*t*y1 + 3*u*t*t*y2 + t*t*t*y2;
+      ctx.beginPath();
+      ctx.arc(px, py, 3.5, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(140,200,255,${1 - t})`;
+      ctx.shadowColor = 'rgba(140,200,255,0.9)';
+      ctx.shadowBlur = 8;
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+    /* keep fading after the last playback step */
+    if (pulses.length && !timeline.playing && !rafId) {
+      requestAnimationFrame(() => draw());
+    }
+  }
 }
 
 /* ---------------- interaction ---------------- */
