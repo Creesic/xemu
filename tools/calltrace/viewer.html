@@ -146,8 +146,7 @@ let ctx2d = null;
  * Whether the browser accelerates 2D canvas at all is still its decision. */
 function getCtx() {
   if (!ctx2d) {
-    ctx2d = el('cv').getContext('2d',
-                                { alpha: false, desynchronized: true });
+    ctx2d = el('cv').getContext('2d', { alpha: false });
   }
   return ctx2d;
 }
@@ -779,8 +778,7 @@ function glCompile(vsSrc, fsSrc) {
 function initGL() {
   const cv = el('glcv');
   try {
-    gl = cv.getContext('webgl',
-                       { alpha: false, antialias: true, desynchronized: true })
+    gl = cv.getContext('webgl', { alpha: false, antialias: true })
       || cv.getContext('experimental-webgl');
   } catch (e) { gl = null; }
   if (!gl) { glActive = false; return; }
@@ -851,6 +849,54 @@ function pushQuad(a, i, x, y, w, h, r, g, b, al) {
   }
   return i;
 }
+/* Arbitrary quad from 4 corners (p0,p1,p2,p3 wound in order). */
+function pushQuadV(a, i, p, r, g, b, al) {
+  const vx = [p[0], p[1], p[2], p[3], p[4], p[5],
+              p[0], p[1], p[4], p[5], p[6], p[7]];
+  for (let k = 0; k < 12; k += 2) {
+    a[i++] = vx[k]; a[i++] = vx[k + 1];
+    a[i++] = r; a[i++] = g; a[i++] = b; a[i++] = al;
+  }
+  return i;
+}
+function pushTri(a, i, x0, y0, x1, y1, x2, y2, r, g, b, al) {
+  const vx = [x0, y0, x1, y1, x2, y2];
+  for (let k = 0; k < 6; k += 2) {
+    a[i++] = vx[k]; a[i++] = vx[k + 1];
+    a[i++] = r; a[i++] = g; a[i++] = b; a[i++] = al;
+  }
+  return i;
+}
+
+const GL_EDGE_CALL = [170 / 255, 170 / 255, 170 / 255, 0.7];
+const GL_EDGE_CROSS = [120 / 255, 180 / 255, 255 / 255, 0.55];
+
+/* One edge: a thick straight segment + arrowhead (or a short stub for a
+ * self-recursion edge). Returns the next float write index. */
+function glPushEdge(a, i, na, nb, count, cross) {
+  const c = cross ? GL_EDGE_CROSS : GL_EDGE_CALL;
+  if (na === nb) {                                    /* recursion stub */
+    const x = na.x + na.w, y = na.y + na.h / 2;
+    return pushQuad(a, i, x, y - 1, 24, 2, c[0], c[1], c[2], c[3]);
+  }
+  const ax = na.x + na.w, ay = na.y + na.h / 2;
+  const bx = nb.x, by = nb.y + nb.h / 2;
+  let dx = bx - ax, dy = by - ay;
+  const len = Math.hypot(dx, dy) || 1;
+  dx /= len; dy /= len;
+  const hw = 1 + Math.log2(1 + count) * 0.4;          /* half width */
+  const nx = -dy * hw, ny = dx * hw;                  /* perpendicular */
+  i = pushQuadV(a, i, [ax + nx, ay + ny, ax - nx, ay - ny,
+                       bx - nx, by - ny, bx + nx, by + ny],
+                c[0], c[1], c[2], c[3]);
+  /* arrowhead at the target */
+  const back = 9, aw = 5;
+  i = pushTri(a, i, bx, by,
+              bx - dx * back - dy * aw, by - dy * back + dx * aw,
+              bx - dx * back + dy * aw, by - dy * back - dx * aw,
+              c[0], c[1], c[2], 1);
+  return i;
+}
 
 /* Fill the node geometry buffer from the current layout (edges: WG3). */
 function glBuild() {
@@ -868,7 +914,34 @@ function glBuild() {
   gl.bindBuffer(gl.ARRAY_BUFFER, glBufNodes);
   gl.bufferData(gl.ARRAY_BUFFER, arr.subarray(0, i), gl.DYNAMIC_DRAW);
   glNodeVerts = i / 6;
-  glEdgeVerts = 0;
+
+  /* --- edges (line quad = 6 verts + arrowhead = 3; over-allocate 9/edge) --- */
+  const edgeVisible = edgeVisibleFn();
+  let nEdge = 0;
+  for (const n of layoutNodes.values()) {
+    const f = model.fns.get(n.id);
+    if (!f) continue;
+    for (const [cid] of f.out) {
+      if (edgeVisible(n.id, cid, f.out.get(cid)) && layoutNodes.has(cid)) {
+        nEdge++;
+      }
+    }
+  }
+  const earr = new Float32Array(nEdge * 9 * 6);
+  let j = 0;
+  for (const n of layoutNodes.values()) {
+    const f = model.fns.get(n.id);
+    if (!f) continue;
+    for (const [cid, e] of f.out) {
+      if (!edgeVisible(n.id, cid, e)) continue;
+      const t = layoutNodes.get(cid);
+      if (!t) continue;
+      j = glPushEdge(earr, j, n, t, e.count, t.parent !== n);
+    }
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, glBufEdges);
+  gl.bufferData(gl.ARRAY_BUFFER, earr.subarray(0, j), gl.DYNAMIC_DRAW);
+  glEdgeVerts = j / 6;
 }
 
 function glDrawBuffer(buf, vertCount) {
