@@ -201,8 +201,26 @@ function deriveModel(rec) {
     }
     siteTargets.add(e.callee);
   }
-  getFn(rec.entry, 'fn'); /* entry exists even if it never calls out */
-  const roots = [rec.entry];
+  /*
+   * Roots are the forest's true entry points: the XBE entry (when it's a
+   * plausible game-space address) plus any game function never reached by
+   * a traced call. Deriving them this way surfaces the real entry even
+   * when the recording's stored entry field is bogus (e.g. some titles
+   * store the entry point already de-obfuscated, so it round-trips wrong).
+   */
+  const entryValid = rec.entry >= rec.base && rec.entry < KERNEL_BOUND;
+  if (entryValid) {
+    getFn(rec.entry, 'fn'); /* entry exists even if it never calls out */
+  }
+  const roots = [];
+  if (entryValid) roots.push(rec.entry);
+  const orphans = [];
+  for (const [id, f] of fns) {
+    if (id < 0 || id >= KERNEL_BOUND || id === rec.entry) continue;
+    if (f.inSet.size === 0) orphans.push(id);
+  }
+  orphans.sort((a, b) => a - b);
+  roots.push(...orphans);
   if (fns.has(-2)) roots.push(-2);
   return { fns, entries, roots, rec };
 }
@@ -245,7 +263,7 @@ function loadRecording(buf, name) {
   if (saved) {
     try { symbols = new Map(JSON.parse(saved)); } catch (e) {}
   }
-  expanded = new Set([rec.entry]);
+  expanded = new Set(model.roots.length ? [model.roots[0]] : []);
   selected = null;
   view = { panX: 40, panY: 40, zoom: 1 };
   clearBanner();

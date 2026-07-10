@@ -256,15 +256,26 @@ char *xemu_calltrace_save(const char *dir, char **err_msg)
         g_strlcpy(title8, title_utf8, sizeof(title8));
     }
 
-    /* Entry point is XOR-obfuscated; try retail key, fall back to debug. */
+    /*
+     * The XBE entry point is normally XOR-obfuscated, but xemu's loader
+     * de-obfuscates it in guest memory for some titles, so the stored
+     * value may already be plaintext. Pick whichever candidate lands
+     * inside the image: raw, retail-keyed, or debug-keyed.
+     */
     uint32_t base = ldl_le_p(&xbe->header->m_base);
     uint32_t image_size = ldl_le_p(&xbe->header->m_sizeof_image);
     uint32_t raw_entry = ldl_le_p(&xbe->header->m_entry);
-    uint32_t entry = raw_entry ^ XBE_ENTRY_XOR_RETAIL;
-    if (entry < base || entry >= base + image_size) {
-        uint32_t dbg = raw_entry ^ XBE_ENTRY_XOR_DEBUG;
-        if (dbg >= base && dbg < base + image_size) {
-            entry = dbg;
+    uint32_t entry_candidates[3] = {
+        raw_entry,
+        raw_entry ^ XBE_ENTRY_XOR_RETAIL,
+        raw_entry ^ XBE_ENTRY_XOR_DEBUG,
+    };
+    uint32_t entry = entry_candidates[1]; /* default: retail-keyed */
+    for (int i = 0; i < 3; i++) {
+        if (entry_candidates[i] >= base &&
+            entry_candidates[i] < base + image_size) {
+            entry = entry_candidates[i];
+            break;
         }
     }
 
