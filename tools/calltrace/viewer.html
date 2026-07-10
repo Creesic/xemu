@@ -74,6 +74,7 @@
   <button id="btn-dot-full">Export DOT (full)</button>
   <button id="btn-reset">Reset view</button>
   <button id="btn-legend">Legend</button>
+  <button id="btn-noise">Noise</button>
   <button onclick="el('helpbox').hidden = !el('helpbox').hidden">Help</button>
 </div>
 <div id="banner"></div>
@@ -497,6 +498,7 @@ function computeLayout(m, edgeVisible) {
   const nodes = new Map();
   const rootNodes = [];
   const visit = (id, depth, parent) => {
+    if (id >= 0 && mutedFns.has(id)) return false; /* muted: hidden */
     if (nodes.has(id)) return false; /* seen: render as cross-link */
     const n = { id, depth, parent, treeKids: [], x: 0, y: 0,
                 w: 160, h: NODE_H };
@@ -761,6 +763,70 @@ el('btn-legend').addEventListener('click', () => {
   showLegend(); /* clears selection */
   draw();
 });
+
+/* ---------------- noise panel ---------------- */
+
+function noiseRanking(m) {
+  const inbound = new Map();
+  for (const f of m.fns.values()) {
+    for (const [cid, edge] of f.out) {
+      if (cid < 0) continue;
+      inbound.set(cid, (inbound.get(cid) || 0) + edge.count);
+    }
+  }
+  return [...inbound.entries()]
+      .map(([id, count]) => ({ id, count }))
+      .sort((a, b) => b.count - a.count);
+}
+
+let noiseExport = new Set();
+
+function showNoise() {
+  selected = null;
+  if (!model) { el('details').innerHTML = '<i>No recording</i>'; return; }
+  const ranked = noiseRanking(model).slice(0, 200);
+  const rows = ['<h3>Noisiest Functions</h3>',
+    '<div class="hint">Check to mute (hidden from the graph and playback) ' +
+    'and include in the exported ignore list for your next run.</div>',
+    '<button id="noise-export">Export ignore list</button>'];
+  for (const r of ranked) {
+    const on = noiseExport.has(r.id) ? ' checked' : '';
+    rows.push(`<div class="leg"><input type="checkbox" data-id="${r.id}"` +
+              `${on} style="margin-right:8px"><span>` +
+              `${esc(fnName(model, r.id))} <small>${hex(r.id)} · ` +
+              `${r.count.toLocaleString()} calls</small></span></div>`);
+  }
+  el('details').innerHTML = rows.join('');
+  for (const cb of el('details').querySelectorAll('input[type=checkbox]')) {
+    cb.onchange = () => {
+      const id = parseInt(cb.dataset.id, 10);
+      if (cb.checked) { noiseExport.add(id); mutedFns.add(id); }
+      else { noiseExport.delete(id); mutedFns.delete(id); }
+      lastLayoutKey = '';   /* force relayout to drop/re-add the node */
+      draw();
+    };
+  }
+  el('noise-export').onclick = exportIgnore;
+}
+
+function exportIgnore() {
+  if (!noiseExport.size) {
+    showBanner('Check some functions first', 'warn');
+    return;
+  }
+  const lines = ['# xemu call-trace ignore list (callee addresses)'];
+  for (const id of [...noiseExport].sort((a, b) => a - b)) {
+    lines.push(hex(id));
+  }
+  const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = (model.rec.title ? model.rec.title.replace(/\W+/g, '_')
+                                : 'calltrace') + '.ignore.txt';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+el('btn-noise').addEventListener('click', () => { showNoise(); });
 
 /* ---------------- legend ---------------- */
 
@@ -1142,6 +1208,15 @@ T('parse v2 header + inflate events', async () => {
   assertEq(ev.length, 13, 'inflated length');
   assertEq(ev[0], 0, 'ev0'); assertEq(ev[4], 3, 'ev4');
   assertEq(ev[11], 0, 'ev11');
+});
+T('noise ranking by inbound calls', async () => {
+  const rec = parseXCT(await buildTimedFixture());
+  const m = deriveModel(rec);
+  m.events = await inflateEvents(rec); buildTimeline(m);
+  const ranked = noiseRanking(m);
+  /* C (0x13000) has inbound 1+9+2 = 12, the most of any game fn */
+  assertEq(ranked[0].id, 0x13000, 'top spammer is C');
+  assertEq(ranked[0].count, 12, 'C inbound count');
 });
 T('firstFire + edgeFn derivation', async () => {
   const rec = parseXCT(await buildTimedFixture());
