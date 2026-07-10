@@ -34,6 +34,19 @@
   #details .site { color: #888; font-family: monospace; font-size: 12px;
                    padding-left: 14px; }
   #details .poly { color: #ffb84a; font-weight: 700; }
+  #details .leg { padding: 3px 0; display: flex; align-items: center; }
+  #details .leg small { color: #889; margin-left: 6px; }
+  #details .sw { flex: none; width: 13px; height: 13px; border-radius: 3px;
+                 margin-right: 8px; border: 1px solid rgba(255,255,255,.25); }
+  #details .bar { flex: none; width: 22px; height: 4px; border-radius: 2px;
+                  margin-right: 8px; }
+  #details .loop { flex: none; width: 22px; margin-right: 8px; color: #aaa;
+                   font-family: monospace; }
+  #details .seclist { max-height: 40vh; overflow-y: auto; margin-top: 2px;
+                      border-top: 1px solid #333; padding-top: 4px; }
+  #details .secrow { font-family: monospace; font-size: 12px; }
+  #details .hint { color: #778; font-size: 12px; margin-top: 10px;
+                   line-height: 1.5; }
   #stats { padding: 5px 12px; background: #1d2026; color: #999;
            border-top: 1px solid #333; font-family: monospace; }
   #help { font-size: 12px; color: #aaa; padding: 8px 12px; }
@@ -52,6 +65,7 @@
   <button id="btn-dot-visible">Export DOT (visible)</button>
   <button id="btn-dot-full">Export DOT (full)</button>
   <button id="btn-reset">Reset view</button>
+  <button id="btn-legend">Legend</button>
   <button onclick="el('helpbox').hidden = !el('helpbox').hidden">Help</button>
 </div>
 <div id="banner"></div>
@@ -285,6 +299,7 @@ function loadRecording(buf, name) {
       `${rec.kimports.size} kernel imports` +
       (symbols.size ? `, ${symbols.size} symbols restored` : '');
   draw();
+  showLegend();
 }
 
 el('file').onchange = ev => {
@@ -301,8 +316,14 @@ window.addEventListener('drop', ev => {
 /* ---------------- layout & rendering ---------------- */
 
 const NODE_H = 26, ROW = 40, COL = 260;
-const SECTION_COLORS = ['#3b5b7d', '#5b3b7d', '#3b7d5b', '#7d5b3b',
-                        '#7d3b4f', '#4f7d3b'];
+const KERNEL_COLOR = '#8a6d1f', ROOT_COLOR = '#6d3b3b',
+      UNATTR_COLOR = '#555555', NOSEC_COLOR = '#3f4652';
+const EDGE_CALL = '#aaaaaa', EDGE_CROSS = '#78b4ff';
+
+/* Distinct, evenly spread color per XBE section (golden-angle hue). */
+function sectionColor(i) {
+  return `hsl(${((i * 137.508) % 360).toFixed(0)}, 42%, 44%)`;
+}
 
 function computeLayout(m) {
   const nodes = new Map();
@@ -346,12 +367,12 @@ function computeLayout(m) {
 }
 
 function nodeColor(n) {
-  if (n.id === -2) return '#6d3b3b';
-  if (n.id === -3) return '#555555';
+  if (n.id === -2) return ROOT_COLOR;
+  if (n.id === -3) return UNATTR_COLOR;
   const f = model.fns.get(n.id);
-  if (f && f.kind === 'kernel') return '#8a6d1f';
+  if (f && f.kind === 'kernel') return KERNEL_COLOR;
   const sec = sectionIndexOf(model, n.id);
-  return sec < 0 ? '#3f4652' : SECTION_COLORS[sec % SECTION_COLORS.length];
+  return sec < 0 ? NOSEC_COLOR : sectionColor(sec);
 }
 
 function roundRect(ctx, x, y, w, h, r) {
@@ -368,6 +389,7 @@ function drawEdge(ctx, a, b, count, cross) {
   ctx.lineWidth = Math.min(5, 1 + Math.log2(1 + count) * 0.4);
   ctx.strokeStyle = cross ? 'rgba(120,180,255,0.45)'
                           : 'rgba(170,170,170,0.7)';
+  /* Legend swatch colors EDGE_CROSS / EDGE_CALL mirror these. */
   ctx.beginPath();
   if (a === b) { /* recursion: small loop off the right edge */
     const x = a.x + a.w, y = a.y + a.h / 2;
@@ -423,6 +445,11 @@ function draw() {
     ctx.font = `${16 * dpr}px system-ui`;
     ctx.fillText('Open or drop an .xct recording to begin',
                  30 * dpr, 50 * dpr);
+    ctx.fillStyle = '#556';
+    ctx.font = `${13 * dpr}px system-ui`;
+    ctx.fillText('Double-click a node to expand it · drag to pan · '
+                 + 'wheel to zoom · colors explained in the Legend →',
+                 30 * dpr, 78 * dpr);
     return;
   }
   ctx.setTransform(view.zoom * dpr, 0, 0, view.zoom * dpr,
@@ -496,6 +523,9 @@ el('cv').addEventListener('click', ev => {
     selected = n.id;
     showDetails(n.id);
     draw();
+  } else {
+    showLegend(); /* clears selection */
+    draw();
   }
 });
 el('cv').addEventListener('dblclick', ev => {
@@ -521,6 +551,64 @@ el('btn-reset').addEventListener('click', () => {
   view = { panX: 40, panY: 40, zoom: 1 };
   draw();
 });
+el('btn-legend').addEventListener('click', () => {
+  showLegend(); /* clears selection */
+  draw();
+});
+
+/* ---------------- legend ---------------- */
+
+function swatch(color, border) {
+  return `<span class="sw" style="background:${color}` +
+         (border ? `;border-color:${border}` : '') + '"></span>';
+}
+
+function showLegend() {
+  selected = null;
+  const rows = ['<h3>Legend</h3>', '<h4>Nodes</h4>'];
+  const node = (sw, label, sub) =>
+    `<div class="leg">${sw}<span>${label}` +
+    (sub ? `<small>${sub}</small>` : '') + '</span></div>';
+  rows.push(node(swatch(sectionColor(0)),
+                 'Game function', 'colored by XBE section'));
+  rows.push(node(swatch(KERNEL_COLOR), 'Kernel export', 'leaf; call into OS'));
+  rows.push(node(swatch(ROOT_COLOR), 'KERNEL', 'thread / callback roots'));
+  rows.push(node(swatch(UNATTR_COLOR), 'Unattributed',
+                 'caller outside any function'));
+  rows.push(node(swatch(NOSEC_COLOR), 'No section',
+                 'address in no XBE section'));
+  rows.push(node(swatch('#2a2e36', '#ffd24a'), 'Selected node'));
+
+  rows.push('<h4>Edges</h4>');
+  rows.push(`<div class="leg"><span class="bar" style="background:` +
+            `${EDGE_CALL}"></span><span>Call<small>caller → callee</small>` +
+            '</span></div>');
+  rows.push(`<div class="leg"><span class="bar" style="background:` +
+            `${EDGE_CROSS}"></span><span>Cross-link<small>to an ` +
+            'already-shown node</small></span></div>');
+  rows.push('<div class="leg"><span class="loop">&#8634;</span>' +
+            '<span>Recursion<small>self-call</small></span></div>');
+  rows.push('<div class="leg"><span class="loop"></span><span>Thicker line ' +
+            '&amp; <b>&times;N</b><small>more calls</small></span></div>');
+  rows.push('<div class="leg"><span class="loop"></span><span>' +
+            '<span class="poly">POLY</span><small>one site, many targets ' +
+            '(vtable / callback)</small></span></div>');
+
+  if (model && model.rec.sections.length) {
+    rows.push(`<h4>Sections in ${esc(model.rec.title || 'this title')}</h4>`);
+    rows.push('<div class="seclist">');
+    model.rec.sections.forEach((s, i) => {
+      rows.push('<div class="leg secrow">' + swatch(sectionColor(i)) +
+                `<span>${esc(s.name)} <small>${hex(s.start)}</small>` +
+                '</span></div>');
+    });
+    rows.push('</div>');
+  }
+  rows.push('<div class="hint">Click a node for its callers, callees and ' +
+            'call sites. Double-click a node to expand or collapse it. ' +
+            'Search jumps to a name or address.</div>');
+  el('details').innerHTML = rows.join('');
+}
 
 /* ---------------- details panel ---------------- */
 
@@ -840,6 +928,7 @@ window.addEventListener('load', () => {
   if (location.search.includes('selftest')) { runSelfTests(); return; }
   fitCanvas();
   window.addEventListener('resize', fitCanvas);
+  showLegend();
   if (EMBEDDED_XCT) loadEmbedded();
 });
 function fitCanvas() {
