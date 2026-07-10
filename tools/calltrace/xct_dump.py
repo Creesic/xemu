@@ -9,10 +9,10 @@ def main(path):
     (magic, ver, flags, title_id, base, entry,
      nsec, nkimp, nedge, stsz) = struct.unpack_from('<10I', data, 0)
     assert magic == 0x52544358, 'bad magic (not an .xct file)'
-    assert ver == 1, f'unsupported version {ver}'
+    assert ver in (1, 2), f'unsupported version {ver}'
     title = data[40:128].split(b'\0')[0].decode('utf-8', 'replace')
     expect = 128 + stsz + nsec * 12 + nkimp * 8 + nedge * 16
-    assert len(data) == expect, f'size mismatch: {len(data)} != {expect}'
+    assert len(data) >= expect, f'size mismatch: {len(data)} < {expect}'
 
     off = 128
     st = data[off:off + stsz]
@@ -45,6 +45,19 @@ def main(path):
     if nedge > 10:
         print(f'  ... {nedge - 10} more edges')
     print(f'total calls recorded: {total}')
+    if ver >= 2:
+        import zlib
+        ecount, = struct.unpack_from('<Q', data, off); off += 8
+        eflags, tfull, tevery = struct.unpack_from('<III', data, off); off += 12
+        raw_bytes, = struct.unpack_from('<Q', data, off); off += 8
+        comp_bytes, = struct.unpack_from('<Q', data, off); off += 8
+        ev = zlib.decompress(data[off:off + comp_bytes])
+        assert len(ev) == raw_bytes, f'event size {len(ev)} != {raw_bytes}'
+        idxs = struct.unpack('<%dI' % ecount, ev) if ecount else ()
+        assert all(i < nedge for i in idxs), 'event index out of range'
+        print(f'events: {ecount} (flags={eflags} throttle={tfull}/{tevery}, '
+              f'{comp_bytes} compressed bytes)')
+        print('first 20 event edge-indices:', list(idxs[:20]))
     print('OK')
 
 
