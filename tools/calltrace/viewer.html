@@ -86,6 +86,7 @@
   <button id="btn-legend">Legend</button>
   <button id="btn-noise">Noise</button>
   <button id="btn-perf">Perf</button>
+  <button id="btn-res">½ res</button>
   <button onclick="el('helpbox').hidden = !el('helpbox').hidden">Help</button>
 </div>
 <div id="banner"></div>
@@ -135,6 +136,7 @@ let expanded = new Set();         // expanded fn ids
 let selected = null;              // selected fn id
 let view = { panX: 40, panY: 40, zoom: 1 };
 let dpr = 1;
+let resScale = 1;                 // canvas backing-store resolution multiplier
 let layoutNodes = new Map();      // id -> layout node (Task 8)
 let timeline = { active: false, playhead: 0, playing: false, speed: 10,
                  acc: 0 };
@@ -599,7 +601,10 @@ function roundRect(ctx, x, y, w, h, r) {
 }
 
 function drawEdge(ctx, a, b, count, cross) {
-  ctx.lineWidth = Math.min(5, 1 + Math.log2(1 + count) * 0.4);
+  /* Cap the *device* stroke width. At high zoom an un-capped world-space
+   * width sweeps a huge painted area per edge (a big paint/upload cost). */
+  const baseW = Math.min(5, 1 + Math.log2(1 + count) * 0.4);
+  ctx.lineWidth = Math.min(baseW, 6 / (view.zoom * dpr));
   ctx.strokeStyle = cross ? 'rgba(120,180,255,0.45)'
                           : 'rgba(170,170,170,0.7)';
   /* Legend swatch colors EDGE_CROSS / EDGE_CALL mirror these. */
@@ -1482,13 +1487,20 @@ window.addEventListener('load', () => {
 function fitCanvas() {
   const cv = el('cv');
   const r = cv.parentElement.getBoundingClientRect();
-  dpr = window.devicePixelRatio || 1;
-  cv.width = r.width * dpr;
-  cv.height = r.height * dpr;
+  /* resScale halves the backing-store resolution — the single biggest lever
+   * when rendering is paint/upload-bound (fewer pixels to raster + copy). */
+  dpr = (window.devicePixelRatio || 1) * resScale;
+  cv.width = Math.round(r.width * dpr);
+  cv.height = Math.round(r.height * dpr);
   cv.style.width = r.width + 'px';
   cv.style.height = r.height + 'px';
   draw();
 }
+el('btn-res').addEventListener('click', () => {
+  resScale = resScale === 1 ? 0.5 : 1;
+  el('btn-res').textContent = resScale === 1 ? '½ res' : 'full res';
+  fitCanvas();
+});
 </script>
 </body>
 </html>
