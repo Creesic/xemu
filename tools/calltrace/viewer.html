@@ -120,7 +120,9 @@ function parseXCT(buf) {
     throw new Error('bad magic (not an .xct file)');
   }
   const version = dv.getUint32(4, true);
-  if (version !== 1) throw new Error('unsupported version ' + version);
+  if (version !== 1 && version !== 2) {
+    throw new Error('unsupported version ' + version);
+  }
   const flags = dv.getUint32(8, true);
   const titleId = dv.getUint32(12, true);
   const base = dv.getUint32(16, true);
@@ -159,8 +161,34 @@ function parseXCT(buf) {
                  callee: dv.getUint32(off + 4, true),
                  count: Number(dv.getBigUint64(off + 8, true)) });
   }
+  let timed = false, eventCount = 0, eventFlags = 0, eventComp = null,
+      eventRawBytes = 0, throttle = { full: 0, every: 0 };
+  if (version >= 2 && off + 36 <= buf.byteLength) {
+    timed = true;
+    eventCount = Number(dv.getBigUint64(off, true)); off += 8;
+    eventFlags = dv.getUint32(off, true); off += 4;
+    throttle.full = dv.getUint32(off, true); off += 4;
+    throttle.every = dv.getUint32(off, true); off += 4;
+    eventRawBytes = Number(dv.getBigUint64(off, true)); off += 8;
+    const compBytes = Number(dv.getBigUint64(off, true)); off += 8;
+    eventComp = new Uint8Array(buf, off, compBytes);
+  }
   return { title, titleId, base, entry, sections, kimports, edges,
-           truncated: !!(flags & 1) };
+           truncated: !!(flags & 1),
+           timed, eventCount, eventFlags, throttle, eventComp,
+           eventRawBytes };
+}
+
+/* Nearest-preceding-entry attribution for a call site. */
+function fnOfSite(m, site) {
+  const entries = m.entries;
+  let lo = 0, hi = entries.length - 1, best = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (entries[mid] <= site) { best = entries[mid]; lo = mid + 1; }
+    else hi = mid - 1;
+  }
+  return best;
 }
 
 function deriveModel(rec) {
@@ -170,16 +198,7 @@ function deriveModel(rec) {
     if (e.callee < KERNEL_BOUND) entrySet.add(e.callee);
   }
   const entries = Uint32Array.from([...entrySet].sort((a, b) => a - b));
-  /* Nearest-preceding-entry attribution for call sites. */
-  const fnOf = site => {
-    let lo = 0, hi = entries.length - 1, best = -1;
-    while (lo <= hi) {
-      const mid = (lo + hi) >> 1;
-      if (entries[mid] <= site) { best = entries[mid]; lo = mid + 1; }
-      else hi = mid - 1;
-    }
-    return best;
-  };
+  const fnOf = site => fnOfSite({ entries }, site);
   const fns = new Map();
   const getFn = (id, kind) => {
     let f = fns.get(id);
@@ -239,6 +258,59 @@ function deriveModel(rec) {
   return { fns, entries, roots, rec };
 }
 
+/* ---------------- timeline (v2) ---------------- */
+
+async function inflateEvents(rec) {
+  if (!rec.timed || !rec.eventComp) return null;
+  try {
+    const ds = new DecompressionStream('deflate');
+    const raw = await new Response(
+        new Blob([rec.eventComp]).stream().pipeThrough(ds)).arrayBuffer();
+    return new Uint32Array(raw);
+  } catch (e) {
+    rec.timed = false;
+    return null;
+  }
+}
+
+/* Compute per-raw-edge caller/callee fns and per-function-edge first-fire. */
+function buildTimeline(m) {
+  const rec = m.rec;
+  m.edgeFn = rec.edges.map(e => {
+    const caller = e.site >= KERNEL_BOUND ? -2 : fnOfSite(m, e.site);
+    return { callerId: caller < 0 ? -3 : caller, calleeId: e.callee };
+  });
+  for (const f of m.fns.values()) {
+    for (const edge of f.out.values()) edge.firstFire = Infinity;
+  }
+  const ev = m.events;
+  const ff = new Int32Array(rec.edges.length).fill(-1);
+  if (ev) {
+    for (let k = 0; k < ev.length; k++) {
+      if (ff[ev[k]] < 0) ff[ev[k]] = k;
+    }
+  }
+  m.firstFireRaw = ff;
+  for (let i = 0; i < rec.edges.length; i++) {
+    if (ff[i] < 0) continue;
+    const { callerId, calleeId } = m.edgeFn[i];
+    const f = m.fns.get(callerId);
+    const edge = f && f.out.get(calleeId);
+    if (edge) edge.firstFire = Math.min(edge.firstFire, ff[i]);
+  }
+  m.eventCount = ev ? ev.length : 0;
+}
+
+function discoveredEdgeCount(m, p) {
+  let n = 0;
+  for (const f of m.fns.values()) {
+    for (const edge of f.out.values()) {
+      if (edge.firstFire <= p) n++;
+    }
+  }
+  return n;
+}
+
 function fnName(m, id) {
   if (id === -2) return 'KERNEL';
   if (id === -3) return '(unattributed)';
@@ -263,7 +335,7 @@ function sectionOf(m, addr) {
 
 /* ---------------- loading ---------------- */
 
-function loadRecording(buf, name) {
+async function loadRecording(buf, name) {
   let rec;
   try {
     rec = parseXCT(buf);
@@ -272,6 +344,10 @@ function loadRecording(buf, name) {
     return;
   }
   model = deriveModel(rec);
+  if (rec.timed) {
+    model.events = await inflateEvents(rec);
+    buildTimeline(model);
+  }
   symbols = new Map();
   const saved = localStorage.getItem('xct-syms-' + rec.titleId);
   if (saved) {
@@ -898,11 +974,53 @@ T('DOT export', () => {
   model = null;
 });
 
-function runSelfTests() {
+async function buildTimedFixture() {
+  const base = new Uint8Array(buildFixture());
+  new DataView(base.buffer).setUint32(4, 2, true);         /* version 2 */
+  const stream = [0, 1, 2, 3, 3, 3, 4, 4, 6, 7, 8, 0, 2];
+  const ev = new Uint32Array(stream);
+  const cs = new CompressionStream('deflate');
+  const comp = new Uint8Array(await new Response(
+      new Blob([ev.buffer]).stream().pipeThrough(cs)).arrayBuffer());
+  const tail = new Uint8Array(8 + 12 + 8 + 8 + comp.length);
+  const dv = new DataView(tail.buffer);
+  dv.setBigUint64(0, BigInt(stream.length), true);         /* event_count */
+  dv.setUint32(8, 0, true);                                /* flags */
+  dv.setUint32(12, 256, true); dv.setUint32(16, 64, true); /* throttle */
+  dv.setBigUint64(20, BigInt(ev.byteLength), true);        /* raw_bytes */
+  dv.setBigUint64(28, BigInt(comp.length), true);          /* comp_bytes */
+  tail.set(comp, 36);
+  const out = new Uint8Array(base.length + tail.length);
+  out.set(base, 0); out.set(tail, base.length);
+  return out.buffer;
+}
+
+T('parse v2 header + inflate events', async () => {
+  const rec = parseXCT(await buildTimedFixture());
+  assertEq(rec.timed, true, 'timed flag');
+  assertEq(rec.eventCount, 13, 'event count');
+  assertEq(rec.throttle.full, 256, 'throttle full');
+  const ev = await inflateEvents(rec);
+  assertEq(ev.length, 13, 'inflated length');
+  assertEq(ev[0], 0, 'ev0'); assertEq(ev[4], 3, 'ev4');
+  assertEq(ev[11], 0, 'ev11');
+});
+T('firstFire + edgeFn derivation', async () => {
+  const rec = parseXCT(await buildTimedFixture());
+  const m = deriveModel(rec);
+  m.events = await inflateEvents(rec);
+  buildTimeline(m);
+  assertEq(m.fns.get(0x11000).out.get(0x12000).firstFire, 0, 'A->B ff');
+  assertEq(m.fns.get(0x12000).out.get(0x15000).firstFire, 6, 'B->D2 ff');
+  assertEq(discoveredEdgeCount(m, 0), 1, 'discovered at 0');
+  assertEq(discoveredEdgeCount(m, 6) >= 4, true, 'discovered at 6');
+});
+
+async function runSelfTests() {
   const out = [];
   let fails = 0;
   for (const [name, fn] of selfTests) {
-    try { fn(); out.push('PASS  ' + name); }
+    try { await fn(); out.push('PASS  ' + name); }
     catch (e) { fails++; out.push('FAIL  ' + name + ' — ' + e.message); }
   }
   out.push('', fails ? `${fails} FAILED` : 'ALL PASS');
