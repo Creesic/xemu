@@ -86,7 +86,7 @@
   <button id="btn-legend">Legend</button>
   <button id="btn-noise">Noise</button>
   <button id="btn-perf">Perf</button>
-  <button id="btn-res">½ res</button>
+  <button id="btn-res">Auto-res</button>
   <button onclick="el('helpbox').hidden = !el('helpbox').hidden">Help</button>
 </div>
 <div id="banner"></div>
@@ -137,7 +137,19 @@ let selected = null;              // selected fn id
 let view = { panX: 40, panY: 40, zoom: 1 };
 let dpr = 1;
 let resScale = 1;                 // canvas backing-store resolution multiplier
+let autoRes = true;               // drop to half res only while moving
+let motionTimer = 0;
 let layoutNodes = new Map();      // id -> layout node (Task 8)
+
+/* Half-res while interacting, snap back to crisp full res when it settles.
+ * This keeps motion smooth on paint/upload-bound machines without leaving
+ * the static view blurry. */
+function nudgeMotion() {
+  if (!autoRes) return;
+  if (resScale !== 0.5) { resScale = 0.5; fitCanvas(); }
+  clearTimeout(motionTimer);
+  motionTimer = setTimeout(() => { resScale = 1; fitCanvas(); }, 180);
+}
 let timeline = { active: false, playhead: 0, playing: false, speed: 10,
                  acc: 0 };
 const MAX_PULSES = 200, PULSE_LIFE_MS = 550;
@@ -487,6 +499,7 @@ function spawnPulsesForRange(p0, p1) {
 }
 function tick(ts) {
   if (!timeline.playing) { rafId = 0; return; }
+  nudgeMotion();          /* keep playback at half res; snap crisp on pause */
   const p0 = timeline.playhead;
   /* Fractional accumulator so speeds < 1 event/frame (e.g. 0.1x) work. */
   timeline.acc += timeline.speed;
@@ -881,6 +894,7 @@ window.addEventListener('mousemove', ev => {
   }
   view.panX = drag.panX + ev.clientX - drag.x;
   view.panY = drag.panY + ev.clientY - drag.y;
+  nudgeMotion();
   draw();
 });
 window.addEventListener('mouseup', () => { drag = null; });
@@ -922,6 +936,7 @@ el('cv').addEventListener('wheel', ev => {
   view.panX = mx - (mx - view.panX) * (nz / view.zoom);
   view.panY = my - (my - view.panY) * (nz / view.zoom);
   view.zoom = nz;
+  nudgeMotion();
   draw();
 }, { passive: false });
 el('btn-reset').addEventListener('click', () => {
@@ -1497,8 +1512,10 @@ function fitCanvas() {
   draw();
 }
 el('btn-res').addEventListener('click', () => {
-  resScale = resScale === 1 ? 0.5 : 1;
-  el('btn-res').textContent = resScale === 1 ? '½ res' : 'full res';
+  autoRes = !autoRes;
+  el('btn-res').textContent = autoRes ? 'Auto-res' : 'Full res';
+  clearTimeout(motionTimer);
+  resScale = 1;
   fitCanvas();
 });
 </script>
