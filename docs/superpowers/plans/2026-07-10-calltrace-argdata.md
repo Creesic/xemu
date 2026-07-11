@@ -728,7 +728,7 @@ Run:
 python3 tools/calltrace/make_test_xct.py --data tools/calltrace/test-fixture-data.xct
 python3 tools/calltrace/xct_dump.py tools/calltrace/test-fixture-data.xct
 ```
-Expected: `wrote tools/calltrace/test-fixture-data.xct`, then a dump ending with a `data:` line reporting `11 sets across 9 edges (2 multi-set), 13 indices, 0 overflow` (edge0=2, edge3=2, edges 1/2/4/6/7/8 = 1 each, edge5=0 → 2+2+1+1+1+1+1+1 = 11; edges 0 and 3 are multi-set).
+Expected: `wrote tools/calltrace/test-fixture-data.xct`, then a dump ending with a `data:` line reporting `10 sets across 9 edges (2 multi-set), 13 indices, 0 overflow` (edge0=2, edge3=2, edges 1/2/4/6/7/8 = 1 each, edge5=0 → 2+2+1+1+1+1+1+1 = 10; edges 0 and 3 are multi-set).
 
 - [ ] **Step 4: Round-trip assertion**
 

@@ -18,6 +18,26 @@ EDGES = [
 # A known event stream referencing EDGES by index.
 EVENT_STREAM = [0, 1, 2, 3, 3, 3, 4, 4, 6, 7, 8, 0, 2]
 
+# One 6-dword arg snapshot per event (parallel to EVENT_STREAM). Repeats
+# create dedup; edge 3 and edge 0 each get a second distinct set.
+ARG_STREAM = [
+    (0x00011A40, 0, 5, 0, 0, 0),      # ev0  edge0 -> set0
+    (1, 2, 3, 4, 5, 6),               # ev1  edge1 -> set0
+    (0xDEAD, 0xBEEF, 0, 0, 0, 0),     # ev2  edge2 -> set0
+    (7, 7, 7, 7, 7, 7),               # ev3  edge3 -> set0
+    (7, 7, 7, 7, 7, 7),               # ev4  edge3 -> set0 (dup)
+    (8, 8, 8, 8, 8, 8),               # ev5  edge3 -> set1 (new)
+    (0x80012345, 0, 0, 0, 0, 0),      # ev6  edge4 -> set0
+    (0x80012345, 0, 0, 0, 0, 0),      # ev7  edge4 -> set0 (dup)
+    (0, 0, 0, 0, 0, 0),               # ev8  edge6 -> set0
+    (0x16000, 0, 0, 0, 0, 0),         # ev9  edge7 -> set0
+    (0x12000, 1, 2, 3, 4, 5),         # ev10 edge8 -> set0
+    (0x00011A44, 0, 6, 0, 0, 0),      # ev11 edge0 -> set1 (new)
+    (0xDEAD, 0xBEEF, 0, 0, 0, 0),     # ev12 edge2 -> set0 (dup)
+]
+ARGSET_DWORDS = 6
+ARGSET_CAP = 16
+
 
 def build():
     strtab = bytearray(b'\0')
@@ -61,11 +81,62 @@ def build_timed():
     return bytes(out)
 
 
+def build_data():
+    import zlib
+    base = bytearray(build())              # v1 body
+    struct.pack_into('<I', base, 4, 3)     # version 1 -> 3
+
+    # v2 event block (identical to build_timed()).
+    ev = struct.pack('<%dI' % len(EVENT_STREAM), *EVENT_STREAM)
+    ev_blob = zlib.compress(ev, 9)
+    out = base
+    out += struct.pack('<Q', len(EVENT_STREAM))
+    out += struct.pack('<III', 0, 256, 64)
+    out += struct.pack('<Q', len(ev))
+    out += struct.pack('<Q', len(ev_blob))
+    out += ev_blob
+
+    # Intern arg snapshots per edge (same rule as ct_argset_intern).
+    tables = [[] for _ in range(len(EDGES))]   # edge -> list of tuples
+    index = []
+    for edge_idx, snap in zip(EVENT_STREAM, ARG_STREAM):
+        t = tables[edge_idx]
+        if snap in t:
+            index.append(t.index(snap))
+        elif len(t) < ARGSET_CAP:
+            index.append(len(t))
+            t.append(snap)
+        else:
+            index.append(0xFF)
+
+    # Arg-set table blob: per edge u8 nsets, then nsets * 6 * u32.
+    table = bytearray()
+    for t in tables:
+        table.append(len(t))
+        for snap in t:
+            table += struct.pack('<6I', *snap)
+    idx = bytes(index)
+    tcomp = zlib.compress(bytes(table), 9)
+    icomp = zlib.compress(idx, 9)
+
+    out += struct.pack('<II', ARGSET_DWORDS, ARGSET_CAP)
+    out += struct.pack('<Q', len(table))
+    out += struct.pack('<Q', len(tcomp))
+    out += struct.pack('<Q', len(idx))
+    out += struct.pack('<Q', len(icomp))
+    out += tcomp
+    out += icomp
+    return bytes(out)
+
+
 if __name__ == '__main__':
     timed = '--timed' in sys.argv
-    args = [a for a in sys.argv[1:] if a != '--timed']
-    path = args[0] if args else ('test-fixture-timed.xct' if timed
-                                 else 'test-fixture.xct')
-    data = build_timed() if timed else build()
-    open(path, 'wb').write(data)
+    data = '--data' in sys.argv
+    args = [a for a in sys.argv[1:] if a not in ('--timed', '--data')]
+    default = ('test-fixture-data.xct' if data
+               else 'test-fixture-timed.xct' if timed
+               else 'test-fixture.xct')
+    path = args[0] if args else default
+    payload = build_data() if data else build_timed() if timed else build()
+    open(path, 'wb').write(payload)
     print(f'wrote {path}')

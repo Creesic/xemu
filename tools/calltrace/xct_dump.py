@@ -9,7 +9,7 @@ def main(path):
     (magic, ver, flags, title_id, base, entry,
      nsec, nkimp, nedge, stsz) = struct.unpack_from('<10I', data, 0)
     assert magic == 0x52544358, 'bad magic (not an .xct file)'
-    assert ver in (1, 2), f'unsupported version {ver}'
+    assert ver in (1, 2, 3), f'unsupported version {ver}'
     title = data[40:128].split(b'\0')[0].decode('utf-8', 'replace')
     expect = 128 + stsz + nsec * 12 + nkimp * 8 + nedge * 16
     assert len(data) >= expect, f'size mismatch: {len(data)} < {expect}'
@@ -58,6 +58,34 @@ def main(path):
         print(f'events: {ecount} (flags={eflags} throttle={tfull}/{tevery}, '
               f'{comp_bytes} compressed bytes)')
         print('first 20 event edge-indices:', list(idxs[:20]))
+        off += comp_bytes
+    if ver == 3:
+        argset_dwords, argset_cap = struct.unpack_from('<II', data, off)
+        off += 8
+        table_raw, table_comp = struct.unpack_from('<QQ', data, off)
+        off += 16
+        index_raw, index_comp = struct.unpack_from('<QQ', data, off)
+        off += 16
+        table = zlib.decompress(data[off:off + table_comp])
+        off += table_comp
+        index = zlib.decompress(data[off:off + index_comp])
+        off += index_comp
+        assert len(table) == table_raw, f'table {len(table)} != {table_raw}'
+        assert len(index) == index_raw, f'index {len(index)} != {index_raw}'
+        assert len(index) == ecount, 'index not parallel to events'
+        o = 0
+        total_sets = multi = 0
+        for _ in range(nedge):
+            nsets = table[o]
+            o += 1
+            o += nsets * argset_dwords * 4
+            total_sets += nsets
+            if nsets > 1:
+                multi += 1
+        overflow = index.count(0xFF)
+        print(f'data: {argset_dwords} dwords/set, cap {argset_cap}, '
+              f'{total_sets} sets across {nedge} edges ({multi} multi-set), '
+              f'{len(index)} indices, {overflow} overflow')
     print('OK')
 
 
