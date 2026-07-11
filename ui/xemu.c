@@ -54,6 +54,8 @@
 #include "hw/xbox/smbus.h" // For eject, drive tray
 #include "hw/xbox/nv2a/nv2a.h"
 #include "ui/xemu-notifications.h"
+#include "../xemu-calltrace.h"
+#include "../xemu-xbe.h"
 
 #include <stb_image.h>
 #include <locale.h>
@@ -407,6 +409,45 @@ static void handle_keydown(SDL_Event *ev)
             window_resize(scon);
             gui_keysym = 1;
             break;
+        case SDL_SCANCODE_T: {
+            gui_keysym = 1;
+            if (xemu_calltrace_mode() != CT_OFF) {
+                xemu_calltrace_stop();
+                const char *dir = g_config.general.calltrace_dir;
+                if (!strlen(dir)) {
+                    dir = g_config.general.screenshot_dir;
+                }
+                char *err = NULL;
+                char *path = xemu_calltrace_save(dir, &err);
+                if (path) {
+                    char *bn = g_path_get_basename(path);
+                    char *msg = g_strdup_printf("Call trace saved: %s", bn);
+                    xemu_queue_notification(msg);
+                    g_free(msg);
+                    g_free(bn);
+                    g_free(path);
+                } else {
+                    xemu_queue_notification(err ? err
+                                            : "Call trace save failed");
+                    g_free(err);
+                }
+            } else if (xemu_get_xbe_info() != NULL) {
+                const char *mstr = g_config.general.calltrace_hotkey_mode;
+                CalltraceMode mode =
+                    (mstr && !strcmp(mstr, "edges")) ? CT_EDGES :
+                    (mstr && !strcmp(mstr, "timed")) ? CT_TIMED : CT_DATA;
+                xemu_calltrace_start_mode(mode);
+                const char *label = mode == CT_EDGES ? "Edges" :
+                                    mode == CT_TIMED ? "Timed" : "Data";
+                char *msg = g_strdup_printf("Call trace: recording (%s)",
+                                            label);
+                xemu_queue_notification(msg);
+                g_free(msg);
+            } else {
+                xemu_queue_notification("Load a game before tracing");
+            }
+            break;
+        }
         default:
             break;
         }
