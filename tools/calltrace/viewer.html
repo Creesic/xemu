@@ -599,8 +599,22 @@ function updateReadout() {
   const p = timeline.playhead;
   let last = '';
   if (model && model.events && p > 0) {
-    const e = model.edgeFn[model.events[p - 1]];
+    const rawEdge = model.events[p - 1];
+    const e = model.edgeFn[rawEdge];
     last = ' · last: ' + (e ? fnName(model, e.calleeId) : '');
+    if (model.argIndex && model.rec.argsets) {
+      const ai = model.argIndex[p - 1];
+      if (ai === 0xFF) {
+        last += '  args: (not captured)';
+      } else {
+        const sets = model.rec.argsets[rawEdge];
+        const w = sets && sets[ai];
+        if (w) {
+          last += '  args: ' + w.map(v => hex(v) + '·' +
+                    classifyWord(model, v).cls).join(', ');
+        }
+      }
+    }
   }
   el('tl-readout').textContent =
       `${p} / ${model ? model.eventCount : 0}${last}`;
@@ -1849,6 +1863,26 @@ function buildFixture() {
   return buf;
 }
 
+/* The committed v3 (--data) fixture, embedded so the selftest checks the
+ * exact bytes the C writer produces (tools/calltrace/test-fixture-data.xct). */
+const DATA_FIXTURE_B64 =
+  "WENUUgMAAAAAAAAAAQBTTQAAAQAAEAEAAQAAAAEAAAAJAAAAGQAAAFRlc3QgRml4dHVyZQAA"
+  + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  + "AAAAAAAAAAAAAAAAAAAAAAAAAAAALnRleHQAS2VRdWVyeVN5c3RlbVRpbWUAAQAAAAAQAQAA"
+  + "gAAARSMBgAcAAAAQEAEAACABAAUAAAAAAAAAIBABAAAwAQABAAAAAAAAAEAgAQAAMAEACQAA"
+  + "AAAAAABQIAEAAEABAAIAAAAAAAAAUCABAABQAQAEAAAAAAAAAAgwAQBFIwGAAwAAAAAAAAAQ"
+  + "MAEAADABAAIAAAAAAAAAAAACgABgAQABAAAAAAAAAAhgAQAAIAEABwAAAAAAAAANAAAAAAAA"
+  + "AAAAAAAAAQAAQAAAADQAAAAAAAAAIAAAAAAAAAB42mNgYGBgBGImIGZGwixQzAbE7EDMwQAB"
+  + "IHUABCAALAYAAAAQAAAA+QAAAAAAAABOAAAAAAAAAA0AAAAAAAAADwAAAAAAAAB42mNykGJk"
+  + "AAFWBlTgAhVnQxNnBAkzATEzELNANYIUMa69x8Dwfh8DBmBiBxLYMAcOzOiqzNjAgA0wMuAA"
+  + "jAwJjDgkFBgZsDkZAI3vBfF42mNgAAJGBggJAAAXAAM=";
+function buildDataFixture() {
+  const bin = atob(DATA_FIXTURE_B64);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8.buffer;
+}
+
 const selfTests = [];
 function T(name, fn) { selfTests.push([name, fn]); }
 function assertEq(got, want, what) {
@@ -1917,6 +1951,31 @@ T('DOT export', () => {
   assertEq(dot.includes('"KERNEL" -> "sub_00016000"'), true, 'root edge');
   assertEq(dot.startsWith('digraph calltrace {'), true, 'digraph header');
   model = null;
+});
+
+T('v3 parse: argsets + index attach', async () => {
+  const rec = parseXCT(buildDataFixture());
+  assertEq(rec.hasArgs, true, 'hasArgs');
+  assertEq(rec.argsetDwords, 6, 'dwords');
+  const m = deriveModel(rec);
+  m.events = await inflateEvents(rec);
+  await inflateArgs(rec);
+  buildCalleeArgsets(m);
+  m.argIndex = rec.argIndex;
+  assertEq(rec.argsets[0].length, 2, 'edge0 has 2 sets');
+  assertEq(rec.argsets[3].length, 2, 'edge3 has 2 sets');
+  assertEq(rec.argsets[5].length, 0, 'edge5 never fired');
+  assertEq(rec.argIndex.length, 13, 'index parallel to events');
+  assertEq(rec.argIndex[5], 1, 'ev5 -> edge3 set1');
+  assertEq(rec.argIndex[4], 0, 'ev4 -> edge3 set0 (dup)');
+  assertEq(m.calleeArgsets.get(0x13000).sets.length, 3, 'callee agg');
+});
+T('v3 classifyWord ranges', () => {
+  const rec = parseXCT(buildDataFixture());
+  const m = deriveModel(rec);
+  assertEq(classifyWord(m, 0x80012345).cls, 'kernel', 'kernel range');
+  assertEq(classifyWord(m, 0x11500).cls, 'code', '.text range');
+  assertEq(classifyWord(m, 5).cls, 'int', 'small int');
 });
 
 T('webgl: node color + pan/collapse rebuild caching', async () => {
