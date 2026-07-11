@@ -9,6 +9,8 @@ There are two versions:
 - **v1 (Edges)** — deduplicated `(call_site → callee)` edges with hit counts.
 - **v2 (Timed)** — everything in v1, plus a compressed, ordered log of every
   recorded call (an event stream) for the timeline/playback view.
+- **v3 (Data)** — everything in v2, plus per-call argument snapshots: a
+  per-edge table of distinct argument-sets and a 1-byte-per-event index into it.
 
 Everything is **little-endian**. All offsets and sizes below are in bytes.
 
@@ -28,12 +30,16 @@ Everything is **little-endian**. All offsets and sizes below are in bytes.
 +------------------------------------------------------+
 | Edges              edge_count × 16 bytes              |
 +------------------------------------------------------+
-| Event block        (v2 only) 36-byte sub-header +    |
+| Event block        (v2+) 36-byte sub-header +        |
 |                    deflate-compressed u32 stream      |
++------------------------------------------------------+
+| Data block         (v3 only) 40-byte sub-header +    |
+|                    two deflate streams (table, index) |
 +------------------------------------------------------+
 ```
 
-A v1 file ends after the Edges block. A v2 file appends the Event block.
+A v1 file ends after the Edges block. A v2 file appends the Event block. A v3
+file also appends the Data block (and always contains the Event block).
 
 ---
 
@@ -42,7 +48,7 @@ A v1 file ends after the Edges block. A v2 file appends the Event block.
 | Offset | Size | Type | Field | Meaning |
 |---|---|---|---|---|
 | 0x00 | 4 | u32 | `magic` | `0x52544358` — the ASCII bytes `X C T R` |
-| 0x04 | 4 | u32 | `version` | `1` = Edges, `2` = Timed |
+| 0x04 | 4 | u32 | `version` | `1` = Edges, `2` = Timed, `3` = Data |
 | 0x08 | 4 | u32 | `flags` | bit 0 = the edge map hit its 1M-edge cap (graph is partial) |
 | 0x0C | 4 | u32 | `title_id` | XBE certificate title id |
 | 0x10 | 4 | u32 | `base` | XBE base address (usually `0x00010000`) |
@@ -143,6 +149,49 @@ find the noisiest ones.
 
 ---
 
+## Data block (v3 only)
+
+Appended immediately after the Event block. Present iff `version == 3`. A v3
+file is a full v2 file (it always contains the Event block) plus this block.
+
+### Sub-header (40 bytes)
+
+| Offset | Size | Type | Field | Meaning |
+|---|---|---|---|---|
+| +0 | 4 | u32 | `argset_dwords` | dwords per arg-set (always 6: ECX, EDX, [ESP+0..12]) |
+| +4 | 4 | u32 | `argset_cap` | max distinct sets per edge (always 16) |
+| +8 | 8 | u64 | `table_raw_bytes` | uncompressed arg-set table size |
+| +16 | 8 | u64 | `table_comp_bytes` | compressed arg-set table size |
+| +24 | 8 | u64 | `index_raw_bytes` | uncompressed index size = `event_count` |
+| +32 | 8 | u64 | `index_comp_bytes` | compressed index size |
+
+### Arg-set table (`table_comp_bytes`, zlib)
+
+Decompresses to `table_raw_bytes`. A sequential walk over **all edges, in
+index order** (`edge_count` entries):
+
+```
+for each edge:
+    u8  nsets                         # 0..16
+    nsets × (argset_dwords × u32)     # ECX, EDX, [ESP+0], [ESP+4], [ESP+8], [ESP+12]
+```
+
+Edge `k`'s distinct arg-sets are the `k`-th entry.
+
+### Index stream (`index_comp_bytes`, zlib)
+
+Decompresses to `event_count` bytes, one `u8` per event, parallel to the event
+stream. For event `i`, the arg-set is `edges[events[i]].argsets[index[i]]`,
+unless `index[i] == 0xFF` (**overflow** — that call's snapshot was a 17th+
+distinct set and was not stored).
+
+**Semantics:** the snapshot is the outgoing argument words *at the call*, read
+before the return address is pushed — so the stack dwords are the caller's
+pushed cdecl/stdcall arguments and ECX/EDX are the thiscall/fastcall register
+arguments. Only the words are stored, not the memory they point at.
+
+---
+
 ## Deriving functions (optional)
 
 The file records call *sites* and *targets*, not function boundaries. The
@@ -169,7 +218,7 @@ def read_xct(path):
     d = open(path, 'rb').read()
     (magic, ver, flags, title_id, base, entry,
      nsec, nkimp, nedge, stsz) = struct.unpack_from('<10I', d, 0)
-    assert magic == 0x52544358 and ver in (1, 2)
+    assert magic == 0x52544358 and ver in (1, 2, 3)
     title = d[40:128].split(b'\0')[0].decode('utf-8', 'replace')
 
     off = 128
@@ -200,10 +249,29 @@ def read_xct(path):
         raw = zlib.decompress(d[off:off + comp_bytes])
         assert len(raw) == raw_bytes
         events = struct.unpack('<%dI' % ecount, raw)   # indices into edges
+        off += comp_bytes
+
+    argsets = None       # per edge: list of arg-set tuples
+    argidx = None        # per event: index into that edge's arg-sets (0xFF = overflow)
+    if ver >= 3:
+        adw, acap = struct.unpack_from('<2I', d, off); off += 8
+        traw, tcomp = struct.unpack_from('<2Q', d, off); off += 16
+        iraw, icomp = struct.unpack_from('<2Q', d, off); off += 16
+        table = zlib.decompress(d[off:off + tcomp]); off += tcomp
+        argidx = list(zlib.decompress(d[off:off + icomp])); off += icomp
+        o = 0
+        argsets = []
+        for _ in range(nedge):
+            nsets = table[o]; o += 1
+            sets = []
+            for _ in range(nsets):
+                sets.append(struct.unpack_from('<%dI' % adw, table, o))
+                o += adw * 4
+            argsets.append(sets)
 
     return dict(version=ver, title=title, title_id=title_id, base=base,
                 entry=entry, sections=sections, kimports=kimports,
-                edges=edges, events=events)
+                edges=edges, events=events, argsets=argsets, argidx=argidx)
 ```
 
 ## Minimal event inflation (JavaScript / browser)
