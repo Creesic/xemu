@@ -25,15 +25,60 @@
 #include "xemu-calltrace.h"
 #include "xemu-calltrace-map.h"
 #include "xemu-calltrace-events.h"
+#include "xemu-calltrace-argsets.h"
 #include "xemu-calltrace-kexports.h"
 #include <zlib.h>
 
 #define CT_KERNEL_SPACE 0x80000000u
 
 bool xemu_calltrace_armed;
+bool xemu_calltrace_capture_args;
 
 static CTMap ct_map;
 static bool ct_truncated;
+
+/* Data mode: per-edge arg-set tables (indexed by edge index) and the
+ * parallel per-event arg-set index stream. */
+static CTEdgeArgs **ct_edge_args;
+static uint32_t ct_edge_args_cap;
+static GByteArray *ct_arg_index;
+
+static void ct_args_reset(void)
+{
+    if (ct_edge_args) {
+        for (uint32_t i = 0; i < ct_edge_args_cap; i++) {
+            g_free(ct_edge_args[i]);
+        }
+        g_free(ct_edge_args);
+        ct_edge_args = NULL;
+    }
+    ct_edge_args_cap = 0;
+    if (ct_arg_index) {
+        g_byte_array_free(ct_arg_index, TRUE);
+        ct_arg_index = NULL;
+    }
+}
+
+/* Intern a snapshot for the given edge index; grows the store lazily. */
+static uint8_t ct_args_intern_edge(uint32_t edge_index,
+                                   const uint32_t args[6])
+{
+    if (edge_index >= ct_edge_args_cap) {
+        uint32_t nc = ct_edge_args_cap ? ct_edge_args_cap : 4096;
+        while (edge_index >= nc) {
+            nc *= 2;
+        }
+        ct_edge_args = g_renew(CTEdgeArgs *, ct_edge_args, nc);
+        for (uint32_t i = ct_edge_args_cap; i < nc; i++) {
+            ct_edge_args[i] = NULL;
+        }
+        ct_edge_args_cap = nc;
+    }
+    if (!ct_edge_args[edge_index]) {
+        ct_edge_args[edge_index] = g_malloc0(sizeof(CTEdgeArgs));
+    }
+    return ct_argset_intern(ct_edge_args[edge_index], args);
+}
 
 #define CT_THROTTLE_FULL 256   /* log every call up to this many per edge */
 #define CT_THROTTLE_EVERY 64   /* then 1-in-this-many afterwards          */
@@ -106,6 +151,11 @@ void xemu_calltrace_start_mode(CalltraceMode mode)
     }
     ct_events_free(&ct_events);
     ct_events_init(&ct_events);
+    ct_args_reset();
+    if (mode == CT_DATA) {
+        ct_arg_index = g_byte_array_new();
+    }
+    xemu_calltrace_capture_args = (mode == CT_DATA);
     ct_truncated = false;
     ct_events_trunc = false;
     ct_mode = mode;
@@ -125,6 +175,7 @@ void xemu_calltrace_stop(void)
         return;
     }
     xemu_calltrace_armed = false;
+    xemu_calltrace_capture_args = false;
     /* Map data intentionally retained until save or next start. */
     queue_tb_flush(qemu_get_cpu(0));
 }
@@ -220,12 +271,43 @@ void xemu_calltrace_record(uint32_t call_site, uint32_t callee)
         }
         return;
     }
-    if (ct_mode == CT_TIMED) {
+    if (ct_mode == CT_TIMED || ct_mode == CT_DATA) {
         if (e->count <= CT_THROTTLE_FULL ||
             (e->count % CT_THROTTLE_EVERY) == 0) {
             if (!ct_events_append(&ct_events, e->index)) {
                 ct_events_trunc = true;
             }
+        }
+    }
+}
+
+void xemu_calltrace_record_data(uint32_t call_site, uint32_t callee,
+                                const uint32_t args[6])
+{
+    if (!xemu_calltrace_armed) {
+        return;
+    }
+    if (call_site >= CT_KERNEL_SPACE && callee >= CT_KERNEL_SPACE) {
+        return;
+    }
+    if (ct_ignore_n && ct_ignore_has(callee)) {
+        return;
+    }
+    CTEdge *e = ct_map_add_indexed(&ct_map, call_site, callee);
+    if (!e) {
+        if (ct_map.num_entries >= CT_MAP_MAX_ENTRIES) {
+            ct_truncated = true;
+        }
+        return;
+    }
+    if (e->count <= CT_THROTTLE_FULL || (e->count % CT_THROTTLE_EVERY) == 0) {
+        /* Append the event and its arg-set index together so the two
+         * streams stay exactly parallel. */
+        if (ct_events_append(&ct_events, e->index)) {
+            uint8_t ai = ct_args_intern_edge(e->index, args);
+            g_byte_array_append(ct_arg_index, &ai, 1);
+        } else {
+            ct_events_trunc = true;
         }
     }
 }
@@ -402,6 +484,45 @@ static GByteArray *ct_deflate_events(void)
     return out;
 }
 
+/* Deflate a raw byte range into a GByteArray. */
+static GByteArray *ct_deflate_bytes(const uint8_t *data, size_t len)
+{
+    GByteArray *out = g_byte_array_new();
+    z_stream zs = { 0 };
+    if (deflateInit(&zs, Z_DEFAULT_COMPRESSION) != Z_OK) {
+        return out;
+    }
+    guint8 obuf[65536];
+    zs.next_in = (Bytef *)data;
+    zs.avail_in = len;
+    int rc;
+    do {
+        zs.next_out = obuf;
+        zs.avail_out = sizeof(obuf);
+        rc = deflate(&zs, Z_FINISH);
+        g_byte_array_append(out, obuf, sizeof(obuf) - zs.avail_out);
+    } while (rc == Z_OK);
+    deflateEnd(&zs);
+    return out;
+}
+
+/* Build the uncompressed arg-set table blob in edge-index order:
+ * per edge: u8 nsets, then nsets * CT_ARGSET_DWORDS * u32. */
+static GByteArray *ct_build_argtable(uint32_t nedges)
+{
+    GByteArray *t = g_byte_array_new();
+    for (uint32_t i = 0; i < nedges; i++) {
+        CTEdgeArgs *ea = (i < ct_edge_args_cap) ? ct_edge_args[i] : NULL;
+        uint8_t nsets = ea ? ea->nsets : 0;
+        g_byte_array_append(t, &nsets, 1);
+        if (nsets) {
+            g_byte_array_append(t, (const guint8 *)ea->sets,
+                                nsets * CT_ARGSET_DWORDS * sizeof(uint32_t));
+        }
+    }
+    return t;
+}
+
 char *xemu_calltrace_save(const char *dir, char **err_msg)
 {
     *err_msg = NULL;
@@ -474,8 +595,10 @@ char *xemu_calltrace_save(const char *dir, char **err_msg)
     if (ok) {
         /* Host is little-endian on all supported platforms. */
         bool timed = ct_mode == CT_TIMED;
+        bool data = ct_mode == CT_DATA;
+        bool has_events = timed || data;
         uint32_t hdr[10] = { 0x52544358u,
-                             timed ? 2u : 1u,
+                             data ? 3u : (timed ? 2u : 1u),
                              ct_truncated ? 1u : 0u,
                              ldl_le_p(&xbe->cert->m_titleid),
                              base,
@@ -511,8 +634,8 @@ char *xemu_calltrace_save(const char *dir, char **err_msg)
         }
         g_free(ordered);
 
-        /* v2: trailing compressed event block. */
-        if (ok && timed) {
+        /* v2/v3: trailing compressed event block. */
+        if (ok && has_events) {
             GByteArray *blob = ct_deflate_events();
             uint64_t event_count = ct_events.count;
             uint32_t event_flags = ct_events_trunc ? 1u : 0u;
@@ -528,6 +651,34 @@ char *xemu_calltrace_save(const char *dir, char **err_msg)
                  (comp_bytes == 0 ||
                   fwrite(blob->data, blob->len, 1, f) == 1);
             g_byte_array_free(blob, TRUE);
+        }
+
+        /* v3: trailing Data block (arg-set table + per-event index). */
+        if (ok && data) {
+            GByteArray *table = ct_build_argtable(ct_map.num_entries);
+            GByteArray *tcomp = ct_deflate_bytes(table->data, table->len);
+            GByteArray *icomp = ct_deflate_bytes(
+                ct_arg_index ? ct_arg_index->data : NULL,
+                ct_arg_index ? ct_arg_index->len : 0);
+            uint32_t argset_dwords = CT_ARGSET_DWORDS;
+            uint32_t argset_cap = CT_ARGSET_CAP;
+            uint64_t table_raw = table->len;
+            uint64_t table_comp = tcomp->len;
+            uint64_t index_raw = ct_arg_index ? ct_arg_index->len : 0;
+            uint64_t index_comp = icomp->len;
+            ok = fwrite(&argset_dwords, 4, 1, f) == 1 &&
+                 fwrite(&argset_cap, 4, 1, f) == 1 &&
+                 fwrite(&table_raw, 8, 1, f) == 1 &&
+                 fwrite(&table_comp, 8, 1, f) == 1 &&
+                 fwrite(&index_raw, 8, 1, f) == 1 &&
+                 fwrite(&index_comp, 8, 1, f) == 1 &&
+                 (table_comp == 0 ||
+                  fwrite(tcomp->data, tcomp->len, 1, f) == 1) &&
+                 (index_comp == 0 ||
+                  fwrite(icomp->data, icomp->len, 1, f) == 1);
+            g_byte_array_free(table, TRUE);
+            g_byte_array_free(tcomp, TRUE);
+            g_byte_array_free(icomp, TRUE);
         }
         fclose(f);
     }

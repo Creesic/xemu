@@ -37,7 +37,7 @@ extern "C" {
  */
 extern bool xemu_calltrace_armed;
 
-typedef enum { CT_OFF, CT_EDGES, CT_TIMED } CalltraceMode;
+typedef enum { CT_OFF, CT_EDGES, CT_TIMED, CT_DATA } CalltraceMode;
 
 void xemu_calltrace_start_mode(CalltraceMode mode);
 void xemu_calltrace_start(void); /* legacy: start in CT_EDGES */
@@ -55,6 +55,10 @@ uint32_t xemu_calltrace_ignore_count(void);
 
 /* Hot path; called from the TCG helper on the vCPU thread. */
 void xemu_calltrace_record(uint32_t call_site, uint32_t callee);
+
+/* Data mode: like record(), plus a 6-dword argument snapshot. */
+void xemu_calltrace_record_data(uint32_t call_site, uint32_t callee,
+                                const uint32_t args[6]);
 
 /*
  * Write the recording to <dir>/<Title>-<timestamp>.xct. Returns the
