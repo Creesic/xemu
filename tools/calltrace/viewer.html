@@ -43,6 +43,15 @@
   #details .site { color: #888; font-family: monospace; font-size: 12px;
                    padding-left: 14px; }
   #details .poly { color: #ffb84a; font-weight: 700; }
+  #details .argrow { font-family: monospace; font-size: 11px; margin: 2px 0;
+                     white-space: nowrap; overflow-x: auto; }
+  #details .argnote { color: #888; font-size: 10px; margin: 2px 0 4px; }
+  #details .aw { padding: 0 2px; border-radius: 2px; }
+  #details .aw.code { color: #7fd1ff; }
+  #details .aw.data { color: #ffd07f; }
+  #details .aw.kernel { color: #ff9f9f; }
+  #details .aw.int { color: #b8ffb8; }
+  #details .aw.raw { color: #ccc; }
   #details .leg { padding: 3px 0; display: flex; align-items: center; }
   #details .leg small { color: #889; margin-left: 6px; }
   #details .sw { flex: none; width: 13px; height: 13px; border-radius: 3px;
@@ -501,6 +510,31 @@ function sectionIndexOf(m, addr) {
 function sectionOf(m, addr) {
   const i = sectionIndexOf(m, addr);
   return i < 0 ? '' : m.rec.sections[i].name;
+}
+
+/* Classify an argument dword by where its value lands. No dereferencing:
+ * the pointed-at memory is not in the file. */
+function classifyWord(m, v) {
+  if (v >= KERNEL_BOUND) return { cls: 'kernel', label: 'kernel' };
+  const si = sectionIndexOf(m, v);
+  if (si >= 0) {
+    const name = m.rec.sections[si].name || '';
+    const code = /text|code/i.test(name);
+    return { cls: code ? 'code' : 'data',
+             label: (name || (code ? 'code' : 'data')) };
+  }
+  if (v < (m.rec.base || 0x10000)) return { cls: 'int', label: 'int' };
+  return { cls: 'raw', label: '?' };
+}
+
+/* Render one arg-set as classified hex words. */
+function fmtArgset(m, w) {
+  const names = ['ecx', 'edx', '[esp]', '[esp+4]', '[esp+8]', '[esp+12]'];
+  return w.map((v, i) => {
+    const c = classifyWord(m, v);
+    return `<span class="aw ${c.cls}" title="${names[i]} · ${esc(c.label)}">` +
+           `${hex(v)}</span>`;
+  }).join(' ');
 }
 
 /* ---------------- loading ---------------- */
@@ -1608,6 +1642,20 @@ function showDetails(id) {
           ? ' <span class="poly">POLY</span>' : '';
       rows.push(`<div class="site">from ${hex(site)} ×${cnt}` +
                 `${poly}</div>`);
+    }
+  }
+  const agg = model.calleeArgsets && model.calleeArgsets.get(id);
+  if (agg && agg.sets.length) {
+    rows.push(`<h4>Arguments (${agg.sets.length} distinct` +
+              `${agg.overflow ? ', capped' : ''})</h4>`);
+    rows.push('<div class="argnote">values only — pointers are classified ' +
+              'by range, not dereferenced</div>');
+    for (const w of agg.sets.slice(0, 64)) {
+      rows.push(`<div class="argrow">${fmtArgset(model, w)}</div>`);
+    }
+    if (agg.overflow) {
+      rows.push('<div class="site">+ more distinct sets not captured ' +
+                '(cap 16 per edge)</div>');
     }
   }
   d.innerHTML = rows.join('');
