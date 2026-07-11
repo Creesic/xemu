@@ -216,7 +216,7 @@ function parseXCT(buf) {
     throw new Error('bad magic (not an .xct file)');
   }
   const version = dv.getUint32(4, true);
-  if (version !== 1 && version !== 2) {
+  if (version !== 1 && version !== 2 && version !== 3) {
     throw new Error('unsupported version ' + version);
   }
   const flags = dv.getUint32(8, true);
@@ -268,11 +268,26 @@ function parseXCT(buf) {
     eventRawBytes = Number(dv.getBigUint64(off, true)); off += 8;
     const compBytes = Number(dv.getBigUint64(off, true)); off += 8;
     eventComp = new Uint8Array(buf, off, compBytes);
+    off += compBytes;
+  }
+  let hasArgs = false, argsetDwords = 0, argsetCap = 0,
+      argTableComp = null, argIndexComp = null;
+  if (version === 3 && off + 40 <= buf.byteLength) {
+    hasArgs = true;
+    argsetDwords = dv.getUint32(off, true); off += 4;
+    argsetCap = dv.getUint32(off, true); off += 4;
+    /* table_raw */ dv.getBigUint64(off, true); off += 8;
+    const tableComp = Number(dv.getBigUint64(off, true)); off += 8;
+    /* index_raw */ dv.getBigUint64(off, true); off += 8;
+    const indexComp = Number(dv.getBigUint64(off, true)); off += 8;
+    argTableComp = new Uint8Array(buf, off, tableComp); off += tableComp;
+    argIndexComp = new Uint8Array(buf, off, indexComp); off += indexComp;
   }
   return { title, titleId, base, entry, sections, kimports, edges,
            truncated: !!(flags & 1),
            timed, eventCount, eventFlags, throttle, eventComp,
-           eventRawBytes };
+           eventRawBytes,
+           hasArgs, argsetDwords, argsetCap, argTableComp, argIndexComp };
 }
 
 /* Nearest-preceding-entry attribution for a call site. */
@@ -369,6 +384,59 @@ async function inflateEvents(rec) {
   }
 }
 
+async function inflateArgs(rec) {
+  if (!rec.hasArgs) return;
+  const inflate = async comp => {
+    const ds = new DecompressionStream('deflate');
+    const raw = await new Response(
+        new Blob([comp]).stream().pipeThrough(ds)).arrayBuffer();
+    return new Uint8Array(raw);
+  };
+  try {
+    const table = await inflate(rec.argTableComp);
+    const index = await inflate(rec.argIndexComp);
+    const dv = new DataView(table.buffer, table.byteOffset, table.byteLength);
+    const D = rec.argsetDwords;
+    let o = 0;
+    const argsets = new Array(rec.edges.length);
+    for (let i = 0; i < rec.edges.length; i++) {
+      const nsets = table[o++];
+      const sets = [];
+      for (let s = 0; s < nsets; s++) {
+        const w = new Array(D);
+        for (let d = 0; d < D; d++) { w[d] = dv.getUint32(o, true); o += 4; }
+        sets.push(w);
+      }
+      argsets[i] = sets;
+    }
+    rec.argsets = argsets;
+    rec.argIndex = index;          /* Uint8Array, length == eventCount */
+  } catch (e) {
+    rec.hasArgs = false;
+  }
+}
+
+/* Aggregate distinct arg-sets per callee address (across all raw edges into
+ * it), with an overflow flag when any contributing edge hit the cap. */
+function buildCalleeArgsets(m) {
+  const rec = m.rec;
+  m.calleeArgsets = new Map();
+  if (!rec.argsets) return;
+  for (let i = 0; i < rec.edges.length; i++) {
+    const sets = rec.argsets[i];
+    if (!sets || !sets.length) continue;
+    const callee = rec.edges[i].callee;
+    let agg = m.calleeArgsets.get(callee);
+    if (!agg) { agg = { sets: [], keys: new Set(), overflow: false };
+                m.calleeArgsets.set(callee, agg); }
+    if (sets.length >= rec.argsetCap) agg.overflow = true;
+    for (const w of sets) {
+      const k = w.join(',');
+      if (!agg.keys.has(k)) { agg.keys.add(k); agg.sets.push(w); }
+    }
+  }
+}
+
 /* Compute per-raw-edge caller/callee fns and per-function-edge first-fire. */
 function buildTimeline(m) {
   const rec = m.rec;
@@ -450,7 +518,10 @@ async function loadRecording(buf, name) {
   if (rec.timed) {
     model.events = await inflateEvents(rec);
     if (model.events) {
+      await inflateArgs(rec);
+      model.argIndex = rec.argIndex || null;
       buildTimeline(model);
+      buildCalleeArgsets(model);
       model.timed = true;
     }
   }
