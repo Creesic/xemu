@@ -1579,10 +1579,15 @@ static void gen_BZHI(DisasContext *s, X86DecodedInsn *decode)
  * arming/disarming flushes the TB cache (see xemu-calltrace.c).
  */
 extern bool xemu_calltrace_armed;
+extern bool xemu_calltrace_capture_args;
 
 static void gen_xemu_calltrace(DisasContext *s, TCGv callee)
 {
-    gen_helper_xemu_calltrace_call(eip_cur_tl(s), callee);
+    if (xemu_calltrace_capture_args) {
+        gen_helper_xemu_calltrace_data(tcg_env, eip_cur_tl(s), callee);
+    } else {
+        gen_helper_xemu_calltrace_call(eip_cur_tl(s), callee);
+    }
 }
 
 static void gen_xemu_calltrace_direct(DisasContext *s,

@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "cpu.h"
+#include "hw/core/cpu.h"   /* cpu_memory_rw_debug */
 #include "exec/helper-proto.h"
 #include "exec/cputlb.h"
 #include "helper-tcg.h"
@@ -149,4 +150,31 @@ void xemu_calltrace_record(uint32_t call_site, uint32_t callee);
 void HELPER(xemu_calltrace_call)(target_ulong call_site, target_ulong callee)
 {
     xemu_calltrace_record((uint32_t)call_site, (uint32_t)callee);
+}
+
+/* Non-faulting guest read: returns 0 (never raises) on an unmapped page,
+ * so tracing can't perturb guest execution. */
+static uint32_t ct_safe_ldl(CPUX86State *env, uint32_t va)
+{
+    uint32_t v = 0;
+    if (cpu_memory_rw_debug(env_cpu(env), va, &v, 4, false) != 0) {
+        return 0;
+    }
+    return v; /* guest and host are little-endian */
+}
+
+void xemu_calltrace_record_data(uint32_t call_site, uint32_t callee,
+                                const uint32_t args[6]);
+
+void HELPER(xemu_calltrace_data)(CPUX86State *env, target_ulong call_site,
+                                 target_ulong callee)
+{
+    uint32_t esp = (uint32_t)env->regs[R_ESP];
+    uint32_t a[6];
+    a[0] = (uint32_t)env->regs[R_ECX];
+    a[1] = (uint32_t)env->regs[R_EDX];
+    for (int k = 0; k < 4; k++) {
+        a[2 + k] = ct_safe_ldl(env, esp + 4u * (uint32_t)k);
+    }
+    xemu_calltrace_record_data((uint32_t)call_site, (uint32_t)callee, a);
 }

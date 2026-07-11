@@ -235,3 +235,4 @@ DEF_HELPER_1(emms, void, env)
 DEF_HELPER_1(rdrand, tl, env)
 
 DEF_HELPER_FLAGS_2(xemu_calltrace_call, TCG_CALL_NO_RWG, void, tl, tl)
+DEF_HELPER_FLAGS_3(xemu_calltrace_data, TCG_CALL_NO_WG, void, env, tl, tl)
