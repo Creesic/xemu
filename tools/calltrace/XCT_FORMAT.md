@@ -159,7 +159,7 @@ file is a full v2 file (it always contains the Event block) plus this block.
 | Offset | Size | Type | Field | Meaning |
 |---|---|---|---|---|
 | +0 | 4 | u32 | `argset_dwords` | dwords per arg-set (always 6: ECX, EDX, [ESP+0..12]) |
-| +4 | 4 | u32 | `argset_cap` | max distinct sets per edge (always 16) |
+| +4 | 4 | u32 | `argset_cap` | max distinct sets per edge (64 in current builds; always read this field) |
 | +8 | 8 | u64 | `table_raw_bytes` | uncompressed arg-set table size |
 | +16 | 8 | u64 | `table_comp_bytes` | compressed arg-set table size |
 | +24 | 8 | u64 | `index_raw_bytes` | uncompressed index size = `event_count` |
@@ -182,8 +182,8 @@ Edge `k`'s distinct arg-sets are the `k`-th entry.
 
 Decompresses to `event_count` bytes, one `u8` per event, parallel to the event
 stream. For event `i`, the arg-set is `edges[events[i]].argsets[index[i]]`,
-unless `index[i] == 0xFF` (**overflow** — that call's snapshot was a 17th+
-distinct set and was not stored).
+unless `index[i] == 0xFF` (**overflow** — that call's snapshot was a distinct
+set beyond `argset_cap` and was not stored).
 
 **Semantics:** the snapshot is the outgoing argument words *at the call*, read
 before the return address is pushed — so the stack dwords are the caller's

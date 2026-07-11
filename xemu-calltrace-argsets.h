@@ -28,7 +28,7 @@
 #include <string.h>
 
 #define CT_ARGSET_DWORDS 6
-#define CT_ARGSET_CAP 16
+#define CT_ARGSET_CAP 64
 #define CT_ARGSET_OVERFLOW 0xFFu
 
 typedef struct CTEdgeArgs {
