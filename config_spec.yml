@@ -8,6 +8,9 @@ general:
       default: true
   screenshot_dir: string
   calltrace_dir: string
+  calltrace_hotkey_mode:
+    type: string
+    default: data
   games_dir: string
   skip_boot_anim: bool
   # throttle_io: bool

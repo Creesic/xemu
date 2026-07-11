@@ -234,6 +234,10 @@ void ShowMainMenu()
                                         false, have_xbe)) {
                         xemu_calltrace_start_mode(CT_TIMED);
                     }
+                    if (ImGui::MenuItem("Start - Data (call + args)", NULL,
+                                        false, have_xbe)) {
+                        xemu_calltrace_start_mode(CT_DATA);
+                    }
                     ImGui::Separator();
                     if (ImGui::MenuItem("Load ignore list...")) {
                         const char *dir = g_config.general.calltrace_dir;
@@ -261,9 +265,11 @@ void ShowMainMenu()
                         }
                     }
                 } else {
-                    bool timed = xemu_calltrace_mode() == CT_TIMED;
-                    ImGui::Text("Recording (%s): %llu edges",
-                                timed ? "Timed" : "Edges",
+                    CalltraceMode m = xemu_calltrace_mode();
+                    const char *modestr = m == CT_DATA ? "Data" :
+                                          m == CT_TIMED ? "Timed" : "Edges";
+                    bool timed = m == CT_TIMED || m == CT_DATA;
+                    ImGui::Text("Recording (%s): %llu edges", modestr,
                                 (unsigned long long)
                                     xemu_calltrace_edge_count());
                     if (timed) {
