@@ -38,16 +38,22 @@ static CTMap ct_map;
 static bool ct_truncated;
 
 /* Data mode: per-edge arg-set tables (indexed by edge index) and the
- * parallel per-event arg-set index stream. */
+ * parallel per-event arg-set index stream. ct_argset_cap is the active
+ * distinct-set cap (64 Data, 512 Extreme); the on-disk index/nsets width is
+ * u8 when it is <=255, else u16. */
 static CTEdgeArgs **ct_edge_args;
-static uint32_t ct_edge_args_cap;
+static uint32_t ct_edge_args_cap;    /* length of the ct_edge_args[] array   */
+static uint32_t ct_argset_cap;       /* distinct sets kept per edge (N)      */
 static GByteArray *ct_arg_index;
 
 static void ct_args_reset(void)
 {
     if (ct_edge_args) {
         for (uint32_t i = 0; i < ct_edge_args_cap; i++) {
-            g_free(ct_edge_args[i]);
+            if (ct_edge_args[i]) {
+                g_free(ct_edge_args[i]->sets);
+                g_free(ct_edge_args[i]);
+            }
         }
         g_free(ct_edge_args);
         ct_edge_args = NULL;
@@ -60,8 +66,8 @@ static void ct_args_reset(void)
 }
 
 /* Intern a snapshot for the given edge index; grows the store lazily. */
-static uint8_t ct_args_intern_edge(uint32_t edge_index,
-                                   const uint32_t args[6])
+static uint16_t ct_args_intern_edge(uint32_t edge_index,
+                                    const uint32_t args[6])
 {
     if (edge_index >= ct_edge_args_cap) {
         uint32_t nc = ct_edge_args_cap ? ct_edge_args_cap : 4096;
@@ -75,7 +81,10 @@ static uint8_t ct_args_intern_edge(uint32_t edge_index,
         ct_edge_args_cap = nc;
     }
     if (!ct_edge_args[edge_index]) {
-        ct_edge_args[edge_index] = g_malloc0(sizeof(CTEdgeArgs));
+        CTEdgeArgs *ea = g_malloc0(sizeof(CTEdgeArgs));
+        ea->cap = (uint16_t)ct_argset_cap;
+        ea->sets = g_malloc(sizeof(uint32_t) * CT_ARGSET_DWORDS * ct_argset_cap);
+        ct_edge_args[edge_index] = ea;
     }
     return ct_argset_intern(ct_edge_args[edge_index], args);
 }
@@ -152,10 +161,13 @@ void xemu_calltrace_start_mode(CalltraceMode mode)
     ct_events_free(&ct_events);
     ct_events_init(&ct_events);
     ct_args_reset();
-    if (mode == CT_DATA) {
+    bool wants_args = (mode == CT_DATA || mode == CT_DATA_EXTREME);
+    if (wants_args) {
         ct_arg_index = g_byte_array_new();
+        ct_argset_cap = (mode == CT_DATA_EXTREME) ? CT_ARGSET_CAP_EXTREME
+                                                  : CT_ARGSET_CAP;
     }
-    xemu_calltrace_capture_args = (mode == CT_DATA);
+    xemu_calltrace_capture_args = wants_args;
     ct_truncated = false;
     ct_events_trunc = false;
     ct_mode = mode;
@@ -304,8 +316,13 @@ void xemu_calltrace_record_data(uint32_t call_site, uint32_t callee,
         /* Append the event and its arg-set index together so the two
          * streams stay exactly parallel. */
         if (ct_events_append(&ct_events, e->index)) {
-            uint8_t ai = ct_args_intern_edge(e->index, args);
-            g_byte_array_append(ct_arg_index, &ai, 1);
+            uint16_t ai = ct_args_intern_edge(e->index, args);
+            if (ct_argset_cap > 255) {
+                g_byte_array_append(ct_arg_index, (guint8 *)&ai, 2);
+            } else {
+                uint8_t b = (ai == CT_ARGSET_OVERFLOW) ? 0xFFu : (uint8_t)ai;
+                g_byte_array_append(ct_arg_index, &b, 1);
+            }
         } else {
             ct_events_trunc = true;
         }
@@ -511,13 +528,20 @@ static GByteArray *ct_deflate_bytes(const uint8_t *data, size_t len)
 static GByteArray *ct_build_argtable(uint32_t nedges)
 {
     GByteArray *t = g_byte_array_new();
+    bool wide = ct_argset_cap > 255;
     for (uint32_t i = 0; i < nedges; i++) {
         CTEdgeArgs *ea = (i < ct_edge_args_cap) ? ct_edge_args[i] : NULL;
-        uint8_t nsets = ea ? ea->nsets : 0;
-        g_byte_array_append(t, &nsets, 1);
+        uint16_t nsets = ea ? ea->nsets : 0;
+        if (wide) {
+            g_byte_array_append(t, (const guint8 *)&nsets, 2);
+        } else {
+            uint8_t n8 = (uint8_t)nsets;
+            g_byte_array_append(t, &n8, 1);
+        }
         if (nsets) {
             g_byte_array_append(t, (const guint8 *)ea->sets,
-                                nsets * CT_ARGSET_DWORDS * sizeof(uint32_t));
+                                (guint)nsets * CT_ARGSET_DWORDS *
+                                    sizeof(uint32_t));
         }
     }
     return t;
@@ -595,7 +619,7 @@ char *xemu_calltrace_save(const char *dir, char **err_msg)
     if (ok) {
         /* Host is little-endian on all supported platforms. */
         bool timed = ct_mode == CT_TIMED;
-        bool data = ct_mode == CT_DATA;
+        bool data = ct_mode == CT_DATA || ct_mode == CT_DATA_EXTREME;
         bool has_events = timed || data;
         uint32_t hdr[10] = { 0x52544358u,
                              data ? 3u : (timed ? 2u : 1u),
@@ -661,7 +685,7 @@ char *xemu_calltrace_save(const char *dir, char **err_msg)
                 ct_arg_index ? ct_arg_index->data : NULL,
                 ct_arg_index ? ct_arg_index->len : 0);
             uint32_t argset_dwords = CT_ARGSET_DWORDS;
-            uint32_t argset_cap = CT_ARGSET_CAP;
+            uint32_t argset_cap = ct_argset_cap;
             uint64_t table_raw = table->len;
             uint64_t table_comp = tcomp->len;
             uint64_t index_raw = ct_arg_index ? ct_arg_index->len : 0;

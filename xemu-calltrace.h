@@ -37,7 +37,8 @@ extern "C" {
  */
 extern bool xemu_calltrace_armed;
 
-typedef enum { CT_OFF, CT_EDGES, CT_TIMED, CT_DATA } CalltraceMode;
+typedef enum { CT_OFF, CT_EDGES, CT_TIMED, CT_DATA, CT_DATA_EXTREME }
+    CalltraceMode;
 
 void xemu_calltrace_start_mode(CalltraceMode mode);
 void xemu_calltrace_start(void); /* legacy: start in CT_EDGES */

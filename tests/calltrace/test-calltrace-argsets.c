@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "../../xemu-calltrace-argsets.h"
 
@@ -7,43 +8,46 @@ static void set(uint32_t a[6], uint32_t v) {
     for (int i = 0; i < 6; i++) a[i] = v + i;
 }
 
+static CTEdgeArgs make(uint16_t cap) {
+    CTEdgeArgs ea = { 0, cap, NULL };
+    ea.sets = malloc(sizeof(uint32_t) * CT_ARGSET_DWORDS * cap);
+    return ea;
+}
+
 int main(void)
 {
-    CTEdgeArgs ea;
-    memset(&ea, 0, sizeof(ea));
-    assert(ea.nsets == 0);
-
-    uint32_t a[6], b[6];
+    /* dedup + overflow at a small cap */
+    CTEdgeArgs ea = make(4);
+    uint32_t a[6], b[6], c[6];
     set(a, 100);
     set(b, 200);
 
-    /* first insert -> index 0 */
     assert(ct_argset_intern(&ea, a) == 0);
-    /* identical snapshot dedups to same index, no new set */
-    assert(ct_argset_intern(&ea, a) == 0);
+    assert(ct_argset_intern(&ea, a) == 0);      /* identical -> dedup */
     assert(ea.nsets == 1);
-    /* distinct snapshot -> index 1 */
-    assert(ct_argset_intern(&ea, b) == 1);
+    assert(ct_argset_intern(&ea, b) == 1);      /* distinct -> new */
     assert(ea.nsets == 2);
-    /* old one still dedups */
-    assert(ct_argset_intern(&ea, a) == 0);
-    assert(ea.nsets == 2);
+    set(c, 300); assert(ct_argset_intern(&ea, c) == 2);
+    set(c, 400); assert(ct_argset_intern(&ea, c) == 3);
+    assert(ea.nsets == 4);                       /* cap reached */
+    set(c, 500);                                 /* 5th distinct overflows */
+    assert(ct_argset_intern(&ea, c) == CT_ARGSET_OVERFLOW);
+    assert(ea.nsets == 4);
+    assert(ct_argset_intern(&ea, a) == 0);      /* known set still dedups */
+    free(ea.sets);
 
-    /* fill to the cap with distinct sets: already have 2, add 14 more = 16 */
-    for (uint32_t i = 2; i < CT_ARGSET_CAP; i++) {
-        uint32_t c[6];
-        set(c, 1000 + i * 10);
-        assert(ct_argset_intern(&ea, c) == (uint8_t)i);
+    /* large cap (>255): set indices exceed a byte, must be 16-bit clean */
+    CTEdgeArgs ex = make(CT_ARGSET_CAP_EXTREME);
+    for (uint32_t i = 0; i < 300; i++) {
+        uint32_t w[6];
+        set(w, 1000 + i * 7);
+        assert(ct_argset_intern(&ex, w) == (uint16_t)i);
     }
-    assert(ea.nsets == CT_ARGSET_CAP);
-
-    /* a new, 17th distinct set overflows and is NOT stored */
-    uint32_t ov[6];
-    set(ov, 99999);
-    assert(ct_argset_intern(&ea, ov) == CT_ARGSET_OVERFLOW);
-    assert(ea.nsets == CT_ARGSET_CAP);
-    /* an already-known set still dedups after overflow */
-    assert(ct_argset_intern(&ea, a) == 0);
+    assert(ex.nsets == 300);
+    uint32_t w299[6];
+    set(w299, 1000 + 299 * 7);
+    assert(ct_argset_intern(&ex, w299) == 299);  /* a >255 index dedups */
+    free(ex.sets);
 
     printf("PASS\n");
     return 0;

@@ -28,33 +28,42 @@
 #include <string.h>
 
 #define CT_ARGSET_DWORDS 6
-#define CT_ARGSET_CAP 64
-#define CT_ARGSET_OVERFLOW 0xFFu
+#define CT_ARGSET_CAP 64           /* Data mode: distinct sets per edge      */
+#define CT_ARGSET_CAP_EXTREME 512  /* Data Extreme mode                       */
+#define CT_ARGSET_OVERFLOW 0xFFFFu /* set-index sentinel: snapshot not stored */
 
+/*
+ * Per-edge table of distinct argument snapshots. The `sets` buffer is
+ * caller-allocated to `cap * CT_ARGSET_DWORDS` uint32_t and `cap` is set
+ * before the first intern (so the same build can record with different caps
+ * per mode). Index/nsets are 16-bit so caps above 255 (Extreme) fit; the
+ * on-disk width is chosen from the cap (u8 when <=255, else u16).
+ */
 typedef struct CTEdgeArgs {
-    uint8_t nsets;                                    /* 0..CT_ARGSET_CAP */
-    uint32_t sets[CT_ARGSET_CAP][CT_ARGSET_DWORDS];
+    uint16_t nsets;   /* 0..cap                                          */
+    uint16_t cap;     /* active cap for this recording                   */
+    uint32_t *sets;   /* caller-allocated: cap * CT_ARGSET_DWORDS words  */
 } CTEdgeArgs;
 
 /*
  * Intern a snapshot into this edge's table. Returns the set index
- * (0..CT_ARGSET_CAP-1) for a matched or newly-stored set, or
- * CT_ARGSET_OVERFLOW when the table is full and the snapshot is new (the
- * snapshot is then not stored).
+ * (0..cap-1) for a matched or newly-stored set, or CT_ARGSET_OVERFLOW when
+ * the table is full and the snapshot is new (then not stored).
  */
-static inline uint8_t ct_argset_intern(CTEdgeArgs *ea,
-                                       const uint32_t args[CT_ARGSET_DWORDS])
+static inline uint16_t ct_argset_intern(CTEdgeArgs *ea,
+                                        const uint32_t args[CT_ARGSET_DWORDS])
 {
-    for (uint8_t i = 0; i < ea->nsets; i++) {
-        if (memcmp(ea->sets[i], args,
+    for (uint16_t i = 0; i < ea->nsets; i++) {
+        if (memcmp(&ea->sets[(size_t)i * CT_ARGSET_DWORDS], args,
                    CT_ARGSET_DWORDS * sizeof(uint32_t)) == 0) {
             return i;
         }
     }
-    if (ea->nsets >= CT_ARGSET_CAP) {
-        return (uint8_t)CT_ARGSET_OVERFLOW;
+    if (ea->nsets >= ea->cap) {
+        return (uint16_t)CT_ARGSET_OVERFLOW;
     }
-    memcpy(ea->sets[ea->nsets], args, CT_ARGSET_DWORDS * sizeof(uint32_t));
+    memcpy(&ea->sets[(size_t)ea->nsets * CT_ARGSET_DWORDS], args,
+           CT_ARGSET_DWORDS * sizeof(uint32_t));
     return ea->nsets++;
 }
 
