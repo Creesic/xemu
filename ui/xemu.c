@@ -435,10 +435,14 @@ static void handle_keydown(SDL_Event *ev)
                 const char *mstr = g_config.general.calltrace_hotkey_mode;
                 CalltraceMode mode =
                     (mstr && !strcmp(mstr, "edges")) ? CT_EDGES :
-                    (mstr && !strcmp(mstr, "timed")) ? CT_TIMED : CT_DATA;
+                    (mstr && !strcmp(mstr, "timed")) ? CT_TIMED :
+                    (mstr && !strcmp(mstr, "extreme")) ? CT_DATA_EXTREME :
+                    CT_DATA;
                 xemu_calltrace_start_mode(mode);
                 const char *label = mode == CT_EDGES ? "Edges" :
-                                    mode == CT_TIMED ? "Timed" : "Data";
+                                    mode == CT_TIMED ? "Timed" :
+                                    mode == CT_DATA_EXTREME ? "Data Extreme" :
+                                    "Data";
                 char *msg = g_strdup_printf("Call trace: recording (%s)",
                                             label);
                 xemu_queue_notification(msg);
