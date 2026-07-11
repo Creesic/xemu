@@ -159,11 +159,16 @@ file is a full v2 file (it always contains the Event block) plus this block.
 | Offset | Size | Type | Field | Meaning |
 |---|---|---|---|---|
 | +0 | 4 | u32 | `argset_dwords` | dwords per arg-set (always 6: ECX, EDX, [ESP+0..12]) |
-| +4 | 4 | u32 | `argset_cap` | max distinct sets per edge (64 in current builds; always read this field) |
+| +4 | 4 | u32 | `argset_cap` | max distinct sets per edge (64 = Data, 512 = Data Extreme; always read this field) |
 | +8 | 8 | u64 | `table_raw_bytes` | uncompressed arg-set table size |
 | +16 | 8 | u64 | `table_comp_bytes` | compressed arg-set table size |
-| +24 | 8 | u64 | `index_raw_bytes` | uncompressed index size = `event_count` |
+| +24 | 8 | u64 | `index_raw_bytes` | uncompressed index size = `event_count` × index width |
 | +32 | 8 | u64 | `index_comp_bytes` | compressed index size |
+
+**Width rule:** the per-edge `nsets` field and the per-event index element are
+each **1 byte when `argset_cap <= 255`, else 2 bytes** (little-endian). The
+overflow sentinel is `0xFF` for the 1-byte form and `0xFFFF` for the 2-byte
+form. Choose the width from `argset_cap` before parsing the two blobs below.
 
 ### Arg-set table (`table_comp_bytes`, zlib)
 
@@ -172,7 +177,7 @@ index order** (`edge_count` entries):
 
 ```
 for each edge:
-    u8  nsets                         # 0..16
+    nsets                             # u8 or u16 per the width rule; 0..argset_cap
     nsets × (argset_dwords × u32)     # ECX, EDX, [ESP+0], [ESP+4], [ESP+8], [ESP+12]
 ```
 
@@ -180,10 +185,11 @@ Edge `k`'s distinct arg-sets are the `k`-th entry.
 
 ### Index stream (`index_comp_bytes`, zlib)
 
-Decompresses to `event_count` bytes, one `u8` per event, parallel to the event
-stream. For event `i`, the arg-set is `edges[events[i]].argsets[index[i]]`,
-unless `index[i] == 0xFF` (**overflow** — that call's snapshot was a distinct
-set beyond `argset_cap` and was not stored).
+Decompresses to `event_count` elements (u8 or u16 per the width rule), parallel
+to the event stream. For event `i`, the arg-set is
+`edges[events[i]].argsets[index[i]]`, unless `index[i]` is the overflow sentinel
+(`0xFF` / `0xFFFF`) — meaning that call's snapshot was a distinct set beyond
+`argset_cap` and was not stored.
 
 **Semantics:** the snapshot is the outgoing argument words *at the call*, read
 before the return address is pushed — so the stack dwords are the caller's
@@ -252,17 +258,20 @@ def read_xct(path):
         off += comp_bytes
 
     argsets = None       # per edge: list of arg-set tuples
-    argidx = None        # per event: index into that edge's arg-sets (0xFF = overflow)
+    argidx = None        # per event: index into that edge's arg-sets (sentinel = overflow)
     if ver >= 3:
         adw, acap = struct.unpack_from('<2I', d, off); off += 8
         traw, tcomp = struct.unpack_from('<2Q', d, off); off += 16
         iraw, icomp = struct.unpack_from('<2Q', d, off); off += 16
         table = zlib.decompress(d[off:off + tcomp]); off += tcomp
-        argidx = list(zlib.decompress(d[off:off + icomp])); off += icomp
+        idxb = zlib.decompress(d[off:off + icomp]); off += icomp
+        w = 2 if acap > 255 else 1                # nsets/index width
+        argidx = [int.from_bytes(idxb[i:i + w], 'little')
+                  for i in range(0, len(idxb), w)]  # parallel to events
         o = 0
         argsets = []
         for _ in range(nedge):
-            nsets = table[o]; o += 1
+            nsets = int.from_bytes(table[o:o + w], 'little'); o += w
             sets = []
             for _ in range(nsets):
                 sets.append(struct.unpack_from('<%dI' % adw, table, o))

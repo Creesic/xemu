@@ -406,10 +406,12 @@ async function inflateArgs(rec) {
     const index = await inflate(rec.argIndexComp);
     const dv = new DataView(table.buffer, table.byteOffset, table.byteLength);
     const D = rec.argsetDwords;
+    const wide = rec.argsetCap > 255;   /* nsets/index are u16 above 255 */
     let o = 0;
     const argsets = new Array(rec.edges.length);
     for (let i = 0; i < rec.edges.length; i++) {
-      const nsets = table[o++];
+      const nsets = wide ? dv.getUint16(o, true) : dv.getUint8(o);
+      o += wide ? 2 : 1;
       const sets = [];
       for (let s = 0; s < nsets; s++) {
         const w = new Array(D);
@@ -419,7 +421,10 @@ async function inflateArgs(rec) {
       argsets[i] = sets;
     }
     rec.argsets = argsets;
-    rec.argIndex = index;          /* Uint8Array, length == eventCount */
+    /* index is parallel to events; overflow sentinel is 0xFF / 0xFFFF. */
+    rec.argIndex = wide
+        ? new Uint16Array(index.buffer, index.byteOffset, index.byteLength >> 1)
+        : index;
   } catch (e) {
     rec.hasArgs = false;
   }
@@ -604,7 +609,8 @@ function updateReadout() {
     last = ' · last: ' + (e ? fnName(model, e.calleeId) : '');
     if (model.argIndex && model.rec.argsets) {
       const ai = model.argIndex[p - 1];
-      if (ai === 0xFF) {
+      const ovf = model.rec.argsetCap > 255 ? 0xFFFF : 0xFF;
+      if (ai === ovf) {
         last += '  args: (not captured)';
       } else {
         const sets = model.rec.argsets[rawEdge];
@@ -1664,12 +1670,17 @@ function showDetails(id) {
               `${agg.overflow ? ', capped' : ''})</h4>`);
     rows.push('<div class="argnote">values only — pointers are classified ' +
               'by range, not dereferenced</div>');
-    for (const w of agg.sets.slice(0, 64)) {
+    const SHOW = 256;
+    for (const w of agg.sets.slice(0, SHOW)) {
       rows.push(`<div class="argrow">${fmtArgset(model, w)}</div>`);
     }
+    if (agg.sets.length > SHOW) {
+      rows.push(`<div class="site">… ${agg.sets.length - SHOW} more ` +
+                `distinct sets not shown</div>`);
+    }
     if (agg.overflow) {
-      rows.push('<div class="site">+ more distinct sets not captured ' +
-                '(cap 16 per edge)</div>');
+      rows.push(`<div class="site">+ still more not captured ` +
+                `(cap ${model.rec.argsetCap} per edge)</div>`);
     }
   }
   d.innerHTML = rows.join('');
@@ -1883,6 +1894,26 @@ function buildDataFixture() {
   return u8.buffer;
 }
 
+/* The committed extreme (--extreme, cap 512) fixture — exercises the u16
+ * nsets/index width path (tools/calltrace/test-fixture-data-extreme.xct). */
+const EXTREME_FIXTURE_B64 =
+  "WENUUgMAAAAAAAAAAQBTTQAAAQAAEAEAAQAAAAEAAAAJAAAAGQAAAFRlc3QgRml4dHVyZQAA"
+  + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  + "AAAAAAAAAAAAAAAAAAAAAAAAAAAALnRleHQAS2VRdWVyeVN5c3RlbVRpbWUAAQAAAAAQAQAA"
+  + "gAAARSMBgAcAAAAQEAEAACABAAUAAAAAAAAAIBABAAAwAQABAAAAAAAAAEAgAQAAMAEACQAA"
+  + "AAAAAABQIAEAAEABAAIAAAAAAAAAUCABAABQAQAEAAAAAAAAAAgwAQBFIwGAAwAAAAAAAAAQ"
+  + "MAEAADABAAIAAAAAAAAAAAACgABgAQABAAAAAAAAAAhgAQAAIAEABwAAAAAAAAANAAAAAAAA"
+  + "AAAAAAAAAQAAQAAAADQAAAAAAAAAIAAAAAAAAAB42mNgYGBgBGImIGZGwixQzAbE7EDMwQAB"
+  + "IHUABCAALAYAAAAAAgAAAgEAAAAAAABQAAAAAAAAABoAAAAAAAAAEAAAAAAAAAB42mNicJBi"
+  + "ZAABVgZU4AIVZ0MTZ2QAiTMBMTMQs0B1soFl1t5jYHi/jwEDMDGwA0lsmAMHZmRwVWZsYMAK"
+  + "GBlwAaBMAiMuGQXsLgcArgIF8XjaY2CAAUYGBhQ2AAAuAAM=";
+function buildExtremeFixture() {
+  const bin = atob(EXTREME_FIXTURE_B64);
+  const u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return u8.buffer;
+}
+
 const selfTests = [];
 function T(name, fn) { selfTests.push([name, fn]); }
 function assertEq(got, want, what) {
@@ -1976,6 +2007,20 @@ T('v3 classifyWord ranges', () => {
   assertEq(classifyWord(m, 0x80012345).cls, 'kernel', 'kernel range');
   assertEq(classifyWord(m, 0x11500).cls, 'code', '.text range');
   assertEq(classifyWord(m, 5).cls, 'int', 'small int');
+});
+T('v3 extreme: u16 nsets/index path', async () => {
+  const rec = parseXCT(buildExtremeFixture());
+  assertEq(rec.hasArgs, true, 'hasArgs');
+  assertEq(rec.argsetCap, 512, 'cap 512');
+  const m = deriveModel(rec);
+  m.events = await inflateEvents(rec);
+  await inflateArgs(rec);
+  assertEq(rec.argIndex.constructor.name, 'Uint16Array', 'u16 index');
+  assertEq(rec.argsets[0].length, 2, 'edge0 has 2 sets');
+  assertEq(rec.argsets[3].length, 2, 'edge3 has 2 sets');
+  assertEq(rec.argsets[5].length, 0, 'edge5 never fired');
+  assertEq(rec.argIndex.length, 13, 'index parallel to events');
+  assertEq(rec.argIndex[5], 1, 'ev5 -> edge3 set1');
 });
 
 T('webgl: node color + pan/collapse rebuild caching', async () => {

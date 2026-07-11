@@ -37,6 +37,7 @@ ARG_STREAM = [
 ]
 ARGSET_DWORDS = 6
 ARGSET_CAP = 16
+ARGSET_CAP_EXTREME = 512   # >255 -> u16 nsets/index widths
 
 
 def build():
@@ -81,8 +82,11 @@ def build_timed():
     return bytes(out)
 
 
-def build_data():
+def build_data(cap=ARGSET_CAP):
     import zlib
+    wide = cap > 255                       # nsets/index become u16
+    nfmt = '<H' if wide else '<B'
+    ovf = 0xFFFF if wide else 0xFF
     base = bytearray(build())              # v1 body
     struct.pack_into('<I', base, 4, 3)     # version 1 -> 3
 
@@ -103,23 +107,23 @@ def build_data():
         t = tables[edge_idx]
         if snap in t:
             index.append(t.index(snap))
-        elif len(t) < ARGSET_CAP:
+        elif len(t) < cap:
             index.append(len(t))
             t.append(snap)
         else:
-            index.append(0xFF)
+            index.append(ovf)
 
-    # Arg-set table blob: per edge u8 nsets, then nsets * 6 * u32.
+    # Arg-set table blob: per edge nsets (u8/u16), then nsets * 6 * u32.
     table = bytearray()
     for t in tables:
-        table.append(len(t))
+        table += struct.pack(nfmt, len(t))
         for snap in t:
             table += struct.pack('<6I', *snap)
-    idx = bytes(index)
+    idx = b''.join(struct.pack(nfmt, v) for v in index)
     tcomp = zlib.compress(bytes(table), 9)
     icomp = zlib.compress(idx, 9)
 
-    out += struct.pack('<II', ARGSET_DWORDS, ARGSET_CAP)
+    out += struct.pack('<II', ARGSET_DWORDS, cap)
     out += struct.pack('<Q', len(table))
     out += struct.pack('<Q', len(tcomp))
     out += struct.pack('<Q', len(idx))
@@ -132,11 +136,16 @@ def build_data():
 if __name__ == '__main__':
     timed = '--timed' in sys.argv
     data = '--data' in sys.argv
-    args = [a for a in sys.argv[1:] if a not in ('--timed', '--data')]
-    default = ('test-fixture-data.xct' if data
+    extreme = '--extreme' in sys.argv
+    args = [a for a in sys.argv[1:]
+            if a not in ('--timed', '--data', '--extreme')]
+    default = ('test-fixture-data-extreme.xct' if extreme
+               else 'test-fixture-data.xct' if data
                else 'test-fixture-timed.xct' if timed
                else 'test-fixture.xct')
     path = args[0] if args else default
-    payload = build_data() if data else build_timed() if timed else build()
+    payload = (build_data(ARGSET_CAP_EXTREME) if extreme
+               else build_data() if data
+               else build_timed() if timed else build())
     open(path, 'wb').write(payload)
     print(f'wrote {path}')

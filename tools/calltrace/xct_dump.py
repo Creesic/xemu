@@ -72,20 +72,31 @@ def main(path):
         off += index_comp
         assert len(table) == table_raw, f'table {len(table)} != {table_raw}'
         assert len(index) == index_raw, f'index {len(index)} != {index_raw}'
-        assert len(index) == ecount, 'index not parallel to events'
+        wide = argset_cap > 255          # nsets/index are u16 above 255
+        iw = 2 if wide else 1
+        nidx = len(index) // iw
+        assert nidx == ecount, 'index not parallel to events'
         o = 0
         total_sets = multi = 0
         for _ in range(nedge):
-            nsets = table[o]
-            o += 1
+            if wide:
+                nsets = int.from_bytes(table[o:o + 2], 'little')
+                o += 2
+            else:
+                nsets = table[o]
+                o += 1
             o += nsets * argset_dwords * 4
             total_sets += nsets
             if nsets > 1:
                 multi += 1
-        overflow = index.count(0xFF)
+        if wide:
+            overflow = sum(1 for k in range(0, len(index), 2)
+                           if index[k] == 0xFF and index[k + 1] == 0xFF)
+        else:
+            overflow = index.count(0xFF)
         print(f'data: {argset_dwords} dwords/set, cap {argset_cap}, '
               f'{total_sets} sets across {nedge} edges ({multi} multi-set), '
-              f'{len(index)} indices, {overflow} overflow')
+              f'{nidx} indices, {overflow} overflow')
     print('OK')
 
 
