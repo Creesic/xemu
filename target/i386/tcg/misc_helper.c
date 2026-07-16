@@ -251,19 +251,27 @@ void HELPER(xemu_fi_ret)(CPUX86State *env, target_ulong ret_target)
  * is emitted after the qemu_st op, so a faulting store unwinds first and
  * never reaches it) — tags are published only for successful stores.
  * Linear→physical goes through a 1-entry page cache; misses walk the
- * page tables non-faulting.
+ * page tables non-faulting. The cache is keyed on (page, CR3) so a
+ * guest address-space switch (CR3 reload) can't serve a stale physical
+ * page under the new tables — worst case is a cache miss, never a wrong
+ * tag. Residual limitation: a PTE modified in place without a CR3
+ * reload can still leave one stale entry for that page (accepted for a
+ * debug tool; cpu_get_phys_page_debug walks the current tables on every
+ * miss, so this only affects the single cached entry, not new lookups).
  */
-static struct { uint32_t page; uint64_t phys_page; bool valid; } fi_tlb1;
+static struct { uint32_t page; uint32_t cr3; uint64_t phys_page; bool valid; } fi_tlb1;
 
 static bool fi_lin_to_phys(CPUX86State *env, uint32_t lin, uint64_t *phys)
 {
     uint32_t page = lin & TARGET_PAGE_MASK;
-    if (!fi_tlb1.valid || fi_tlb1.page != page) {
+    uint32_t cr3 = (uint32_t)env->cr[3];
+    if (!fi_tlb1.valid || fi_tlb1.page != page || fi_tlb1.cr3 != cr3) {
         hwaddr p = cpu_get_phys_page_debug(env_cpu(env), page);
         if (p == -1) {
             return false;
         }
         fi_tlb1.page = page;
+        fi_tlb1.cr3 = cr3;
         fi_tlb1.phys_page = p;
         fi_tlb1.valid = true;
     }
