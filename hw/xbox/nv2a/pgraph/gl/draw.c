@@ -23,6 +23,7 @@
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "debug.h"
 #include "renderer.h"
+#include "xemu-frameinspect-capture.h"
 
 void pgraph_gl_clear_surface(NV2AState *d, uint32_t parameter)
 {
@@ -127,7 +128,10 @@ void pgraph_gl_clear_surface(NV2AState *d, uint32_t parameter)
     if (r->zeta_binding) {
         r->zeta_binding->cleared = full_clear && write_zeta;
     }
-    
+
+    xemu_frameinspect_capture_event(FI_EV_CLEAR,
+                                    pgraph_gl_fi_intern_current_color(d));
+
     pg->clearing = false;
 }
 
@@ -156,6 +160,8 @@ void pgraph_gl_draw_begin(NV2AState *d)
     }
 
     assert(r->color_binding || r->zeta_binding);
+
+    xemu_frameinspect_capture_begin_batch(pgraph_gl_fi_intern_current_color(d));
 
     pgraph_gl_bind_textures(d);
     pgraph_gl_bind_shaders(pg);
@@ -373,6 +379,8 @@ void pgraph_gl_draw_end(NV2AState *d)
     if (r->zeta_binding && pgraph_zeta_write_enabled(pg)) {
         r->zeta_binding->draw_time = pg->draw_time;
     }
+
+    xemu_frameinspect_capture_end_batch();
 
     pgraph_gl_set_surface_dirty(pg, color_write, depth_test || stencil_test);
     NV2A_GL_DGROUP_END();

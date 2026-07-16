@@ -21,6 +21,7 @@
 
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "renderer.h"
+#include "xemu-frameinspect-capture.h"
 
 static void perform_blit(int operation, uint8_t *source, uint8_t *dest,
                          size_t width, size_t height, size_t width_bytes,
@@ -220,4 +221,7 @@ void pgraph_gl_image_blit(NV2AState *d)
                                    DIRTY_MEMORY_VGA);
     memory_region_set_client_dirty(d->vram, dest_addr, clipped_dest_size,
                                    DIRTY_MEMORY_NV2A_TEX);
+
+    xemu_frameinspect_capture_event(FI_EV_BLIT,
+                                    pgraph_gl_fi_intern_current_color(d));
 }

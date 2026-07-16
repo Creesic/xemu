@@ -261,6 +261,9 @@ void pgraph_gl_mark_textures_possibly_dirty(NV2AState *d, hwaddr addr, hwaddr si
 void pgraph_gl_process_pending_reports(NV2AState *d);
 void pgraph_gl_surface_flush(NV2AState *d);
 void pgraph_gl_surface_update(NV2AState *d, bool upload, bool color_write, bool zeta_write);
+/* Frame inspector: intern the current colour binding as a surface
+ * generation (no-op returning FI_SURFGEN_INVALID when not capturing). */
+uint32_t pgraph_gl_fi_intern_current_color(NV2AState *d);
 void pgraph_gl_sync(NV2AState *d);
 void pgraph_gl_update_entire_memory_buffer(NV2AState *d);
 void pgraph_gl_init_display(NV2AState *d);
