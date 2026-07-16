@@ -626,15 +626,25 @@ static inline void gen_op_ld_v(DisasContext *s, int idx, TCGv t0, TCGv a0)
 }
 
 extern bool xemu_frameinspect_armed;
+extern bool xemu_frameinspect_watch_mode;
 
 static inline void gen_op_st_v(DisasContext *s, int idx, TCGv t0, TCGv a0)
 {
+    /* xemu frame inspector: watch mode brackets the store to capture
+     * old->new bytes; plain armed mode tags post-retire only. */
+    if (xemu_frameinspect_armed && xemu_frameinspect_watch_mode) {
+        gen_helper_xemu_fi_store_pre(tcg_env, a0,
+                                     tcg_constant_i32(1 << (idx & MO_SIZE)));
+    }
     tcg_gen_qemu_st_tl(t0, a0, s->mem_index, idx | MO_LE);
-    /* xemu frame inspector: tag the store's destination post-retire.
-     * Translation-time guard; arming/disarming flushes the TB cache. */
     if (xemu_frameinspect_armed) {
-        gen_helper_xemu_fi_store_post(tcg_env, a0,
-                                      tcg_constant_i32(1 << (idx & MO_SIZE)));
+        if (xemu_frameinspect_watch_mode) {
+            gen_helper_xemu_fi_store_post_watch(
+                tcg_env, a0, tcg_constant_i32(1 << (idx & MO_SIZE)));
+        } else {
+            gen_helper_xemu_fi_store_post(
+                tcg_env, a0, tcg_constant_i32(1 << (idx & MO_SIZE)));
+        }
     }
 }
 

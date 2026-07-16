@@ -297,3 +297,44 @@ void HELPER(xemu_fi_store_post)(CPUX86State *env, target_ulong addr,
         done += chunk;
     }
 }
+
+/* Watch mode: the pre-helper stashes the old bytes (single vCPU, so one
+ * scratch slot suffices); the post-helper reads the new bytes back from
+ * memory and logs old->new. Nothing is published if the store faults
+ * between the two (the post-helper never runs; the stash is simply
+ * overwritten by the next store). */
+static struct {
+    uint64_t phys;
+    uint32_t size;
+    bool is_ram;
+    uint8_t old_bytes[8];
+} fi_store_stash;
+
+void HELPER(xemu_fi_store_pre)(CPUX86State *env, target_ulong addr,
+                               uint32_t size)
+{
+    uint64_t phys;
+    fi_store_stash.size = size;
+    fi_store_stash.is_ram = fi_lin_to_phys(env, (uint32_t)addr, &phys);
+    if (fi_store_stash.is_ram) {
+        fi_store_stash.phys = phys;
+        cpu_physical_memory_read(phys, fi_store_stash.old_bytes, size);
+    }
+}
+
+void HELPER(xemu_fi_store_post_watch)(CPUX86State *env, target_ulong addr,
+                                      uint32_t size)
+{
+    uint8_t new_bytes[8];
+    if (fi_store_stash.is_ram && fi_store_stash.size == size) {
+        cpu_physical_memory_read(fi_store_stash.phys, new_bytes, size);
+        xemu_frameinspect_record_store_watched(fi_thread_key_cached(),
+                                               fi_store_stash.phys, size,
+                                               fi_store_stash.old_bytes,
+                                               new_bytes, true);
+    } else {
+        xemu_frameinspect_record_store_watched(fi_thread_key_cached(),
+                                               (uint32_t)addr, size,
+                                               NULL, NULL, false);
+    }
+}
