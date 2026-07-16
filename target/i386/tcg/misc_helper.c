@@ -302,11 +302,38 @@ void HELPER(xemu_fi_store_post)(CPUX86State *env, target_ulong addr,
  * scratch slot suffices); the post-helper reads the new bytes back from
  * memory and logs old->new. Nothing is published if the store faults
  * between the two (the post-helper never runs; the stash is simply
- * overwritten by the next store). */
+ * overwritten by the next store).
+ *
+ * Two invariants the stash exists to protect ("degrade to MISSING, never
+ * WRONG"):
+ *  - Page crossing: an unaligned store whose tail spills into the next
+ *    guest page must not read/tag that second page's physical memory
+ *    through the first page's physical base. `len` is clamped in the
+ *    pre-helper to the bytes remaining in the first page; the post-helper
+ *    (and the tag map, via record_store_watched) only ever sees that
+ *    clamped length, so the tail is genuinely omitted, not misattributed.
+ *  - MMIO side effects: fi_lin_to_phys() (`is_ram` below) only tells us
+ *    the page is mapped -- it says nothing about RAM vs. device memory.
+ *    Reading through cpu_physical_memory_read() would perturb a real
+ *    device register just to log it. Both reads instead go through
+ *    cpu_memory_rw_debug() (virtual address, non-faulting, side-effect
+ *    free), same as ct_safe_ldl(). `have_old` records whether the
+ *    pre-helper's debug read actually succeeded; the post-helper only
+ *    logs old/new bytes when both the pre and post debug reads succeeded,
+ *    otherwise it falls back to the count-only path rather than log
+ *    bytes it can't vouch for.
+ *    Residual (deferred to Plan 2's memory-region modeling): a store to a
+ *    mapped MMIO page is still logged as a RAM write with debug-read
+ *    bytes instead of being routed to the MMIO count path -- `is_ram`
+ *    can't distinguish RAM from a mapped device here. Genuinely unmapped
+ *    targets already fall to the is_ram=false count-only path. The
+ *    debug accessor at least makes the read itself non-perturbing.
+ */
 static struct {
     uint64_t phys;
-    uint32_t size;
-    bool is_ram;
+    uint32_t len;       /* bytes to log, clamped to the first page */
+    bool is_ram;        /* fi_lin_to_phys() succeeded: page is mapped */
+    bool have_old;      /* old_bytes was populated by a successful debug read */
     uint8_t old_bytes[8];
 } fi_store_stash;
 
@@ -314,11 +341,17 @@ void HELPER(xemu_fi_store_pre)(CPUX86State *env, target_ulong addr,
                                uint32_t size)
 {
     uint64_t phys;
-    fi_store_stash.size = size;
+    uint32_t in_page = TARGET_PAGE_SIZE - ((uint32_t)addr & ~TARGET_PAGE_MASK);
+    uint32_t len = size < in_page ? size : in_page;
+    fi_store_stash.len = len;
+    fi_store_stash.have_old = false;
     fi_store_stash.is_ram = fi_lin_to_phys(env, (uint32_t)addr, &phys);
     if (fi_store_stash.is_ram) {
         fi_store_stash.phys = phys;
-        cpu_physical_memory_read(phys, fi_store_stash.old_bytes, size);
+        if (cpu_memory_rw_debug(env_cpu(env), addr, fi_store_stash.old_bytes,
+                                len, false) == 0) {
+            fi_store_stash.have_old = true;
+        }
     }
 }
 
@@ -326,10 +359,17 @@ void HELPER(xemu_fi_store_post_watch)(CPUX86State *env, target_ulong addr,
                                       uint32_t size)
 {
     uint8_t new_bytes[8];
-    if (fi_store_stash.is_ram && fi_store_stash.size == size) {
-        cpu_physical_memory_read(fi_store_stash.phys, new_bytes, size);
+    /* is_ram + have_old (both set atomically in the pre-helper, for the
+     * clamped fi_store_stash.len -- not the raw `size` argument, which is
+     * always equal across the pre/post pair by construction and so isn't
+     * a meaningful check) is what actually proves the pre-helper ran and
+     * captured valid old bytes for this store. */
+    if (fi_store_stash.is_ram && fi_store_stash.have_old &&
+        cpu_memory_rw_debug(env_cpu(env), addr, new_bytes,
+                            fi_store_stash.len, false) == 0) {
         xemu_frameinspect_record_store_watched(fi_thread_key_cached(),
-                                               fi_store_stash.phys, size,
+                                               fi_store_stash.phys,
+                                               fi_store_stash.len,
                                                fi_store_stash.old_bytes,
                                                new_bytes, true);
     } else {
