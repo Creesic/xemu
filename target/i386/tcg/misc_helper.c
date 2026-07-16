@@ -178,3 +178,69 @@ void HELPER(xemu_calltrace_data)(CPUX86State *env, target_ulong call_site,
     }
     xemu_calltrace_record_data((uint32_t)call_site, (uint32_t)callee, a);
 }
+
+/* xemu frame inspector (see xemu-frameinspect.c) */
+#include "../../../xemu-frameinspect.h"
+
+/*
+ * Guest thread key: current KTHREAD pointer at KPCR.PrcbData.CurrentThread
+ * = fs:[0x28] (fixed Xbox kernel ABI). Read non-faulting and cached;
+ * refreshed at every CALL/RET, which brackets thread switches closely
+ * enough for best-effort attribution (stores between a switch and the
+ * next CALL/RET may attribute to the previous thread's path).
+ */
+static uint32_t fi_cached_thread_key;
+
+static uint32_t fi_thread_key(CPUX86State *env)
+{
+    uint32_t key = ct_safe_ldl(env, (uint32_t)env->segs[R_FS].base + 0x28);
+    if (key != 0) {
+        fi_cached_thread_key = key;
+    }
+    return fi_cached_thread_key;
+}
+
+/* Used by the store helpers (Tasks 7/8), which live in this same file —
+ * keep it static so no prototype is needed. */
+static uint32_t fi_thread_key_cached(void)
+{
+    return fi_cached_thread_key;
+}
+
+void HELPER(xemu_fi_call)(CPUX86State *env, target_ulong call_site,
+                          target_ulong callee)
+{
+    uint32_t key = fi_thread_key(env);
+    uint32_t esp = (uint32_t)env->regs[R_ESP];
+    uint32_t args[6];
+    args[0] = (uint32_t)env->regs[R_ECX];
+    args[1] = (uint32_t)env->regs[R_EDX];
+    for (int k = 0; k < 4; k++) {
+        args[2 + k] = ct_safe_ldl(env, esp + 4u * (uint32_t)k);
+    }
+    /* call_site holds next-EIP: the address the CALL pushes. It both
+     * identifies the call site and is the RET-match key (see the design
+     * note under Step 3). */
+    uint32_t ret_addr = (uint32_t)call_site;
+    xemu_frameinspect_record_call(key, ret_addr, (uint32_t)callee,
+                                  ret_addr, esp, args);
+    if (xemu_frameinspect_callee_watched((uint32_t)callee)) {
+        uint32_t regs[8];
+        for (int r = 0; r < 8; r++) {
+            regs[r] = (uint32_t)env->regs[r];
+        }
+        uint32_t stack16[16];
+        for (int k = 0; k < 16; k++) {
+            stack16[k] = ct_safe_ldl(env, esp + 4u * (uint32_t)k);
+        }
+        xemu_frameinspect_record_call_watched(key, (uint32_t)callee, regs,
+                                              esp, stack16);
+    }
+}
+
+void HELPER(xemu_fi_ret)(CPUX86State *env, target_ulong ret_target)
+{
+    uint32_t key = fi_thread_key(env);
+    xemu_frameinspect_record_ret(key, (uint32_t)ret_target,
+                                 (uint32_t)env->regs[R_EAX]);
+}

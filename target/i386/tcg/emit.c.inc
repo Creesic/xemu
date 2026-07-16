@@ -1602,10 +1602,31 @@ static void gen_xemu_calltrace_direct(DisasContext *s,
     gen_xemu_calltrace(s, tcg_constant_tl(dest));
 }
 
+extern bool xemu_frameinspect_armed;
+
+static void gen_xemu_fi_call(DisasContext *s, TCGv callee)
+{
+    gen_helper_xemu_fi_call(tcg_env, eip_next_tl(s), callee);
+}
+
+static void gen_xemu_fi_call_direct(DisasContext *s, X86DecodedInsn *decode)
+{
+    /* Same destination arithmetic as gen_xemu_calltrace_direct(). */
+    target_ulong dest = s->pc + decode->immediate - s->cs_base;
+
+    if (s->dflag == MO_16) {
+        dest &= 0xffff;
+    }
+    gen_xemu_fi_call(s, tcg_constant_tl(dest));
+}
+
 static void gen_CALL(DisasContext *s, X86DecodedInsn *decode)
 {
     if (xemu_calltrace_armed) {
         gen_xemu_calltrace_direct(s, decode);
+    }
+    if (xemu_frameinspect_armed) {
+        gen_xemu_fi_call_direct(s, decode);
     }
     gen_push_v(s, eip_next_tl(s));
     gen_JMP(s, decode);
@@ -1616,6 +1637,9 @@ static void gen_CALL_m(DisasContext *s, X86DecodedInsn *decode)
     if (xemu_calltrace_armed) {
         gen_xemu_calltrace(s, s->T0);
     }
+    if (xemu_frameinspect_armed) {
+        gen_xemu_fi_call(s, s->T0);
+    }
     gen_push_v(s, eip_next_tl(s));
     gen_JMP_m(s, decode);
 }
@@ -1624,6 +1648,9 @@ static void gen_CALLF(DisasContext *s, X86DecodedInsn *decode)
 {
     if (xemu_calltrace_armed) {
         gen_xemu_calltrace(s, s->T0);
+    }
+    if (xemu_frameinspect_armed) {
+        gen_xemu_fi_call(s, s->T0);
     }
     gen_far_call(s);
 }
@@ -1637,6 +1664,9 @@ static void gen_CALLF_m(DisasContext *s, X86DecodedInsn *decode)
     gen_op_ld_v(s, MO_16, s->T1, s->A0);
     if (xemu_calltrace_armed) {
         gen_xemu_calltrace(s, s->T0);
+    }
+    if (xemu_frameinspect_armed) {
+        gen_xemu_fi_call(s, s->T0);
     }
     gen_far_call(s);
 }
@@ -3639,6 +3669,9 @@ static void gen_RET(DisasContext *s, X86DecodedInsn *decode)
     int16_t adjust = decode->e.op1 == X86_TYPE_I ? decode->immediate : 0;
 
     MemOp ot = gen_pop_T0(s);
+    if (xemu_frameinspect_armed) {
+        gen_helper_xemu_fi_ret(tcg_env, s->T0);
+    }
     gen_stack_update(s, adjust + (1 << ot));
     gen_op_jmp_v(s, s->T0);
     gen_bnd_jmp(s);
