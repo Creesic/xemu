@@ -23,6 +23,7 @@
 #include "hw/core/cpu.h"   /* cpu_memory_rw_debug */
 #include "exec/helper-proto.h"
 #include "exec/cputlb.h"
+#include "exec/target_page.h" /* TARGET_PAGE_MASK/TARGET_PAGE_SIZE (fi_lin_to_phys) */
 #include "helper-tcg.h"
 
 /*
@@ -243,4 +244,48 @@ void HELPER(xemu_fi_ret)(CPUX86State *env, target_ulong ret_target)
     uint32_t key = fi_thread_key(env);
     xemu_frameinspect_record_ret(key, (uint32_t)ret_target,
                                  (uint32_t)env->regs[R_EAX]);
+}
+
+/*
+ * Post-store tagging: runs only after the store retired (the helper call
+ * is emitted after the qemu_st op, so a faulting store unwinds first and
+ * never reaches it) — tags are published only for successful stores.
+ * Linear→physical goes through a 1-entry page cache; misses walk the
+ * page tables non-faulting.
+ */
+static struct { uint32_t page; uint64_t phys_page; bool valid; } fi_tlb1;
+
+static bool fi_lin_to_phys(CPUX86State *env, uint32_t lin, uint64_t *phys)
+{
+    uint32_t page = lin & TARGET_PAGE_MASK;
+    if (!fi_tlb1.valid || fi_tlb1.page != page) {
+        hwaddr p = cpu_get_phys_page_debug(env_cpu(env), page);
+        if (p == -1) {
+            return false;
+        }
+        fi_tlb1.page = page;
+        fi_tlb1.phys_page = p;
+        fi_tlb1.valid = true;
+    }
+    *phys = fi_tlb1.phys_page | (lin & ~TARGET_PAGE_MASK);
+    return true;
+}
+
+void HELPER(xemu_fi_store_post)(CPUX86State *env, target_ulong addr,
+                                uint32_t size)
+{
+    uint32_t lin = (uint32_t)addr;
+    uint32_t done = 0;
+    while (done < size) {             /* split page-crossing stores */
+        uint32_t chunk = TARGET_PAGE_SIZE - ((lin + done) & ~TARGET_PAGE_MASK);
+        if (chunk > size - done) {
+            chunk = size - done;
+        }
+        uint64_t phys;
+        if (fi_lin_to_phys(env, lin + done, &phys)) {
+            xemu_frameinspect_record_store(fi_thread_key_cached(), phys,
+                                           chunk);
+        }
+        done += chunk;
+    }
 }

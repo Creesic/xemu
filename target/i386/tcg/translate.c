@@ -625,9 +625,17 @@ static inline void gen_op_ld_v(DisasContext *s, int idx, TCGv t0, TCGv a0)
     tcg_gen_qemu_ld_tl(t0, a0, s->mem_index, idx | MO_LE);
 }
 
+extern bool xemu_frameinspect_armed;
+
 static inline void gen_op_st_v(DisasContext *s, int idx, TCGv t0, TCGv a0)
 {
     tcg_gen_qemu_st_tl(t0, a0, s->mem_index, idx | MO_LE);
+    /* xemu frame inspector: tag the store's destination post-retire.
+     * Translation-time guard; arming/disarming flushes the TB cache. */
+    if (xemu_frameinspect_armed) {
+        gen_helper_xemu_fi_store_post(tcg_env, a0,
+                                      tcg_constant_i32(1 << (idx & MO_SIZE)));
+    }
 }
 
 static void gen_update_eip_next(DisasContext *s)
