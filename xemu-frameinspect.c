@@ -96,6 +96,10 @@ bool xemu_frameinspect_is_armed(void)
 
 bool xemu_frameinspect_callee_watched(uint32_t callee)
 {
+    /* Stale TB may fire between disarm and flush completion. */
+    if (!xemu_frameinspect_armed) {
+        return false;
+    }
     return fi_alive && fi_watch_find(&fi_watch, callee) >= 0;
 }
 
@@ -103,6 +107,10 @@ uint32_t xemu_frameinspect_record_call(uint32_t thread_key, uint32_t call_site,
                                        uint32_t callee, uint32_t ret_addr,
                                        uint32_t esp, const uint32_t args[6])
 {
+    /* Stale TB may fire between disarm and flush completion. */
+    if (!xemu_frameinspect_armed) {
+        return FI_NODE_ROOT;
+    }
     if (!fi_alive) {
         return FI_NODE_ROOT;
     }
@@ -118,6 +126,10 @@ void xemu_frameinspect_record_call_watched(uint32_t thread_key,
                                            uint32_t esp,
                                            const uint32_t stack16[16])
 {
+    /* Stale TB may fire between disarm and flush completion. */
+    if (!xemu_frameinspect_armed) {
+        return;
+    }
     if (!fi_alive) {
         return;
     }
@@ -135,6 +147,10 @@ void xemu_frameinspect_record_call_watched(uint32_t thread_key,
 void xemu_frameinspect_record_ret(uint32_t thread_key, uint32_t ret_target,
                                   uint32_t eax)
 {
+    /* Stale TB may fire between disarm and flush completion. */
+    if (!xemu_frameinspect_armed) {
+        return;
+    }
     if (!fi_alive) {
         return;
     }
@@ -149,6 +165,10 @@ void xemu_frameinspect_record_ret(uint32_t thread_key, uint32_t ret_target,
 void xemu_frameinspect_record_store(uint32_t thread_key, uint64_t paddr,
                                     uint32_t len)
 {
+    /* Stale TB may fire between disarm and flush completion. */
+    if (!xemu_frameinspect_armed) {
+        return;
+    }
     if (!fi_alive) {
         return;
     }
@@ -163,6 +183,10 @@ void xemu_frameinspect_record_store_watched(uint32_t thread_key,
                                             const uint8_t *new_bytes,
                                             bool is_ram)
 {
+    /* Stale TB may fire between disarm and flush completion. */
+    if (!xemu_frameinspect_armed) {
+        return;
+    }
     if (!fi_alive) {
         return;
     }
