@@ -196,6 +196,11 @@ uint32_t xemu_frameinspect_lookup_tag(uint64_t paddr)
     return fi_alive ? fi_tagmap_lookup(&fi_tags, paddr) : 0;
 }
 
+uint64_t xemu_frameinspect_ram_size(void)
+{
+    return fi_alive ? fi_tags.ram_size : 0;
+}
+
 bool xemu_frameinspect_watch_add(uint32_t callee)
 {
     if (callee == 0) {

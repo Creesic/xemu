@@ -64,6 +64,10 @@ void xemu_frameinspect_record_store_watched(uint32_t thread_key,
 
 /* Lookup (PFIFO thread, Plan 2) and UI (Plan 3): */
 uint32_t xemu_frameinspect_lookup_tag(uint64_t paddr);
+/* Armed capture's RAM size (bytes), or 0 if no capture is live. Used by
+ * the store helpers to tell real RAM apart from mapped MMIO/device
+ * memory before doing a debug-read byte diff. */
+uint64_t xemu_frameinspect_ram_size(void);
 bool xemu_frameinspect_watch_add(uint32_t callee);
 void xemu_frameinspect_watch_remove(uint32_t callee);
 char *xemu_frameinspect_status_line(void);  /* g_strdup'd, caller frees */

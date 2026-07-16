@@ -312,27 +312,30 @@ void HELPER(xemu_fi_store_post)(CPUX86State *env, target_ulong addr,
  *    pre-helper to the bytes remaining in the first page; the post-helper
  *    (and the tag map, via record_store_watched) only ever sees that
  *    clamped length, so the tail is genuinely omitted, not misattributed.
- *  - MMIO side effects: fi_lin_to_phys() (`is_ram` below) only tells us
- *    the page is mapped -- it says nothing about RAM vs. device memory.
- *    Reading through cpu_physical_memory_read() would perturb a real
- *    device register just to log it. Both reads instead go through
- *    cpu_memory_rw_debug() (virtual address, non-faulting, side-effect
- *    free), same as ct_safe_ldl(). `have_old` records whether the
- *    pre-helper's debug read actually succeeded; the post-helper only
- *    logs old/new bytes when both the pre and post debug reads succeeded,
- *    otherwise it falls back to the count-only path rather than log
- *    bytes it can't vouch for.
- *    Residual (deferred to Plan 2's memory-region modeling): a store to a
- *    mapped MMIO page is still logged as a RAM write with debug-read
- *    bytes instead of being routed to the MMIO count path -- `is_ram`
- *    can't distinguish RAM from a mapped device here. Genuinely unmapped
- *    targets already fall to the is_ram=false count-only path. The
- *    debug accessor at least makes the read itself non-perturbing.
+ *  - MMIO side effects: fi_lin_to_phys() only tells us the page is
+ *    mapped -- it says nothing about RAM vs. device memory, and
+ *    cpu_memory_rw_debug() is NOT side-effect free for reads: it walks
+ *    to memory_region_dispatch_read() and invokes the device's real
+ *    .read() callback the same as a normal access (attrs.debug only
+ *    gates ROM write-protection, not read side effects). So `is_ram`
+ *    additionally requires phys < xemu_frameinspect_ram_size(): Xbox RAM
+ *    is one contiguous block from physical 0, and every MMIO/GPU
+ *    aperture sits above it, so this bound reliably separates real RAM
+ *    from device registers (same assumption the tag map already makes).
+ *    Only when `is_ram` holds do the pre/post helpers debug-read the
+ *    bytes at all; MMIO/device pages (phys >= ram_size), and genuinely
+ *    unmapped targets, take the count-only path below and are never
+ *    read, so the log can no longer perturb device state. `have_old`
+ *    additionally records whether the pre-helper's debug read of RAM
+ *    actually succeeded; the post-helper only logs old/new bytes when
+ *    both the pre and post debug reads succeeded, otherwise it falls
+ *    back to the count-only path rather than log bytes it can't vouch
+ *    for.
  */
 static struct {
     uint64_t phys;
     uint32_t len;       /* bytes to log, clamped to the first page */
-    bool is_ram;        /* fi_lin_to_phys() succeeded: page is mapped */
+    bool is_ram;        /* mapped AND phys < xemu_frameinspect_ram_size() */
     bool have_old;      /* old_bytes was populated by a successful debug read */
     uint8_t old_bytes[8];
 } fi_store_stash;
@@ -345,7 +348,8 @@ void HELPER(xemu_fi_store_pre)(CPUX86State *env, target_ulong addr,
     uint32_t len = size < in_page ? size : in_page;
     fi_store_stash.len = len;
     fi_store_stash.have_old = false;
-    fi_store_stash.is_ram = fi_lin_to_phys(env, (uint32_t)addr, &phys);
+    fi_store_stash.is_ram = fi_lin_to_phys(env, (uint32_t)addr, &phys) &&
+                            phys < xemu_frameinspect_ram_size();
     if (fi_store_stash.is_ram) {
         fi_store_stash.phys = phys;
         if (cpu_memory_rw_debug(env_cpu(env), addr, fi_store_stash.old_bytes,
