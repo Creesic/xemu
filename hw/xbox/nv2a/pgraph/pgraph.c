@@ -22,11 +22,14 @@
 #include <math.h>
 
 #include "hw/xbox/nv2a/nv2a_int.h"
+#include "qemu/main-loop.h"
+#include "system/runstate.h"
 #include "ui/xemu-notifications.h"
 #include "ui/xemu-settings.h"
 #include "util.h"
 #include "swizzle.h"
 #include "nv2a_vsh_emulator.h"
+#include "xemu-frameinspect-capture.h"
 
 #define PG_GET_MASK(reg, mask) GET_MASK(pgraph_reg_r(pg, reg), mask)
 #define PG_SET_MASK(reg, mask, value)        \
@@ -898,12 +901,27 @@ DEF_METHOD(NV097, FLIP_INCREMENT_WRITE)
     pg->frame_time++;
 }
 
+static void fi_capture_pause_bh(void *opaque)
+{
+    /* Runs in the main loop under the BQL; safe to stop the VM here. */
+    vm_stop(RUN_STATE_PAUSED);
+    char *msg = xemu_frameinspect_capture_summary();
+    xemu_queue_notification(msg);
+    g_free(msg);
+}
+
 DEF_METHOD(NV097, FLIP_STALL)
 {
     trace_nv2a_pgraph_flip_stall();
     d->pgraph.renderer->ops.surface_update(d, false, true, true);
     d->pgraph.renderer->ops.flip_stall(d);
     nv2a_profile_flip_stall();
+    if (xemu_frameinspect_capture_on_flip()) {
+        /* This handler runs on the pfifo thread without the BQL;
+         * defer vm_stop() to the BQL-holding main loop. */
+        aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                                fi_capture_pause_bh, NULL);
+    }
     pg->waiting_for_flip = true;
 }
 

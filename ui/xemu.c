@@ -56,7 +56,7 @@
 #include "hw/xbox/nv2a/nv2a.h"
 #include "ui/xemu-notifications.h"
 #include "../xemu-calltrace.h"
-#include "../xemu-frameinspect.h"
+#include "../xemu-frameinspect-capture.h"
 #include "../xemu-xbe.h"
 
 #include <stb_image.h>
@@ -456,18 +456,11 @@ static void handle_keydown(SDL_Event *ev)
         }
         case SDL_SCANCODE_I: {
             gui_keysym = 1;
-            if (xemu_frameinspect_is_armed()) {
-                xemu_frameinspect_disarm();
-                char *msg = xemu_frameinspect_status_line();
-                xemu_queue_notification(msg);
-                g_free(msg);
-            } else if (xemu_get_xbe_info() != NULL) {
+            if (xemu_get_xbe_info() != NULL) {
                 MachineState *ms = MACHINE(qdev_get_machine());
-                xemu_frameinspect_arm(ms->ram_size);
+                xemu_frameinspect_capture_arm(ms->ram_size);
                 xemu_queue_notification(
-                    xemu_frameinspect_is_armed()
-                        ? "Frame inspector: armed (recording)"
-                        : "Frame inspector: arm failed (allocation)");
+                    "Frame inspector: capturing next frame...");
             } else {
                 xemu_queue_notification("Load a game before inspecting");
             }
