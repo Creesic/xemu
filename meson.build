@@ -4051,7 +4051,7 @@ if have_block
   endif
 endif
 
-specific_ss.add(files('xemu-xbe.c', 'xemu-calltrace.c', 'xemu-version.c'))
+specific_ss.add(files('xemu-xbe.c', 'xemu-calltrace.c', 'xemu-frameinspect.c', 'xemu-version.c'))
 
 common_ss.add(genconfig)
 
