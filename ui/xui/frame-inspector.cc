@@ -320,9 +320,118 @@ static void fi_render_call_chain(uint32_t start_node, uint32_t generation)
     ImGui::PopFont();
 }
 
+/* Groups the selected batch's method records by writer_node and renders a
+ * one-click list of the distinct guest functions that emitted them. A single
+ * draw batch is usually built by several functions -- e.g. render-state setup
+ * writes a handful of methods while a separate glyph/geometry routine emits
+ * the bulk of the inline vertex data (method 0x1818). The Origin tab otherwise
+ * defaults to the batch's first record (the state write), so this surfaces the
+ * dominant geometry writer directly. Clicking a writer points m_selected_rec
+ * at one of its records so the chain below (and the Copy button) follow. */
+static void fi_render_batch_writers(FrameInspectorWindow *w,
+                                    const FICapture *cap,
+                                    const FIMethodBatch *batch)
+{
+    if (!batch || batch->rec_count == 0) {
+        return;
+    }
+    struct Writer {
+        uint32_t node;
+        uint32_t count;
+        int first_rec;
+        uint32_t method;
+        bool partial;
+    };
+    enum { MAX_WRITERS = 64 };
+    Writer writers[MAX_WRITERS];
+    int n_writers = 0;
+    bool truncated = false;
+    for (uint32_t i = batch->first_rec;
+         i < batch->first_rec + batch->rec_count; i++) {
+        const FIMethodRec *r = &cap->methods.recs[i];
+        if (r->confidence != FI_ORIG_ATTRIBUTED &&
+            r->confidence != FI_ORIG_PARTIAL) {
+            continue; /* no resolvable writer node */
+        }
+        int found = -1;
+        for (int k = 0; k < n_writers; k++) {
+            if (writers[k].node == r->writer_node) {
+                found = k;
+                break;
+            }
+        }
+        if (found < 0) {
+            if (n_writers >= MAX_WRITERS) {
+                truncated = true;
+                continue;
+            }
+            found = n_writers++;
+            writers[found] = { r->writer_node, 0, (int)i, r->method, false };
+        }
+        writers[found].count++;
+        if (r->confidence == FI_ORIG_PARTIAL) {
+            writers[found].partial = true;
+        }
+    }
+    if (n_writers <= 1) {
+        return; /* only one writer (or none) -- the chain below is enough */
+    }
+    /* Dominant contributor first (usually the vertex/geometry builder), then
+     * by first appearance. */
+    for (int a = 0; a < n_writers; a++) {
+        for (int b = a + 1; b < n_writers; b++) {
+            if (writers[b].count > writers[a].count ||
+                (writers[b].count == writers[a].count &&
+                 writers[b].first_rec < writers[a].first_rec)) {
+                Writer t = writers[a];
+                writers[a] = writers[b];
+                writers[b] = t;
+            }
+        }
+    }
+
+    uint32_t cur_node = FI_NODE_INVALID;
+    if (w->m_selected_rec >= 0 &&
+        (uint32_t)w->m_selected_rec < cap->methods.num_recs) {
+        cur_node = cap->methods.recs[w->m_selected_rec].writer_node;
+    }
+
+    ImGui::TextUnformatted("Writers in this batch");
+    ImGui::SameLine();
+    HelpMarker("A draw batch is often emitted by several functions (render-"
+               "state setup vs. the code that builds the vertex/geometry data). "
+               "Ranked by method count -- select a writer to show its call "
+               "chain below.");
+    ImGui::PushFont(g_font_mgr.m_fixed_width_font);
+    for (int k = 0; k < n_writers; k++) {
+        char method_ex[16];
+        if (writers[k].method == FI_METHOD_RAW_WORD) {
+            snprintf(method_ex, sizeof(method_ex), "raw");
+        } else {
+            snprintf(method_ex, sizeof(method_ex), "0x%04x", writers[k].method);
+        }
+        char label[96];
+        snprintf(label, sizeof(label), "node %u  -  %u method%s  (e.g. %s)%s",
+                 writers[k].node, writers[k].count,
+                 writers[k].count == 1 ? "" : "s", method_ex,
+                 writers[k].partial ? "  [partial]" : "");
+        ImGui::PushID(k);
+        if (ImGui::Selectable(label, writers[k].node == cur_node)) {
+            w->m_selected_rec = writers[k].first_rec;
+        }
+        ImGui::PopID();
+    }
+    ImGui::PopFont();
+    if (truncated) {
+        ImGui::TextDisabled("(writer list truncated at %d)", (int)MAX_WRITERS);
+    }
+    ImGui::Separator();
+}
+
 /* Resolves the selected Methods-tab record's writer_node and renders its
  * call chain via fi_render_call_chain(). */
-static void fi_origin_tab(const FICapture *cap, int selected_rec)
+static void fi_origin_tab(FrameInspectorWindow *w, const FICapture *cap,
+                          const FIMethodBatch *batch)
 {
     ImGui::TextUnformatted("Call-path origin");
     ImGui::SameLine();
@@ -330,6 +439,9 @@ static void fi_origin_tab(const FICapture *cap, int selected_rec)
               "before re-arming the inspector.");
     ImGui::Separator();
 
+    fi_render_batch_writers(w, cap, batch);
+
+    int selected_rec = w->m_selected_rec;
     if (selected_rec < 0 || (uint32_t)selected_rec >= cap->methods.num_recs) {
         ImGui::TextDisabled("Origin unavailable (unattributed).");
         return;
@@ -1416,7 +1528,7 @@ void FrameInspectorWindow::Draw()
 
             if (ImGui::BeginTabBar("fi_tabs")) {
                 if (ImGui::BeginTabItem("Origin")) {
-                    fi_origin_tab(cap, m_selected_rec);
+                    fi_origin_tab(this, cap, cur_batch);
                     ImGui::EndTabItem();
                 }
                 if (ImGui::BeginTabItem("Methods")) {
