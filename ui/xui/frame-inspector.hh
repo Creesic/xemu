@@ -25,7 +25,12 @@ class FrameInspectorWindow
 {
 public:
     bool m_is_open = false;
-    unsigned m_last_seen_events = 0;
+    /* Identity of the last-seen published capture, used to detect a new
+     * capture (see Draw()). Compared by pointer, not by event count: two
+     * captures of the same scene can have identical event counts, so an
+     * event-count comparison can miss a re-capture and leave stale
+     * frame/selection state on screen. */
+    const FICapture *m_last_seen_cap = nullptr;
     int m_selected_event = -1;
     /* Selected FIMethodRec index in the Methods tab (a global index into
      * cap->methods.recs), shared with the Origin tab. -1 = none. Reset to

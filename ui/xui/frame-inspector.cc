@@ -270,9 +270,14 @@ static void fi_origin_tab(const FICapture *cap, int selected_rec)
         return;
     }
     const FIMethodRec *rec = &cap->methods.recs[selected_rec];
-    if (rec->confidence != FI_ORIG_ATTRIBUTED) {
+    if (rec->confidence != FI_ORIG_ATTRIBUTED &&
+        rec->confidence != FI_ORIG_PARTIAL) {
         ImGui::TextDisabled("Origin unavailable (unattributed).");
         return;
+    }
+    if (rec->confidence == FI_ORIG_PARTIAL) {
+        ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.2f, 1),
+                           "(partial attribution)");
     }
 
     fi_render_call_chain(rec->writer_node);
@@ -573,8 +578,17 @@ static void fi_timeline_scrubber(FrameInspectorWindow *w, const FICapture *cap)
 
     uint32_t shown =
         (w->m_timeline_idx < 0) ? num_ev - 1 : (uint32_t)w->m_timeline_idx;
-    const char *kind = shown < cap->events.count ?
-                       ev_kind_name(cap->events.events[shown].kind) : "?";
+    /* `shown` is a dense index into this surface's colour history, not a
+     * global event-log index -- map it through the colorhist event's
+     * event_id before indexing cap->events, else this names the wrong
+     * event's kind. */
+    const char *kind = "?";
+    if (shown < ch->num_events) {
+        uint32_t global_ev = ch->events[shown].event_id;
+        if (global_ev < cap->events.count) {
+            kind = ev_kind_name(cap->events.events[global_ev].kind);
+        }
+    }
     ImGui::Text("event %u / %u: %s", shown, num_ev - 1, kind);
 }
 
@@ -585,10 +599,16 @@ void FrameInspectorWindow::Draw()
         return; /* nothing published */
     }
 
-    /* Auto-open once when a new capture publishes. */
-    bool new_capture = cap->events.count != m_last_seen_events;
+    /* Auto-open once when a new capture publishes. Identified by pointer,
+     * not event count: two captures can have identical event counts (e.g.
+     * the same scene re-captured), which an event-count comparison would
+     * miss, leaving the old frame image/selection displayed alongside the
+     * new capture's metadata. The window holds a ref to `cap` for the rest
+     * of Draw(), so this pointer is stable for that duration, and a
+     * different published capture is a distinct malloc'd object. */
+    bool new_capture = cap != m_last_seen_cap;
     if (new_capture) {
-        m_last_seen_events = cap->events.count;
+        m_last_seen_cap = cap;
         m_is_open = true;
     }
 
