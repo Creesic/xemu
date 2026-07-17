@@ -26,7 +26,19 @@ public:
     unsigned m_last_seen_events = 0;
     int m_selected_event = -1;
 
+    /* Frozen-frame GL texture (Task 3): reconstructed final scanout image.
+     * m_frame_tex == 0 means no image is currently held. Deleted+recreated
+     * on each new capture (see Draw()); note there is no window dtor here,
+     * so a texture leaked on emulator exit is acceptable (single alloc). */
+    unsigned m_frame_tex = 0;
+    int m_frame_w = 0, m_frame_h = 0;
+    int m_frame_gen = -1;
+    /* Pixel pinned by clicking the frame image; consumed by the Pixels tab
+     * added in Task 4. */
+    int m_pinned_pixel = -1;
+
     void Draw();
+    void ReleaseTexture();
 };
 
 extern FrameInspectorWindow frame_inspector_window;
