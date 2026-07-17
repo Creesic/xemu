@@ -205,9 +205,11 @@ void pgraph_gl_draw_begin(NV2AState *d)
             palette_vram_offset = pgraph_get_texture_palette_phys_addr_length(
                 pg, i, &palette_length);
 
-            if (length == 0 || length > (16u << 20)) {
-                /* Absurd/zero length: skip rather than snapshot garbage.
-                 * Missing, never wrong. */
+            if (length == 0 || length > (16u << 20) ||
+                texture_vram_offset + length > memory_region_size(d->vram)) {
+                /* Absurd/zero length, or texture read would exceed VRAM bounds:
+                 * skip rather than snapshot garbage. This bounds the reads
+                 * independently of bind_textures' assert. Missing, never wrong. */
                 continue;
             }
 
@@ -234,7 +236,9 @@ void pgraph_gl_draw_begin(NV2AState *d)
 
                 bool is_indexed = (state.color_format ==
                     NV097_SET_TEXTURE_FORMAT_COLOR_SZ_I8_A8R8G8B8);
-                if (is_indexed && palette_length > 0) {
+                if (is_indexed && palette_length > 0 &&
+                    palette_vram_offset + palette_length <= memory_region_size(d->vram)) {
+                    /* Palette read bounds-checked independently of bind_textures' assert. */
                     uint32_t pal_res = xemu_frameinspect_capture_resource(
                         FI_RESK_PALETTE, d->vram_ptr + palette_vram_offset,
                         (uint32_t)palette_length, palette_vram_offset);
