@@ -790,6 +790,46 @@ static void surface_download_to_buffer(NV2AState *d, SurfaceBinding *surface,
     bind_current_surface(d);
 }
 
+/* Frame inspector: readback of the current colour binding, forced to
+ * canonical RGBA8888 regardless of the surface's native GL storage format.
+ * Follows the same FBO bind/readback/restore pattern as
+ * surface_download_to_buffer() above, but always reads GL_RGBA/
+ * GL_UNSIGNED_BYTE via glo_readpixels() instead of the surface's own
+ * fmt.gl_format/gl_type. */
+uint32_t *pgraph_gl_fi_readback_color(NV2AState *d, uint32_t *out_w,
+                                      uint32_t *out_h)
+{
+    if (xemu_frameinspect_capture_state() != FI_CAP_CAPTURING) {
+        return NULL;
+    }
+    PGRAPHState *pg = &d->pgraph;
+    PGRAPHGLState *r = pg->gl_renderer_state;
+    SurfaceBinding *s = r->color_binding;
+    if (!s || !s->width || !s->height) {
+        return NULL;
+    }
+
+    unsigned int width = s->width, height = s->height;
+    pgraph_apply_scaling_factor(pg, &width, &height);
+
+    uint32_t *buf =
+        (uint32_t *)g_malloc((size_t)width * height * sizeof(uint32_t));
+
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                           s->gl_buffer, 0);
+    assert(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+
+    glo_readpixels(GL_RGBA, GL_UNSIGNED_BYTE, sizeof(uint32_t),
+                  width * sizeof(uint32_t), width, height, false, buf);
+
+    /* Re-bind original framebuffer target */
+    bind_current_surface(d);
+
+    *out_w = width;
+    *out_h = height;
+    return buf;
+}
+
 static void surface_download(NV2AState *d, SurfaceBinding *surface, bool force)
 {
     if (!(surface->download_pending || force) || !surface->width ||

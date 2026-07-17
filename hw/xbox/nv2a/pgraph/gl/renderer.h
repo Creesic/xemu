@@ -264,6 +264,13 @@ void pgraph_gl_surface_update(NV2AState *d, bool upload, bool color_write, bool 
 /* Frame inspector: intern the current colour binding as a surface
  * generation (no-op returning FI_SURFGEN_INVALID when not capturing). */
 uint32_t pgraph_gl_fi_intern_current_color(NV2AState *d);
+/* Frame inspector: readback of the current colour binding as canonical
+ * RGBA8888 at surface scale. Returns a freshly g_malloc'd width*height
+ * uint32_t buffer (caller frees with g_free), or NULL if not capturing / no
+ * colour binding / the binding is zeta-only. out_w/out_h are set only on
+ * a non-NULL return. */
+uint32_t *pgraph_gl_fi_readback_color(NV2AState *d, uint32_t *out_w,
+                                      uint32_t *out_h);
 void pgraph_gl_sync(NV2AState *d);
 void pgraph_gl_update_entire_memory_buffer(NV2AState *d);
 void pgraph_gl_init_display(NV2AState *d);

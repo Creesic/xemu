@@ -130,6 +130,51 @@ void xemu_frameinspect_capture_event(uint8_t kind, uint32_t surface_gen)
     fi_eventlog_append(&fi_cap.events, kind, surface_gen, 0, 0, 0, 0);
 }
 
+void xemu_frameinspect_capture_writer(uint8_t kind, uint32_t surface_gen,
+                                      const uint32_t *rgba, uint32_t width,
+                                      uint32_t height)
+{
+    if (fi_state != FI_CAP_CAPTURING) return;
+
+    uint32_t idx = fi_eventlog_append(&fi_cap.events, kind, surface_gen,
+                                      0, 0, 0, 0);
+    if (surface_gen == FI_SURFGEN_INVALID || !rgba || idx == FI_EVENT_INVALID) {
+        /* Event recorded (if it fit); no pixels to diff -> "missing", never
+         * wrong. */
+        return;
+    }
+
+    if (surface_gen >= fi_cap.hist_count) {
+        uint32_t new_count = surface_gen + 1;
+        FIColorHist *nh = (FIColorHist *)realloc(
+            fi_cap.hist, new_count * sizeof(FIColorHist));
+        if (!nh) {
+            fi_cap.truncated = true;
+            return;
+        }
+        memset(&nh[fi_cap.hist_count], 0,
+              (new_count - fi_cap.hist_count) * sizeof(FIColorHist));
+        fi_cap.hist = nh;
+        fi_cap.hist_count = new_count;
+    }
+
+    FIColorHist *ch = &fi_cap.hist[surface_gen];
+    if (ch->width == 0) {
+        /* First sight of this generation this frame: it becomes the
+         * baseline for its colour history. */
+        if (!fi_colorhist_init(ch, width, height, 16) ||
+            !fi_colorhist_set_baseline(ch, rgba)) {
+            fi_cap.truncated = true;
+        }
+    } else if (ch->width != width || ch->height != height) {
+        /* Dimensions changed mid-capture for this generation (e.g. a
+         * rebind that reused the gen id): skip the diff rather than risk
+         * corrupting the history. Missing, not wrong. */
+    } else if (!fi_colorhist_add_event(ch, idx, rgba)) {
+        fi_cap.truncated = true;
+    }
+}
+
 const FICapture *xemu_frameinspect_capture_get(void)
 {
     return qatomic_load_acquire(&fi_published);
