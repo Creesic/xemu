@@ -93,6 +93,19 @@ int main(void)
     CHECK(!invalid.has_baseline);
     fi_colorhist_free(&invalid);
 
+    /* A same-image event remains reconstructable. Capture uses this fallback
+     * for a surface first encountered at scanout, where no pre-write state is
+     * available but the final image must still be displayable. */
+    FIColorHist static_image;
+    CHECK(fi_colorhist_init(&static_image, 2, 2, 8));
+    CHECK(fi_colorhist_set_baseline(&static_image, small));
+    CHECK(fi_colorhist_add_event(&static_image, 77, small));
+    CHECK(fi_colorhist_num_events(&static_image) == 1);
+    uint32_t static_out[4];
+    CHECK(fi_colorhist_reconstruct(&static_image, 0, static_out));
+    CHECK(memcmp(static_out, small, sizeof(small)) == 0);
+    fi_colorhist_free(&static_image);
+
     /* A failure in a later run rolls back every run in that event. */
     FIColorHist rollback;
     CHECK(fi_colorhist_init(&rollback, 4098, 1, 8));

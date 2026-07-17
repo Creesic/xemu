@@ -25,6 +25,18 @@
 #include "renderer.h"
 #include "xemu-frameinspect-capture.h"
 
+static void pgraph_gl_fi_seed_color_baseline(NV2AState *d,
+                                              uint32_t surface_gen)
+{
+    if (!xemu_frameinspect_capture_needs_baseline(surface_gen)) {
+        return;
+    }
+    uint32_t w = 0, h = 0;
+    uint32_t *rgba = pgraph_gl_fi_readback_color(d, &w, &h);
+    xemu_frameinspect_capture_baseline(surface_gen, rgba, w, h);
+    g_free(rgba);
+}
+
 void pgraph_gl_clear_surface(NV2AState *d, uint32_t parameter)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -73,6 +85,11 @@ void pgraph_gl_clear_surface(NV2AState *d, uint32_t parameter)
     }
 
     pgraph_gl_surface_update(d, true, write_color, write_zeta);
+    uint32_t color_gen = write_color ?
+        pgraph_gl_fi_intern_current_color(d) : FI_SURFGEN_INVALID;
+    uint32_t zeta_gen = write_zeta ?
+        pgraph_gl_fi_intern_current_zeta(d) : FI_SURFGEN_INVALID;
+    pgraph_gl_fi_seed_color_baseline(d, color_gen);
 
     /* FIXME: Needs confirmation */
     unsigned int xmin =
@@ -129,18 +146,12 @@ void pgraph_gl_clear_surface(NV2AState *d, uint32_t parameter)
         r->zeta_binding->cleared = full_clear && write_zeta;
     }
 
-    xemu_frameinspect_capture_clear(
-        write_color ? pgraph_gl_fi_intern_current_color(d)
-                    : FI_SURFGEN_INVALID,
-        write_zeta ? pgraph_gl_fi_intern_current_zeta(d)
-                   : FI_SURFGEN_INVALID,
-        parameter);
+    xemu_frameinspect_capture_clear(color_gen, zeta_gen, parameter);
 
     if (xemu_frameinspect_capture_state() == FI_CAP_CAPTURING) {
         uint32_t w = 0, h = 0;
         uint32_t *rgba = pgraph_gl_fi_readback_color(d, &w, &h);
-        xemu_frameinspect_capture_attach_pixels(
-            pgraph_gl_fi_intern_current_color(d), rgba, w, h);
+        xemu_frameinspect_capture_attach_pixels(color_gen, rgba, w, h);
         g_free(rgba);
     }
 
@@ -173,11 +184,12 @@ void pgraph_gl_draw_begin(NV2AState *d)
 
     assert(r->color_binding || r->zeta_binding);
 
-    xemu_frameinspect_capture_begin_batch(
-        color_write ? pgraph_gl_fi_intern_current_color(d)
-                    : FI_SURFGEN_INVALID,
-        pgraph_zeta_write_enabled(pg) ? pgraph_gl_fi_intern_current_zeta(d)
-                                      : FI_SURFGEN_INVALID);
+    uint32_t color_gen = color_write ?
+        pgraph_gl_fi_intern_current_color(d) : FI_SURFGEN_INVALID;
+    uint32_t zeta_gen = pgraph_zeta_write_enabled(pg) ?
+        pgraph_gl_fi_intern_current_zeta(d) : FI_SURFGEN_INVALID;
+    pgraph_gl_fi_seed_color_baseline(d, color_gen);
+    xemu_frameinspect_capture_begin_batch(color_gen, zeta_gen);
 
     pgraph_gl_bind_textures(d);
 

@@ -58,6 +58,7 @@ enum {
     FI_RESK_TEXTURE,
     FI_RESK_PALETTE,
     FI_RESK_TEXTURE_RTREF,
+    FI_RESK_SCANOUT_RGBA,
 };
 
 /* One batch->resource reference: `event` is the FI_EV_BATCH event index the
@@ -97,7 +98,9 @@ typedef struct FICapture {
     uint64_t batch_res_bytes; /* total budget charged for `batch_res`,
                                * released in full on reset, symmetric with
                                * fi_budget_try (like methods_bytes) */
+    uint32_t origin_generation; /* live call-tree generation for method origins */
     uint32_t refcount;        /* protected by the capture-module lock */
+    uint64_t capture_id;      /* monotonically increasing publication identity */
     bool batch_open;
     bool truncated;
 } FICapture;
@@ -126,7 +129,10 @@ void xemu_frameinspect_capture_blit(uint32_t surface_gen, uint32_t source_addr,
                                 * Known v1 limitation: the overlay's content
                                 * is NOT captured or attributed anywhere in
                                 * the capture; this bit only records that it
-                                * was on screen. */
+                                 * was on screen. */
+#define FI_SCANOUT_TRANSFORMED 0x2u /* Scanout uses interlace or a non-1:1
+                                     * line mapping; source pixel attribution
+                                     * cannot be mapped exactly in v1. */
 /* Record the scanout event: which surface was actually displayed, its final
  * pixels, and the PCRTC/PVIDEO state that produced it. Intended to be called
  * once, as the last event of a captured frame (see
@@ -140,9 +146,22 @@ void xemu_frameinspect_capture_blit(uint32_t surface_gen, uint32_t source_addr,
 void xemu_frameinspect_capture_scanout(uint32_t surface_gen,
                                        uint32_t pcrtc_start,
                                        uint32_t line_offset, uint32_t flags,
-                                       const uint32_t *rgba, uint32_t width,
-                                       uint32_t height);
+                                       const uint32_t *surface_rgba,
+                                       uint32_t surface_width,
+                                       uint32_t surface_height,
+                                       const uint32_t *display_rgba,
+                                       uint32_t display_width,
+                                       uint32_t display_height);
 uint32_t xemu_frameinspect_capture_intern_surface(const FISurfaceKey *k);
+/* True when this generation has not yet captured its pre-write image. */
+bool xemu_frameinspect_capture_needs_baseline(uint32_t surface_gen);
+/* Seed a generation with the image immediately before its first writer. */
+void xemu_frameinspect_capture_baseline(uint32_t surface_gen,
+                                        const uint32_t *rgba,
+                                        uint32_t width, uint32_t height);
+/* Bounds transient GL readbacks by the remaining capture/history budgets. */
+bool xemu_frameinspect_capture_readback_allowed(uint32_t width,
+                                                uint32_t height);
 /* Attach a readback image to the most-recently appended event (the one left
  * by begin_batch/clear/blit/scanout) without appending a new event of its
  * own. Feeds the image to surface_gen's colour history (lazily allocated;
@@ -169,7 +188,8 @@ void xemu_frameinspect_capture_methods(uint32_t first_method, bool method_inc,
                                        uint16_t subchannel,
                                        const uint32_t *words, uint32_t n,
                                        uint32_t n_labeled,
-                                       uint64_t phys_base);
+                                       uint64_t phys_base,
+                                       const uint32_t *writer_tags);
 /* Intern a content-hash-deduplicated resource snapshot (register file,
  * texture, palette, or an RTREF dependency reference) into the capture's
  * resource pool. Returns its id, or FI_RES_INVALID if not capturing or the

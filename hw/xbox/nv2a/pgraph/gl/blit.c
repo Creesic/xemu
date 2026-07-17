@@ -152,7 +152,16 @@ void pgraph_gl_image_blit(NV2AState *d)
     }
 
     SurfaceBinding *surf_dest = pgraph_gl_surface_get(d, dest_addr);
+    uint32_t surface_gen = pgraph_gl_fi_intern_surface(d, surf_dest);
     if (surf_dest) {
+        if (xemu_frameinspect_capture_needs_baseline(surface_gen)) {
+            pgraph_gl_upload_surface_data(d, surf_dest, false);
+            uint32_t w = 0, h = 0;
+            uint32_t *rgba =
+                pgraph_gl_fi_readback_surface(d, surf_dest, &w, &h);
+            xemu_frameinspect_capture_baseline(surface_gen, rgba, w, h);
+            g_free(rgba);
+        }
         if (adjusted_height < surf_dest->height ||
             row_pixels < surf_dest->width) {
             pgraph_gl_surface_download_if_dirty(d, surf_dest);
@@ -222,25 +231,19 @@ void pgraph_gl_image_blit(NV2AState *d)
     memory_region_set_client_dirty(d->vram, dest_addr, clipped_dest_size,
                                    DIRTY_MEMORY_NV2A_TEX);
 
-    uint32_t surface_gen = pgraph_gl_fi_intern_surface(d, surf_dest);
     xemu_frameinspect_capture_blit(surface_gen,
                                    source_addr + source_offset,
                                    dest_addr, clipped_dest_size,
                                    image_blit->operation);
 
-    if (xemu_frameinspect_capture_state() == FI_CAP_CAPTURING) {
-        /* NOTE: reads back the CURRENT colour binding, which may not be
-         * surf_dest (the blit destination) if it isn't currently bound as
-         * the colour render target. attach_pixels has no gen-comparison: it
-         * feeds whatever gen is passed here, whether or not it matches the
-         * blit destination. In practice this just means the readback may
-         * capture the wrong surface's pixels (or none), which degrades to
-         * an empty/near-empty diff -- a known blit-readback limitation, not
-         * a protective rejection. */
+    if (xemu_frameinspect_capture_state() == FI_CAP_CAPTURING && surf_dest) {
+        /* The CPU blit changed guest RAM. Upload that exact destination before
+         * reading its GL image; the currently bound render target may be a
+         * completely different surface. */
+        pgraph_gl_upload_surface_data(d, surf_dest, false);
         uint32_t w = 0, h = 0;
-        uint32_t *rgba = pgraph_gl_fi_readback_color(d, &w, &h);
-        xemu_frameinspect_capture_attach_pixels(
-            pgraph_gl_fi_intern_current_color(d), rgba, w, h);
+        uint32_t *rgba = pgraph_gl_fi_readback_surface(d, surf_dest, &w, &h);
+        xemu_frameinspect_capture_attach_pixels(surface_gen, rgba, w, h);
         g_free(rgba);
     }
 }

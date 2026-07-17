@@ -40,6 +40,7 @@ static FIShadow fi_shadow;
 static FIWatchEngine fi_watch;
 static bool fi_alive;                 /* structures allocated */
 static uint64_t fi_stores_tagged;
+static uint32_t fi_generation;
 
 /* Watch addresses persist across captures; the engine is rebuilt on
  * every arm and seeded from this list. */
@@ -67,6 +68,7 @@ void xemu_frameinspect_arm(uint64_t ram_size)
     fi_shadow_init(&fi_shadow, &fi_tree);
     fi_stores_tagged = 0;
     fi_alive = true;
+    qatomic_inc(&fi_generation);
     bool any_watch = false;
     for (int i = 0; i < FI_WATCH_MAX; i++) {
         any_watch |= fi_watch_addrs[i] != 0;
@@ -227,11 +229,18 @@ uint32_t xemu_frameinspect_lookup_tag(uint64_t paddr)
  * retained). Same guard pattern as xemu_frameinspect_lookup_tag(): no lock,
  * just the fi_alive flag -- reading is only meaningful once the UI thread
  * is walking a paused capture. */
-FINodeInfo xemu_frameinspect_node_info(uint32_t node_id)
+uint32_t xemu_frameinspect_generation(void)
+{
+    return qatomic_read(&fi_generation);
+}
+
+FINodeInfo xemu_frameinspect_node_info(uint32_t node_id,
+                                       uint32_t generation)
 {
     FINodeInfo info;
     memset(&info, 0, sizeof(info));
-    if (!fi_alive || node_id >= fi_tree.num_nodes) {
+    if (!fi_alive || generation != qatomic_read(&fi_generation) ||
+        node_id >= fi_tree.num_nodes) {
         return info; /* valid = false */
     }
     const FINode *n = &fi_tree.nodes[node_id];

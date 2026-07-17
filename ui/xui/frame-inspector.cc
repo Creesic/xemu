@@ -22,6 +22,7 @@
 #include "font-manager.hh"
 #include "widgets.hh"
 #include <cstdlib>
+#include <string>
 #include <vector>
 extern "C" {
 #include "../../xemu-frameinspect-capture.h"
@@ -65,6 +66,40 @@ static int fi_find_scanout_gen(const FICapture *cap)
         }
     }
     return -1;
+}
+
+static const FIEvent *fi_find_scanout_event(const FICapture *cap)
+{
+    for (uint32_t i = cap->events.count; i-- > 0;) {
+        if (cap->events.events[i].kind == FI_EV_SCANOUT) {
+            return &cap->events.events[i];
+        }
+    }
+    return nullptr;
+}
+
+/* Map a global event-log index to its dense per-surface colour-history
+ * index. Not every event has an image: failed readbacks, zeta-only work, and
+ * untracked blit destinations intentionally return false. */
+static bool fi_find_history_event(const FICapture *cap, uint32_t event_id,
+                                  int *gen_out, uint32_t *index_out)
+{
+    if (event_id >= cap->events.count) {
+        return false;
+    }
+    uint32_t gen = cap->events.events[event_id].surface_gen;
+    if (gen == FI_SURFGEN_INVALID || !cap->hist || gen >= cap->hist_count) {
+        return false;
+    }
+    const FIColorHist *ch = &cap->hist[gen];
+    for (uint32_t i = 0; i < ch->num_events; i++) {
+        if (ch->events[i].event_id == event_id) {
+            *gen_out = (int)gen;
+            *index_out = i;
+            return true;
+        }
+    }
+    return false;
 }
 
 static const char *fi_confidence_name(uint16_t confidence)
@@ -141,6 +176,36 @@ static void fi_methods_tab(FrameInspectorWindow *w, const FICapture *cap,
         return;
     }
 
+    if (ImGui::Button("Copy all methods")) {
+        std::string text;
+        char line[256];
+        snprintf(line, sizeof(line), "event #%u: %u method records\n",
+                 batch->batch_event, batch->rec_count);
+        text.append(line);
+        for (uint32_t i = batch->first_rec;
+             i < batch->first_rec + batch->rec_count; i++) {
+            const FIMethodRec *r = &cap->methods.recs[i];
+            if (r->method == FI_METHOD_RAW_WORD) {
+                snprintf(line, sizeof(line),
+                         "[%u] method=RAW_WORD sub=%u param=0x%08x "
+                         "phys=0x%08x confidence=%s writer_node=%u\n",
+                         i, r->subchannel, r->param, r->phys_addr,
+                         fi_confidence_name(r->confidence), r->writer_node);
+            } else {
+                snprintf(line, sizeof(line),
+                         "[%u] method=0x%04x sub=%u param=0x%08x "
+                         "phys=0x%08x confidence=%s writer_node=%u\n",
+                         i, r->method, r->subchannel, r->param, r->phys_addr,
+                         fi_confidence_name(r->confidence), r->writer_node);
+            }
+            text.append(line);
+        }
+        ImGui::SetClipboardText(text.c_str());
+    }
+    ImGui::SameLine();
+    HelpMarker("Copies every method in the selected batch as plain text, "
+               "independent of the table filter.");
+
     w->m_method_filter.Draw("Filter", 200.0f * g_viewport_mgr.m_scale);
 
     ImGui::PushFont(g_font_mgr.m_fixed_width_font);
@@ -214,7 +279,7 @@ static void fi_methods_tab(FrameInspectorWindow *w, const FICapture *cap,
  * valid only until the inspector's capture is re-armed. Shared by the
  * Origin tab (Task 4, walking a method record's writer_node) and the
  * Address Lookup panel (Task 6, walking a tag map hit's node). */
-static void fi_render_call_chain(uint32_t start_node)
+static void fi_render_call_chain(uint32_t start_node, uint32_t generation)
 {
     ImGui::PushFont(g_font_mgr.m_fixed_width_font);
     uint32_t node = start_node;
@@ -225,7 +290,7 @@ static void fi_render_call_chain(uint32_t start_node)
     int indents = 0;
     int depth = 0;
     while (node != FI_NODE_ROOT && node != FI_NODE_INVALID) {
-        FINodeInfo ni = xemu_frameinspect_node_info(node);
+        FINodeInfo ni = xemu_frameinspect_node_info(node, generation);
         if (!ni.valid) {
             ImGui::TextColored(ImVec4(1, 0.6f, 0, 1),
                               "origin unavailable (capture re-armed)");
@@ -280,7 +345,47 @@ static void fi_origin_tab(const FICapture *cap, int selected_rec)
                            "(partial attribution)");
     }
 
-    fi_render_call_chain(rec->writer_node);
+    if (ImGui::Button("Copy origin")) {
+        std::string text;
+        char line[256];
+        snprintf(line, sizeof(line),
+                 "method_record=%d writer_node=%u confidence=%s "
+                 "origin_generation=%u\n",
+                 selected_rec, rec->writer_node,
+                 fi_confidence_name(rec->confidence),
+                 cap->origin_generation);
+        text.append(line);
+        uint32_t node = rec->writer_node;
+        uint32_t depth = 0;
+        while (node != FI_NODE_ROOT && node != FI_NODE_INVALID &&
+               depth < 256) {
+            FINodeInfo ni = xemu_frameinspect_node_info(
+                node, cap->origin_generation);
+            if (!ni.valid) {
+                text.append("origin unavailable (capture re-armed)\n");
+                break;
+            }
+            snprintf(
+                line, sizeof(line),
+                "[%u] node=%u call_site=0x%08x callee=0x%08x "
+                "ecx/this=0x%08x args=%08x %08x %08x %08x %08x\n",
+                depth, node, ni.call_site, ni.callee, ni.args[0], ni.args[1],
+                ni.args[2], ni.args[3], ni.args[4], ni.args[5]);
+            text.append(line);
+            node = ni.parent;
+            depth++;
+        }
+        if (node == FI_NODE_ROOT) {
+            text.append("[root]\n");
+        } else if (depth == 256) {
+            text.append("[truncated at 256 frames]\n");
+        }
+        ImGui::SetClipboardText(text.c_str());
+    }
+    ImGui::SameLine();
+    HelpMarker("Copies the selected method's writer call chain as plain text.");
+
+    fi_render_call_chain(rec->writer_node, cap->origin_generation);
 }
 
 static void fi_state_tab(const FICapture *cap, int event_idx)
@@ -373,27 +478,43 @@ static void fi_resources_tab(const FICapture *cap, int event_idx)
     }
 }
 
-static void fi_pixels_tab(const FICapture *cap, int pinned_pixel)
+static int fi_pixel_history_until(const FIColorHist *ch, uint32_t pixel_index,
+                                  uint32_t max_event_id,
+                                  std::vector<FIColorTouch> *touches)
+{
+    touches->resize(ch->num_events);
+    int n = fi_colorhist_pixel_history(ch, pixel_index, touches->data(),
+                                       (int)touches->size());
+    while (n > 0 && (*touches)[n - 1].event_id > max_event_id) {
+        n--;
+    }
+    touches->resize(n);
+    return n;
+}
+
+static void fi_pixels_tab(const FICapture *cap, int pinned_gen,
+                          int pinned_pixel,
+                          uint32_t max_event_id)
 {
     if (pinned_pixel < 0) {
         ImGui::TextDisabled(
             "Hover + click a pixel in the frame to pin its history.");
         return;
     }
-    int gen = fi_find_scanout_gen(cap);
-    if (gen < 0 || !cap->hist || (uint32_t)gen >= cap->hist_count) {
-        ImGui::TextDisabled("No colour history available for the scanout surface.");
+    if (pinned_gen < 0 || !cap->hist ||
+        (uint32_t)pinned_gen >= cap->hist_count) {
+        ImGui::TextDisabled("No colour history available for this surface.");
         return;
     }
-    const FIColorHist *ch = &cap->hist[gen];
+    const FIColorHist *ch = &cap->hist[pinned_gen];
     if ((uint32_t)pinned_pixel >= ch->npix) {
         ImGui::TextDisabled("Pinned pixel is out of range for this capture.");
         return;
     }
 
-    FIColorTouch touches[128];
-    int n = fi_colorhist_pixel_history(ch, (uint32_t)pinned_pixel, touches,
-                                       128);
+    std::vector<FIColorTouch> touches;
+    int n = fi_pixel_history_until(ch, (uint32_t)pinned_pixel, max_event_id,
+                                   &touches);
     ImGui::Text("Pixel index %d: %d touch(es)", pinned_pixel, n);
     if (n == 0) {
         ImGui::TextDisabled("No colour-change history for this pixel.");
@@ -441,8 +562,14 @@ static void fi_pixels_tab(const FICapture *cap, int pinned_pixel)
  * is not gated on cap and not reset when a new capture publishes. Same
  * re-arm caveat as the Origin tab: valid only until the inspector is next
  * armed. */
-static void fi_address_lookup_panel(FrameInspectorWindow *w)
+static void fi_address_lookup_panel(FrameInspectorWindow *w,
+                                    const FICapture *cap)
 {
+    if (xemu_frameinspect_generation() != cap->origin_generation) {
+        ImGui::TextDisabled(
+            "Address origins unavailable: the inspector has been re-armed.");
+        return;
+    }
     ImGui::TextUnformatted("Who wrote a guest physical address");
     ImGui::SameLine();
     HelpMarker("Resolves against the live tag map + call tree; valid only "
@@ -483,52 +610,154 @@ static void fi_address_lookup_panel(FrameInspectorWindow *w)
                                  ImVec4(0.3f, 0.9f, 0.3f, 1),
                        "%s (node %u)", partial ? "partial" : "attributed",
                        node_id);
-    fi_render_call_chain(node_id);
+    fi_render_call_chain(node_id, cap->origin_generation);
 }
 
-/* (Re)builds m_frame_tex from cap->hist[gen] reconstructed at event_index.
- * Always deletes any existing texture first (no per-capture/per-scrub
- * leak). Leaves m_frame_tex == 0 on any failure (gen out of range, colour
- * history not initialized, event_index out of range, or reconstruct
- * failure). Shared by the initial "show final frame" build and the Task 5
- * timeline scrubber. */
-void FrameInspectorWindow::UploadFrame(const FICapture *cap, int gen,
-                                       uint32_t event_index)
+static GLuint fi_upload_rgba_texture(const uint32_t *image, uint32_t width,
+                                     uint32_t height, GLuint tex = 0)
 {
-    ReleaseTexture();
-
-    if (gen < 0 || !cap->hist || (uint32_t)gen >= cap->hist_count) {
-        return;
+    if (!tex) {
+        glGenTextures(1, &tex);
     }
-    const FIColorHist *ch = &cap->hist[gen];
-    if (ch->width == 0 || ch->height == 0) {
-        return; /* not inited */
-    }
-    if (event_index >= fi_colorhist_num_events(ch)) {
-        return;
-    }
-
-    std::vector<uint32_t> pixels((size_t)ch->width * ch->height);
-    if (!fi_colorhist_reconstruct(ch, event_index, pixels.data())) {
-        return;
-    }
-
-    GLuint tex = 0;
-    glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)ch->width,
-                (GLsizei)ch->height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-                pixels.data());
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)width,
+                 (GLsizei)height, 0, GL_RGBA, GL_UNSIGNED_BYTE, image);
     glBindTexture(GL_TEXTURE_2D, 0);
+    return tex;
+}
 
-    m_frame_tex = tex;
-    m_frame_w = (int)ch->width;
-    m_frame_h = (int)ch->height;
+/* Builds the composed scanout texture, falling back to cap->hist[gen].
+ * Always deletes any existing texture first (no per-capture/per-scrub
+ * leak). Leaves m_frame_tex == 0 on any failure (gen out of range, colour
+ * history not initialized, event_index out of range, or reconstruct failure). */
+void FrameInspectorWindow::UploadFrame(const FICapture *cap, int gen,
+                                        uint32_t event_index)
+{
+    ReleaseTexture();
+
+    const uint32_t *image = nullptr;
+    uint32_t image_w = 0, image_h = 0;
+    const FIEvent *scanout = fi_find_scanout_event(cap);
+    if (scanout && scanout->a3 < cap->resources.num_res) {
+        const FIResource *res = &cap->resources.res[scanout->a3];
+        uint32_t width = (uint32_t)(res->meta >> 32);
+        uint32_t height = (uint32_t)res->meta;
+        uint64_t bytes = (uint64_t)width * height * sizeof(uint32_t);
+        if (res->kind == FI_RESK_SCANOUT_RGBA && width && height &&
+            bytes == res->len && res->off <= cap->resources.blob_used &&
+            res->len <= cap->resources.blob_used - res->off) {
+            image = (const uint32_t *)(cap->resources.blob + res->off);
+            image_w = width;
+            image_h = height;
+        }
+    }
+
+    if (gen < 0 || !cap->hist || (uint32_t)gen >= cap->hist_count) {
+        if (!image) {
+            return;
+        }
+    }
+
+    std::vector<uint32_t> pixels;
+    if (!image) {
+        const FIColorHist *ch = &cap->hist[gen];
+        if (ch->width == 0 || ch->height == 0 ||
+            event_index >= fi_colorhist_num_events(ch)) {
+            return;
+        }
+        pixels.resize((size_t)ch->width * ch->height);
+        if (!fi_colorhist_reconstruct(ch, event_index, pixels.data())) {
+            return;
+        }
+        image = pixels.data();
+        image_w = ch->width;
+        image_h = ch->height;
+    }
+
+    m_frame_tex = fi_upload_rgba_texture(image, image_w, image_h);
+    m_frame_w = (int)image_w;
+    m_frame_h = (int)image_h;
     m_frame_gen = gen;
+}
+
+void FrameInspectorWindow::SetTargetEvent(const FICapture *cap, int gen,
+                                           uint32_t event_index,
+                                           uint32_t event_id)
+{
+    m_isolate_w = m_isolate_h = 0;
+    m_target_w = m_target_h = 0;
+    m_target_gen = -1;
+    m_target_bounds_valid = false;
+    m_target_changed_pixels = 0;
+
+    if (gen < 0 || !cap->hist || (uint32_t)gen >= cap->hist_count) {
+        return;
+    }
+    const FIColorHist *ch = &cap->hist[gen];
+    if (!ch->width || !ch->height || event_index >= ch->num_events ||
+        ch->events[event_index].event_id != event_id) {
+        return;
+    }
+
+    const FIColorEvent *event = &ch->events[event_index];
+    for (uint32_t i = 0; i < event->run_count; i++) {
+        const FIColorRun *run = &ch->runs[event->run_first + i];
+        uint32_t first_y = run->start / ch->width;
+        uint32_t last = run->start + run->len - 1;
+        uint32_t last_y = last / ch->width;
+        uint32_t first_x = run->start % ch->width;
+        uint32_t last_x = last % ch->width;
+        uint32_t run_min_x = first_y == last_y ? first_x : 0;
+        uint32_t run_max_x = first_y == last_y ? last_x : ch->width - 1;
+        if (!m_target_bounds_valid) {
+            m_target_min_x = run_min_x;
+            m_target_max_x = run_max_x;
+            m_target_min_y = first_y;
+            m_target_max_y = last_y;
+            m_target_bounds_valid = true;
+        } else {
+            if (run_min_x < m_target_min_x) m_target_min_x = run_min_x;
+            if (run_max_x > m_target_max_x) m_target_max_x = run_max_x;
+            if (first_y < m_target_min_y) m_target_min_y = first_y;
+            if (last_y > m_target_max_y) m_target_max_y = last_y;
+        }
+        m_target_changed_pixels += run->len;
+    }
+
+    m_target_w = (int)ch->width;
+    m_target_h = (int)ch->height;
+    m_target_gen = gen;
+
+    if (m_target_bounds_valid) {
+        uint32_t crop_w = m_target_max_x - m_target_min_x + 1;
+        uint32_t crop_h = m_target_max_y - m_target_min_y + 1;
+        std::vector<uint32_t> isolated((size_t)crop_w * crop_h,
+                                       0xff202020u);
+        for (uint32_t i = 0; i < event->run_count; i++) {
+            const FIColorRun *run = &ch->runs[event->run_first + i];
+            for (uint32_t k = 0; k < run->len; k++) {
+                uint32_t source = run->start + k;
+                uint32_t x = source % ch->width;
+                uint32_t y = source / ch->width;
+                uint32_t dest = (y - m_target_min_y) * crop_w +
+                                (x - m_target_min_x);
+                isolated[dest] =
+                    ch->colors[run->color_off + run->len + k] |
+                    0xff000000u;
+            }
+        }
+        m_isolate_tex = fi_upload_rgba_texture(
+            isolated.data(), crop_w, crop_h, (GLuint)m_isolate_tex);
+        m_isolate_w = (int)crop_w;
+        m_isolate_h = (int)crop_h;
+    }
+    if (!m_isolate_w || !m_isolate_h) {
+        m_isolate_batch = false;
+    }
 }
 
 void FrameInspectorWindow::ReleaseTexture()
@@ -537,45 +766,321 @@ void FrameInspectorWindow::ReleaseTexture()
         GLuint tex = (GLuint)m_frame_tex;
         glDeleteTextures(1, &tex);
     }
+    if (m_isolate_tex) {
+        GLuint tex = (GLuint)m_isolate_tex;
+        glDeleteTextures(1, &tex);
+    }
     m_frame_tex = 0;
     m_frame_w = 0;
     m_frame_h = 0;
     m_frame_gen = -1;
+    m_target_w = m_target_h = 0;
+    m_target_gen = -1;
+    m_target_bounds_valid = false;
+    m_target_changed_pixels = 0;
+    m_isolate_tex = 0;
+    m_isolate_w = m_isolate_h = 0;
 }
 
-/* Timeline scrubber (Task 5): lets the user re-reconstruct the currently
- * displayed frame at any event of the scanout generation's colour history,
- * not just the final one -- watch the frame build up draw by draw. Only
- * shown when the scanout gen (m_frame_gen, set by UploadFrame on success)
- * has more than one recorded event. Note: only the scanout generation is
- * scrubbable in v1; offscreen render targets (other surfaces) would need a
- * per-surface timeline of their own (out of scope, see HelpMarker). */
-static void fi_timeline_scrubber(FrameInspectorWindow *w, const FICapture *cap)
+static void fi_clear_target(FrameInspectorWindow *w)
 {
-    if (w->m_frame_gen < 0 || (uint32_t)w->m_frame_gen >= cap->hist_count) {
+    w->m_target_w = w->m_target_h = 0;
+    w->m_target_gen = -1;
+    w->m_view_event = -1;
+    w->m_timeline_idx = -1;
+    w->m_target_bounds_valid = false;
+    w->m_target_changed_pixels = 0;
+    w->m_isolate_w = w->m_isolate_h = 0;
+    w->m_isolate_batch = false;
+}
+
+static bool fi_show_event(FrameInspectorWindow *w, const FICapture *cap,
+                          uint32_t event_id)
+{
+    int gen = -1;
+    uint32_t index = 0;
+    if (!fi_find_history_event(cap, event_id, &gen, &index)) {
+        fi_clear_target(w);
+        return false;
+    }
+    w->m_timeline_idx = (int)index;
+    w->m_view_event = (int)event_id;
+    w->SetTargetEvent(cap, gen, index, event_id);
+    return w->m_target_gen >= 0;
+}
+
+static void fi_show_final_frame(FrameInspectorWindow *w, const FICapture *cap)
+{
+    int gen = fi_find_scanout_gen(cap);
+    uint32_t num_ev =
+        gen >= 0 && cap->hist && (uint32_t)gen < cap->hist_count ?
+            fi_colorhist_num_events(&cap->hist[gen]) : 0;
+    w->UploadFrame(cap, gen, num_ev ? num_ev - 1 : 0);
+}
+
+/* Resolve a render-target texture reference to the latest earlier writer at
+ * that VRAM address. Surface generations are capture-local and event IDs are
+ * chronological, so this also handles address rebinds without guessing a
+ * future generation. */
+static bool fi_resolve_rtref_producer(const FICapture *cap, uint64_t address,
+                                      uint32_t consumer_event,
+                                      uint32_t *gen_out,
+                                      uint32_t *event_out)
+{
+    for (uint32_t i = consumer_event; i-- > 0;) {
+        uint32_t gen = cap->events.events[i].surface_gen;
+        if (gen != FI_SURFGEN_INVALID && gen < cap->surfaces.num_gens &&
+            cap->surfaces.gens[gen].key.color &&
+            cap->surfaces.gens[gen].key.addr == address) {
+            *gen_out = gen;
+            *event_out = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool fi_surface_is_ancestor(const std::vector<uint32_t> &ancestors,
+                                   uint32_t gen)
+{
+    for (uint32_t ancestor : ancestors) {
+        if (ancestor == gen) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void fi_render_surface_writes(FrameInspectorWindow *w,
+                                     const FICapture *cap, uint32_t gen,
+                                     uint32_t through_event, int depth,
+                                     std::vector<uint32_t> *ancestors)
+{
+    for (uint32_t event_id = 0;
+         event_id < cap->events.count && event_id <= through_event;
+         event_id++) {
+        const FIEvent *event = &cap->events.events[event_id];
+        if (event->surface_gen != gen) {
+            continue;
+        }
+
+        std::vector<uint64_t> dependencies;
+        for (uint32_t i = 0; i < cap->num_batch_res; i++) {
+            const FIBatchResRef *ref = &cap->batch_res[i];
+            if (ref->event != event_id ||
+                ref->res_id >= cap->resources.num_res) {
+                continue;
+            }
+            const FIResource *res = &cap->resources.res[ref->res_id];
+            if (res->kind != FI_RESK_TEXTURE_RTREF) {
+                continue;
+            }
+            bool duplicate = false;
+            for (uint64_t address : dependencies) {
+                duplicate |= address == res->meta;
+            }
+            if (!duplicate) {
+                dependencies.push_back(res->meta);
+            }
+        }
+
+        ImGui::PushID((int)event_id);
+        ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_SpanAvailWidth |
+            ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick;
+        if ((int)event_id == w->m_selected_event) {
+            flags |= ImGuiTreeNodeFlags_Selected;
+        }
+        if (dependencies.empty() || depth >= 8) {
+            flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+        }
+        bool open = ImGui::TreeNodeEx(
+            "event", flags, "#%u %s", event_id, ev_kind_name(event->kind));
+        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+            w->m_selected_event = (int)event_id;
+            w->m_pinned_pixel = -1;
+            w->m_pinned_gen = -1;
+            fi_show_event(w, cap, event_id);
+        }
+
+        if (open && !(flags & ImGuiTreeNodeFlags_NoTreePushOnOpen)) {
+            if (depth >= 8) {
+                ImGui::TextDisabled("dependency depth limit reached");
+            } else {
+                for (uint32_t i = 0; i < (uint32_t)dependencies.size(); i++) {
+                    uint32_t producer_gen = FI_SURFGEN_INVALID;
+                    uint32_t producer_event = FI_EVENT_INVALID;
+                    ImGui::PushID((int)i);
+                    if (!fi_resolve_rtref_producer(
+                            cap, dependencies[i], event_id, &producer_gen,
+                            &producer_event)) {
+                        ImGui::TextDisabled("unresolved RT @ 0x%llx",
+                            (unsigned long long)dependencies[i]);
+                    } else {
+                        const FISurfaceKey *key =
+                            &cap->surfaces.gens[producer_gen].key;
+                        bool cycle = fi_surface_is_ancestor(*ancestors,
+                                                            producer_gen);
+                        ImGuiTreeNodeFlags dep_flags =
+                            ImGuiTreeNodeFlags_SpanAvailWidth |
+                            ImGuiTreeNodeFlags_OpenOnArrow;
+                        if (cycle) {
+                            dep_flags |= ImGuiTreeNodeFlags_Leaf |
+                                         ImGuiTreeNodeFlags_NoTreePushOnOpen;
+                        }
+                        bool dep_open = ImGui::TreeNodeEx(
+                            "surface", dep_flags,
+                            "samples gen %u, %ux%u @ 0x%llx%s",
+                            producer_gen, key->width, key->height,
+                            (unsigned long long)key->addr,
+                            cycle ? " [cycle]" : "");
+                        if (ImGui::IsItemClicked() &&
+                            !ImGui::IsItemToggledOpen()) {
+                            w->m_selected_event = (int)producer_event;
+                            w->m_pinned_pixel = -1;
+                            w->m_pinned_gen = -1;
+                            fi_show_event(w, cap, producer_event);
+                        }
+                        if (dep_open && !cycle) {
+                            ancestors->push_back(producer_gen);
+                            fi_render_surface_writes(
+                                w, cap, producer_gen, producer_event,
+                                depth + 1, ancestors);
+                            ancestors->pop_back();
+                            ImGui::TreePop();
+                        }
+                    }
+                    ImGui::PopID();
+                }
+            }
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+}
+
+static void fi_render_dependency_tree(FrameInspectorWindow *w,
+                                      const FICapture *cap)
+{
+    const FIEvent *scanout = fi_find_scanout_event(cap);
+    if (!scanout || scanout->surface_gen == FI_SURFGEN_INVALID ||
+        scanout->surface_gen >= cap->surfaces.num_gens) {
+        ImGui::TextDisabled("No tracked scanout surface.");
         return;
     }
-    const FIColorHist *ch = &cap->hist[w->m_frame_gen];
+    uint32_t scanout_event = (uint32_t)(scanout - cap->events.events);
+    uint32_t gen = scanout->surface_gen;
+    const FISurfaceKey *key = &cap->surfaces.gens[gen].key;
+    std::vector<uint32_t> event_counts(cap->surfaces.num_gens, 0);
+    uint32_t untracked_events = 0;
+    for (uint32_t i = 0; i < cap->events.count; i++) {
+        uint32_t event_gen = cap->events.events[i].surface_gen;
+        if (event_gen != FI_SURFGEN_INVALID &&
+            event_gen < cap->surfaces.num_gens) {
+            event_counts[event_gen]++;
+        } else if (cap->events.events[i].kind != FI_EV_SCANOUT) {
+            untracked_events++;
+        }
+    }
+    uint32_t other_targets = 0;
+    for (uint32_t i = 0; i < (uint32_t)event_counts.size(); i++) {
+        if (i != gen && event_counts[i]) {
+            other_targets++;
+        }
+    }
+
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_DefaultOpen |
+        ImGuiTreeNodeFlags_SpanAvailWidth;
+    if (ImGui::TreeNodeEx("final", flags,
+                          "Presented target: gen %u, %ux%u", gen,
+                          key->width, key->height)) {
+        std::vector<uint32_t> ancestors = { gen };
+        fi_render_surface_writes(w, cap, gen, scanout_event, 0, &ancestors);
+        ImGui::TreePop();
+    }
+
+    if (other_targets) {
+        if (ImGui::TreeNodeEx("other_targets", flags,
+                              "Other captured targets (%u)",
+                              other_targets)) {
+            for (uint32_t other_gen = 0;
+                 other_gen < (uint32_t)event_counts.size(); other_gen++) {
+                if (other_gen == gen || !event_counts[other_gen]) {
+                    continue;
+                }
+                const FISurfaceKey *other_key =
+                    &cap->surfaces.gens[other_gen].key;
+                ImGui::PushID((int)other_gen);
+                ImGuiTreeNodeFlags target_flags =
+                    ImGuiTreeNodeFlags_SpanAvailWidth;
+                if (other_targets == 1) {
+                    target_flags |= ImGuiTreeNodeFlags_DefaultOpen;
+                }
+                if (ImGui::TreeNodeEx(
+                        "target", target_flags,
+                        "gen %u: %ux%u, %u writes [not linked]", other_gen,
+                        other_key->width, other_key->height,
+                        event_counts[other_gen])) {
+                    std::vector<uint32_t> ancestors = { other_gen };
+                    fi_render_surface_writes(w, cap, other_gen,
+                                             scanout_event, 0, &ancestors);
+                    ImGui::TreePop();
+                }
+                ImGui::PopID();
+            }
+            ImGui::TreePop();
+        }
+    }
+
+    if (untracked_events &&
+        ImGui::TreeNodeEx("untracked", ImGuiTreeNodeFlags_SpanAvailWidth,
+                          "No tracked colour target (%u)",
+                          untracked_events)) {
+        for (uint32_t event_id = 0; event_id < cap->events.count; event_id++) {
+            const FIEvent *event = &cap->events.events[event_id];
+            if (event->surface_gen != FI_SURFGEN_INVALID ||
+                event->kind == FI_EV_SCANOUT) {
+                continue;
+            }
+            ImGui::PushID((int)event_id);
+            char label[64];
+            snprintf(label, sizeof(label), "#%u %s", event_id,
+                     ev_kind_name(event->kind));
+            if (ImGui::Selectable(
+                    label, (int)event_id == w->m_selected_event,
+                    0, ImVec2(0, 0))) {
+                w->m_selected_event = (int)event_id;
+                w->m_pinned_pixel = -1;
+                w->m_pinned_gen = -1;
+                fi_show_event(w, cap, event_id);
+            }
+            ImGui::PopID();
+        }
+        ImGui::TreePop();
+    }
+}
+
+/* Scrubs the colour history of whichever surface is in the viewport. Moving
+ * it also selects the corresponding global event so the image and detail
+ * tabs cannot silently describe different draws. */
+static void fi_timeline_scrubber(FrameInspectorWindow *w, const FICapture *cap)
+{
+    if (w->m_target_gen < 0 ||
+        (uint32_t)w->m_target_gen >= cap->hist_count) {
+        return;
+    }
+    const FIColorHist *ch = &cap->hist[w->m_target_gen];
     uint32_t num_ev = fi_colorhist_num_events(ch);
-    if (num_ev <= 1) {
-        return; /* nothing to scrub through */
+    if (num_ev == 0) {
+        return;
     }
 
     int idx = (w->m_timeline_idx < 0) ? (int)(num_ev - 1) : w->m_timeline_idx;
-    if (ImGui::SliderInt("Timeline", &idx, 0, (int)num_ev - 1)) {
-        w->m_timeline_idx = idx;
-        w->UploadFrame(cap, w->m_frame_gen, (uint32_t)idx);
+    if (num_ev > 1 &&
+        ImGui::SliderInt("Surface timeline", &idx, 0, (int)num_ev - 1)) {
+        uint32_t event_id = ch->events[idx].event_id;
+        w->m_selected_event = (int)event_id;
+        fi_show_event(w, cap, event_id);
     }
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Latest")) {
-        w->m_timeline_idx = -1;
-        w->UploadFrame(cap, w->m_frame_gen, num_ev - 1);
-    }
-    ImGui::SameLine();
-    HelpMarker("Only the scanout generation is scrubbable in v1; offscreen "
-              "render targets would need a per-surface timeline of their "
-              "own (out of scope).");
-
     uint32_t shown =
         (w->m_timeline_idx < 0) ? num_ev - 1 : (uint32_t)w->m_timeline_idx;
     /* `shown` is a dense index into this surface's colour history, not a
@@ -589,7 +1094,37 @@ static void fi_timeline_scrubber(FrameInspectorWindow *w, const FICapture *cap)
             kind = ev_kind_name(cap->events.events[global_ev].kind);
         }
     }
-    ImGui::Text("event %u / %u: %s", shown, num_ev - 1, kind);
+    uint32_t global_ev = shown < ch->num_events ?
+                             ch->events[shown].event_id : FI_EVENT_INVALID;
+    ImGui::Text("surface event %u / %u: #%u %s", shown, num_ev - 1,
+                global_ev, kind);
+}
+
+static void fi_draw_image_bounds(uint32_t width, uint32_t height,
+                                 uint32_t min_x, uint32_t min_y,
+                                 uint32_t max_x, uint32_t max_y, bool flip_y,
+                                 ImU32 color)
+{
+    if (!width || !height) {
+        return;
+    }
+    ImVec2 origin = ImGui::GetItemRectMin();
+    ImVec2 size = ImGui::GetItemRectSize();
+    float x1 = origin.x + size.x * min_x / width;
+    float x2 = origin.x + size.x * (max_x + 1) / width;
+    float y1;
+    float y2;
+    if (flip_y) {
+        y1 = origin.y + size.y * (height - (max_y + 1)) / height;
+        y2 = origin.y + size.y * (height - min_y) / height;
+    } else {
+        y1 = origin.y + size.y * min_y / height;
+        y2 = origin.y + size.y * (max_y + 1) / height;
+    }
+    ImDrawList *draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(ImVec2(x1, y1), ImVec2(x2, y2),
+                        IM_COL32(40, 150, 255, 55));
+    draw->AddRect(ImVec2(x1, y1), ImVec2(x2, y2), color, 0.0f, 0, 3.0f);
 }
 
 void FrameInspectorWindow::Draw()
@@ -606,9 +1141,9 @@ void FrameInspectorWindow::Draw()
      * new capture's metadata. The window holds a ref to `cap` for the rest
      * of Draw(), so this pointer is stable for that duration, and a
      * different published capture is a distinct malloc'd object. */
-    bool new_capture = cap != m_last_seen_cap;
+    bool new_capture = cap->capture_id != m_last_seen_capture;
     if (new_capture) {
-        m_last_seen_cap = cap;
+        m_last_seen_capture = cap->capture_id;
         m_is_open = true;
     }
 
@@ -623,20 +1158,22 @@ void FrameInspectorWindow::Draw()
     }
 
     if (new_capture) {
+        m_selected_event = -1;
         m_pinned_pixel = -1; /* stale index into a possibly-differently-sized image */
+        m_pinned_gen = -1;
         m_selected_rec = -1; /* stale index into the old capture's methods log */
-        m_timeline_idx = -1; /* show the final frame first on a new capture */
+        m_timeline_idx = -1;
+        m_view_event = -1;
+        m_isolate_batch = false;
+        m_lookup_done = false;
     }
-    if (new_capture || m_frame_tex == 0) {
-        int gen = fi_find_scanout_gen(cap);
-        uint32_t num_ev = (gen >= 0 && cap->hist && (uint32_t)gen < cap->hist_count) ?
-                          fi_colorhist_num_events(&cap->hist[gen]) :
-                          0;
-        bool have_idx = m_timeline_idx >= 0 && num_ev > 0 &&
-                        (uint32_t)m_timeline_idx < num_ev;
-        uint32_t idx = have_idx ? (uint32_t)m_timeline_idx :
-                                  (num_ev > 0 ? num_ev - 1 : 0);
-        UploadFrame(cap, gen, idx);
+    if (new_capture) {
+        fi_show_final_frame(this, cap);
+    } else if (m_frame_tex == 0) {
+        fi_show_final_frame(this, cap);
+    }
+    if (!new_capture && m_view_event >= 0 && m_target_gen < 0) {
+        fi_show_event(this, cap, (uint32_t)m_view_event);
     }
 
     ImGui::SetNextWindowSize(ImVec2(900.0f * g_viewport_mgr.m_scale,
@@ -644,9 +1181,13 @@ void FrameInspectorWindow::Draw()
                              ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Frame Inspector", &m_is_open,
                       ImGuiWindowFlags_NoCollapse)) {
-        char *summary = xemu_frameinspect_capture_summary();
-        ImGui::TextUnformatted(summary);
-        g_free(summary);
+        ImGui::Text("Captured frame: %u events, %u surfaces, %u methods, "
+                    "%u resources%s", cap->events.count,
+                    cap->surfaces.num_gens, cap->methods.num_recs,
+                    cap->resources.num_res,
+                    (cap->truncated || cap->events.truncated ||
+                     cap->surfaces.truncated || cap->resources.truncated ||
+                     cap->methods.truncated) ? " [TRUNCATED]" : "");
         ImGui::Separator();
         ImGui::Text("Events: %u   Surfaces: %u   Resources: %u",
                     cap->events.count, cap->surfaces.num_gens,
@@ -658,115 +1199,192 @@ void FrameInspectorWindow::Draw()
                 ImVec4(1, 0.6f, 0, 1),
                 "[TRUNCATED] capture hit a cap/budget; some data is missing.");
         }
+        const FIEvent *scanout = fi_find_scanout_event(cap);
+        if (scanout && (scanout->a2 & FI_SCANOUT_PVIDEO)) {
+            ImGui::TextColored(
+                ImVec4(1, 0.6f, 0, 1),
+                "PVIDEO is present in the composed frame; covered pixels "
+                "cannot be attributed to PGRAPH draws.");
+        }
+        if (scanout && (scanout->a2 & FI_SCANOUT_TRANSFORMED)) {
+            ImGui::TextColored(
+                ImVec4(1, 0.6f, 0, 1),
+                "Interlaced/non-1:1 scanout: composed pixels cannot be mapped "
+                "exactly to source history.");
+        }
         ImGui::BeginChild("fi_events", ImVec2(260.0f * g_viewport_mgr.m_scale, 0),
                           true);
-        for (uint32_t i = 0; i < cap->events.count; i++) {
-            const FIEvent *ev = &cap->events.events[i];
-            ImGui::PushID((int)i);
-            char label[64];
-            snprintf(label, sizeof(label), "#%u %s gen=%u", i,
-                     ev_kind_name(ev->kind), ev->surface_gen);
-            bool is_special =
-                ev->kind == FI_EV_SCANOUT || ev->kind == FI_EV_BLIT;
-            if (is_special) {
-                ImGui::PushStyleColor(ImGuiCol_Text,
-                                      ImVec4(0.4f, 0.8f, 1.0f, 1.0f));
-            }
-            if (ImGui::Selectable(label, (int)i == m_selected_event)) {
-                m_selected_event = (int)i;
-            }
-            if (is_special) {
-                ImGui::PopStyleColor();
-            }
-            ImGui::PopID();
-        }
+        ImGui::TextUnformatted("Render dependencies");
+        ImGui::SameLine();
+        HelpMarker("The final scanout surface contains its writes. A draw "
+                   "that samples an earlier render target contains that "
+                   "producer surface as a child. Targets with no proven "
+                   "path to scanout are listed separately so every captured "
+                   "draw remains available.");
+        ImGui::Separator();
+        fi_render_dependency_tree(this, cap);
         ImGui::EndChild();
 
         ImGui::SameLine();
 
         ImGui::BeginChild("fi_detail", ImVec2(0, 0), true);
-        if (m_frame_tex && m_frame_w > 0 && m_frame_h > 0) {
+        int selected_gen = -1;
+        uint32_t selected_hist_idx = 0;
+        bool selected_has_image =
+            m_selected_event >= 0 &&
+            fi_find_history_event(cap, (uint32_t)m_selected_event,
+                                  &selected_gen, &selected_hist_idx);
+        if (m_view_event >= 0 && m_target_gen >= 0) {
+            ImGui::TextColored(
+                ImVec4(0.3f, 0.9f, 1.0f, 1.0f),
+                "Inspecting #%d %s: surface gen %d, %llu changed pixels",
+                m_view_event,
+                ev_kind_name(cap->events.events[m_view_event].kind),
+                m_target_gen,
+                (unsigned long long)m_target_changed_pixels);
+        } else {
+            ImGui::TextDisabled(
+                "Select a write in the render tree to inspect its target.");
+        }
+        if (m_selected_event >= 0 && !selected_has_image) {
+            ImGui::TextColored(
+                ImVec4(1, 0.6f, 0, 1),
+                "Selected event #%d has no captured colour output.",
+                m_selected_event);
+        }
+        uint32_t visible_event_id = UINT32_MAX;
+        bool have_target = m_view_event >= 0 && m_target_gen >= 0 &&
+                           m_target_w > 0 && m_target_h > 0;
+        unsigned view_tex = m_frame_tex;
+        int view_w = m_frame_w;
+        int view_h = m_frame_h;
+        int view_gen = m_frame_gen;
+        bool isolate = have_target && m_isolate_batch && m_isolate_tex &&
+                       m_isolate_w > 0 && m_isolate_h > 0;
+        if (have_target) {
+            ImGui::Text(isolate ? "Isolated #%d changed pixels" :
+                                  "Final frame with projected gen %d bounds",
+                        isolate ? m_view_event : m_target_gen);
+            if (m_isolate_tex && m_isolate_w > 0 && m_isolate_h > 0) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton(isolate ? "Show final frame" :
+                                                 "Isolate batch")) {
+                    m_isolate_batch = !m_isolate_batch;
+                    isolate = m_isolate_batch;
+                }
+            }
+        } else {
+            ImGui::TextUnformatted("Composed scanout");
+        }
+        if (isolate) {
+            view_tex = m_isolate_tex;
+            view_w = m_isolate_w;
+            view_h = m_isolate_h;
+            view_gen = -1;
+        }
+
+        if (view_tex && view_w > 0 && view_h > 0) {
             float avail_w = ImGui::GetContentRegionAvail().x;
-            float img_scale = avail_w / (float)m_frame_w;
-            ImVec2 img_size(avail_w, m_frame_h * img_scale);
-            ImGui::Image((ImTextureID)(intptr_t)m_frame_tex, img_size);
+            float img_scale = avail_w / (float)view_w;
+            ImVec2 img_size(avail_w, view_h * img_scale);
+            ImGui::Image((ImTextureID)(intptr_t)view_tex, img_size,
+                         ImVec2(0, 1), ImVec2(1, 0));
+            if (have_target && m_target_bounds_valid && !isolate) {
+                fi_draw_image_bounds(
+                    (uint32_t)m_target_w, (uint32_t)m_target_h,
+                    m_target_min_x, m_target_min_y, m_target_max_x,
+                    m_target_max_y, false, IM_COL32(255, 210, 40, 255));
+            }
+
             bool img_hovered = ImGui::IsItemHovered();
             bool img_clicked = img_hovered && ImGui::IsItemClicked();
-            if (img_hovered && m_frame_gen >= 0 &&
-                (uint32_t)m_frame_gen < cap->hist_count) {
+            if (img_hovered && view_gen >= 0 &&
+                (uint32_t)view_gen < cap->hist_count) {
                 ImVec2 mn = ImGui::GetItemRectMin();
                 ImVec2 sz = ImGui::GetItemRectSize();
                 ImVec2 mp = ImGui::GetMousePos();
                 float u = ImClamp((mp.x - mn.x) / sz.x, 0.0f, 0.9999f);
                 float v = ImClamp((mp.y - mn.y) / sz.y, 0.0f, 0.9999f);
-                int px = (int)(u * m_frame_w);
-                int py = (int)(v * m_frame_h);
-                uint32_t pixel_index = (uint32_t)py * (uint32_t)m_frame_w +
+                const FIColorHist *ch = &cap->hist[view_gen];
+                bool can_attribute = ch->width && ch->height &&
+                    view_w == (int)ch->width &&
+                    view_h == (int)ch->height && scanout &&
+                    !(scanout->a2 &
+                      (FI_SCANOUT_PVIDEO | FI_SCANOUT_TRANSFORMED));
+                int px = (int)(u * ch->width);
+                float source_v = v;
+                source_v = ImClamp(source_v, 0.0f, 0.9999f);
+                int py = (int)(source_v * ch->height);
+                uint32_t pixel_index = (uint32_t)py * ch->width +
                                        (uint32_t)px;
-
-                const FIColorHist *ch = &cap->hist[m_frame_gen];
-                FIColorTouch touches[16];
-                int n = fi_colorhist_pixel_history(ch, pixel_index, touches,
-                                                   16);
+                std::vector<FIColorTouch> touches;
+                int n = can_attribute ?
+                    fi_pixel_history_until(ch, pixel_index,
+                                           visible_event_id, &touches) : 0;
 
                 ImGui::BeginTooltip();
-                ImGui::Text("px (%d, %d)", px, py);
-                ImGui::SameLine();
-                HelpMarker(
-                    "Shows draws that CHANGED this pixel's colour "
-                    "(colour-change history); a draw that writes the same "
-                    "colour it already had will not appear here.");
-                if (n == 0) {
-                    ImGui::TextDisabled("no colour-change history for this pixel");
+                if (!can_attribute) {
+                    ImGui::TextDisabled(
+                        "final-to-source pixel mapping was not captured");
                 } else {
-                    for (int i = 0; i < n; i++) {
+                    ImGui::Text("surface px (%d, %d)", px, py);
+                    if (n == 0) {
+                        ImGui::TextDisabled(
+                            "no colour-change history for this pixel");
+                    }
+                    int first = n > 16 ? n - 16 : 0;
+                    for (int i = first; i < n; i++) {
                         const FIColorTouch *t = &touches[i];
-                        const char *kind = "?";
-                        if (t->event_id < cap->events.count) {
-                            kind = ev_kind_name(
-                                cap->events.events[t->event_id].kind);
-                        }
-                        ImGui::PushID(i);
-                        ImGui::Text("#%u %s", t->event_id, kind);
-                        ImGui::SameLine();
-                        ImVec2 sw(16.0f * g_viewport_mgr.m_scale,
-                                  16.0f * g_viewport_mgr.m_scale);
-                        ImGui::ColorButton(
-                            "before", fi_rgba_to_imvec4(t->before),
-                            ImGuiColorEditFlags_NoTooltip |
-                                ImGuiColorEditFlags_NoBorder,
-                            sw);
-                        ImGui::SameLine();
-                        ImGui::TextUnformatted("->");
-                        ImGui::SameLine();
-                        ImGui::ColorButton(
-                            "after", fi_rgba_to_imvec4(t->after),
-                            ImGuiColorEditFlags_NoTooltip |
-                                ImGuiColorEditFlags_NoBorder,
-                            sw);
-                        ImGui::PopID();
+                        ImGui::Text("#%u %s", t->event_id,
+                            t->event_id < cap->events.count ?
+                                ev_kind_name(cap->events.events[
+                                    t->event_id].kind) : "?");
                     }
                 }
                 ImGui::EndTooltip();
 
-                if (img_clicked) {
+                if (img_clicked && can_attribute) {
                     if (n > 0) {
                         m_selected_event = (int)touches[n - 1].event_id;
+                        fi_show_event(this, cap, touches[n - 1].event_id);
                     }
+                    m_pinned_gen = view_gen;
                     m_pinned_pixel = (int)pixel_index;
                 }
             }
-            fi_timeline_scrubber(this, cap);
-            ImGui::Separator();
         } else {
-            ImGui::TextDisabled(
-                fi_find_scanout_gen(cap) < 0 ?
-                    "no image (no scanout event in this capture)" :
-                    "no image (scanout surface has no colour history)");
-            ImGui::Separator();
+            ImGui::TextDisabled("No captured image for this target.");
         }
+
+        if (have_target) {
+            if (isolate) {
+                ImGui::TextDisabled(
+                    "Changed colour pixels only; same-colour and depth-only writes are absent.");
+            }
+            if (m_target_bounds_valid) {
+                ImGui::Text("projected bounds from target: (%u,%u)-(%u,%u)",
+                            m_target_min_x, m_target_min_y,
+                            m_target_max_x, m_target_max_y);
+            } else {
+                ImGui::TextDisabled(
+                    "No colour change; no pixel bounds for this event.");
+            }
+            fi_timeline_scrubber(this, cap);
+        }
+        ImGui::Separator();
         if (m_selected_event >= 0 &&
             m_selected_event < (int)cap->events.count) {
+            const FIEvent *selected = &cap->events.events[m_selected_event];
+            if (selected->kind == FI_EV_BLIT &&
+                selected->surface_gen == FI_SURFGEN_INVALID) {
+                ImGui::TextColored(
+                    ImVec4(1, 0.6f, 0, 1),
+                    "Blit destination was not a tracked colour surface; pixel "
+                    "history is unavailable.");
+            }
+            HelpMarker("Pixel history records colour changes only; zeta/depth "
+                       "writes are listed as event targets but have no image "
+                       "history.");
             /* Anchor the Methods-tab selection to the current event's
              * batch, defaulting to its first ATTRIBUTED record whenever the
              * selection doesn't belong to it (new event/capture, no batch,
@@ -814,7 +1432,8 @@ void FrameInspectorWindow::Draw()
                     ImGui::EndTabItem();
                 }
                 if (ImGui::BeginTabItem("Pixels")) {
-                    fi_pixels_tab(cap, m_pinned_pixel);
+                    fi_pixels_tab(cap, m_pinned_gen, m_pinned_pixel,
+                                  visible_event_id);
                     ImGui::EndTabItem();
                 }
                 ImGui::EndTabBar();
@@ -825,7 +1444,7 @@ void FrameInspectorWindow::Draw()
         ImGui::EndChild();
 
         if (ImGui::CollapsingHeader("Address Lookup")) {
-            fi_address_lookup_panel(this);
+            fi_address_lookup_panel(this, cap);
         }
     }
     ImGui::End();

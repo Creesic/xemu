@@ -817,8 +817,14 @@ uint32_t *pgraph_gl_fi_readback_surface(NV2AState *d, SurfaceBinding *s,
     unsigned int width = s->width, height = s->height;
     pgraph_apply_scaling_factor(pg, &width, &height);
 
-    uint32_t *buf =
-        (uint32_t *)g_malloc((size_t)width * height * sizeof(uint32_t));
+    if (!xemu_frameinspect_capture_readback_allowed(width, height)) {
+        return NULL;
+    }
+    uint32_t *buf = (uint32_t *)g_try_malloc(
+        (size_t)width * height * sizeof(uint32_t));
+    if (!buf) {
+        return NULL;
+    }
 
     /* Detach whatever the FBO currently has bound (mirrors
      * surface_download_to_buffer()'s discipline) so a stale depth/stencil

@@ -20,7 +20,10 @@
  */
 
 #include "nv2a_int.h"
+#include "xemu-frameinspect.h"
 #include "xemu-frameinspect-capture.h"
+
+#define FI_PFIFO_SNAPSHOT_MAX 2052u /* 11-bit method count + 4 lookahead words */
 
 typedef struct RAMHTEntry {
     uint32_t handle;
@@ -292,6 +295,9 @@ static void pfifo_run_pusher(NV2AState *d)
     hwaddr dma_len;
     uint8_t *dma = nv_dma_map(d, dma_instance, &dma_len);
 
+    uint32_t fi_words[FI_PFIFO_SNAPSHOT_MAX];
+    uint32_t fi_tags[FI_PFIFO_SNAPSHOT_MAX];
+
     while (!pfifo_pusher_should_stall(d)) {
         uint32_t dma_get_v = *dma_get;
         uint32_t dma_put_v = *dma_put;
@@ -336,8 +342,22 @@ static void pfifo_run_pusher(NV2AState *d)
 
             *status &= ~NV_PFIFO_CACHE1_STATUS_LOW_MARK;
 
+            uint32_t fi_count = 0;
+            if (xemu_frameinspect_capture_state() == FI_CAP_CAPTURING) {
+                fi_count = MIN((uint32_t)num_words_available,
+                               method_count + 4);
+                assert(fi_count <= FI_PFIFO_SNAPSHOT_MAX);
+                uint64_t phys_base =
+                    (uint64_t)((uint8_t *)word_ptr - d->vram_ptr);
+                for (uint32_t i = 0; i < fi_count; i++) {
+                    fi_words[i] = i == 0 ? word : ldl_le_p(word_ptr + i);
+                    fi_tags[i] = xemu_frameinspect_lookup_tag(phys_base + 4ull * i);
+                }
+            }
+
+            uint32_t *dispatch_words = fi_count ? fi_words : word_ptr;
             ssize_t num_words_processed =
-                pfifo_run_puller(d, method_entry, word, word_ptr,
+                pfifo_run_puller(d, method_entry, word, dispatch_words,
                                  MIN(method_count, num_words_available),
                                  num_words_available);
             if (num_words_processed < 0) {
@@ -355,14 +375,18 @@ static void pfifo_run_pusher(NV2AState *d)
              * first n_labeled words are actual parameters of `method`; any
              * tail beyond that is raw pushbuffer dwords belonging to later
              * commands and must not be labeled as such. */
-            uint32_t n_labeled = MIN((uint32_t)num_words_processed,
-                (uint32_t)MIN(method_count, num_words_available));
-            xemu_frameinspect_capture_methods(
-                method,
-                method_type == NV_PFIFO_CACHE1_DMA_STATE_METHOD_TYPE_INC,
-                method_subchannel, word_ptr, (uint32_t)num_words_processed,
-                n_labeled,
-                (uint64_t)((uint8_t *)word_ptr - d->vram_ptr));
+            if (fi_count) {
+                uint32_t captured = MIN((uint32_t)num_words_processed,
+                                        fi_count);
+                uint32_t n_labeled = MIN(
+                    captured,
+                    (uint32_t)MIN(method_count, num_words_available));
+                xemu_frameinspect_capture_methods(
+                    method,
+                    method_type == NV_PFIFO_CACHE1_DMA_STATE_METHOD_TYPE_INC,
+                    method_subchannel, fi_words, captured, n_labeled,
+                    (uint64_t)((uint8_t *)word_ptr - d->vram_ptr), fi_tags);
+            }
 
             dma_get_v += (num_words_processed-1)*4;
 

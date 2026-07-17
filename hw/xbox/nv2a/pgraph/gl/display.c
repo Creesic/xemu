@@ -431,16 +431,56 @@ void pgraph_gl_fi_capture_scanout(NV2AState *d)
          * wrong). */
         xemu_frameinspect_capture_scanout(FI_SURFGEN_INVALID,
                                           (uint32_t)d->pcrtc.start,
-                                          line_offset, flags, NULL, 0, 0);
+                                          line_offset, flags, NULL, 0, 0,
+                                          NULL, 0, 0);
         return;
     }
+    if ((line_offset && surface->pitch != line_offset) ||
+        d->vga.cr[NV_PRMCIO_INTERLACE_MODE] !=
+            NV_PRMCIO_INTERLACE_MODE_DISABLED) {
+        flags |= FI_SCANOUT_TRANSFORMED;
+    }
 
+    /* Match pgraph_gl_sync(): CPU/blit-written guest RAM must be uploaded
+     * before either the source snapshot or composed display is rendered. */
+    pgraph_gl_upload_surface_data(d, surface, !tcg_enabled());
     uint32_t surface_gen = pgraph_gl_fi_intern_surface(d, surface);
-    uint32_t w = 0, h = 0;
-    uint32_t *rgba = pgraph_gl_fi_readback_surface(d, surface, &w, &h);
+    uint32_t surface_w = 0, surface_h = 0;
+    uint32_t *surface_rgba = pgraph_gl_fi_readback_surface(
+        d, surface, &surface_w, &surface_h);
+
+    PGRAPHGLState *r = d->pgraph.gl_renderer_state;
+    glo_set_current(g_nv2a_context_display);
+    render_display(d, surface);
+    gl_fence();
+
+    uint32_t display_w = r->gl_display_buffer_width;
+    uint32_t display_h = r->gl_display_buffer_height;
+    uint32_t *display_rgba = NULL;
+    if (xemu_frameinspect_capture_readback_allowed(display_w, display_h)) {
+        display_rgba = (uint32_t *)g_try_malloc(
+            (size_t)display_w * display_h * sizeof(uint32_t));
+    }
+    if (display_rgba) {
+        glBindFramebuffer(GL_FRAMEBUFFER, r->disp_rndr.fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, r->gl_display_buffer, 0);
+        assert(glCheckFramebufferStatus(GL_FRAMEBUFFER) ==
+               GL_FRAMEBUFFER_COMPLETE);
+        glo_readpixels(GL_RGBA, GL_UNSIGNED_BYTE, sizeof(uint32_t),
+                       display_w * sizeof(uint32_t), display_w, display_h,
+                       false, display_rgba);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, 0, 0);
+    }
+    glo_set_current(g_nv2a_context_render);
+
     xemu_frameinspect_capture_scanout(surface_gen, (uint32_t)d->pcrtc.start,
-                                      line_offset, flags, rgba, w, h);
-    g_free(rgba);
+                                      line_offset, flags, surface_rgba,
+                                      surface_w, surface_h, display_rgba,
+                                      display_w, display_h);
+    g_free(surface_rgba);
+    g_free(display_rgba);
 }
 
 int pgraph_gl_get_framebuffer_surface(NV2AState *d)

@@ -84,7 +84,9 @@ typedef struct {
     uint32_t args[6];
     bool valid;
 } FINodeInfo;
-FINodeInfo xemu_frameinspect_node_info(uint32_t node_id);
+uint32_t xemu_frameinspect_generation(void);
+FINodeInfo xemu_frameinspect_node_info(uint32_t node_id,
+                                       uint32_t generation);
 /* Armed capture's RAM size (bytes), or 0 if no capture is live. Used by
  * the store helpers to tell real RAM apart from mapped MMIO/device
  * memory before doing a debug-read byte diff. */

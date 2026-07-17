@@ -32,6 +32,7 @@ static FICaptureState fi_state = FI_CAP_IDLE;
 static FICapture *fi_published;          /* immutable, protected by fi_lock */
 static QemuMutex fi_lock;
 static int fi_lock_state;
+static uint64_t fi_next_capture_id;
 
 static void fi_capture_sync_init(void)
 {
@@ -114,6 +115,7 @@ static bool fi_capture_alloc(FICapture *c)
         fi_capture_reset(c);
         return false;
     }
+    c->origin_generation = xemu_frameinspect_generation();
     return true;
 }
 
@@ -185,6 +187,7 @@ FICaptureFlipResult xemu_frameinspect_capture_on_flip(bool opengl_active)
         *done = fi_cap;                 /* transfer ownership of buffers */
         memset(&fi_cap, 0, sizeof(fi_cap));
         done->refcount = 1;             /* published-pointer ownership */
+        done->capture_id = ++fi_next_capture_id;
         FICapture *old = fi_published;
         fi_published = done;
         bool destroy_old = old && --old->refcount == 0;
@@ -371,14 +374,10 @@ void xemu_frameinspect_capture_blit(uint32_t surface_gen, uint32_t source_addr,
     qemu_mutex_unlock(&fi_lock);
 }
 
-/* Lazy-alloc + baseline/add_event + budget logic shared by capture_writer()
- * and attach_pixels(). Feeds `rgba` into surface_gen's colour history,
- * tagging the diff with event_idx. Caller must hold fi_lock and must have
- * already verified we are FI_CAP_CAPTURING, surface_gen is valid, and rgba
- * is non-NULL. */
-static void fi_feed_colorhist(uint32_t surface_gen, uint32_t event_idx,
-                              const uint32_t *rgba, uint32_t width,
-                              uint32_t height)
+/* Return the initialized history for a surface, growing and charging the
+ * capture-owned array as needed. Caller holds fi_lock. */
+static FIColorHist *fi_get_colorhist(uint32_t surface_gen, uint32_t width,
+                                     uint32_t height)
 {
     if (surface_gen >= fi_cap.hist_count) {
         uint32_t new_count = surface_gen + 1;
@@ -386,14 +385,14 @@ static void fi_feed_colorhist(uint32_t surface_gen, uint32_t event_idx,
         uint64_t new_bytes = (uint64_t)new_count * sizeof(FIColorHist);
         if (!fi_budget_try(&fi_cap.budget, new_bytes - old_bytes)) {
             fi_cap.truncated = true;
-            return;
+            return NULL;
         }
         FIColorHist *nh = (FIColorHist *)realloc(
             fi_cap.hist, (size_t)new_bytes);
         if (!nh) {
             fi_budget_release(&fi_cap.budget, new_bytes - old_bytes);
             fi_cap.truncated = true;
-            return;
+            return NULL;
         }
         memset(&nh[fi_cap.hist_count], 0,
               (new_count - fi_cap.hist_count) * sizeof(FIColorHist));
@@ -403,37 +402,130 @@ static void fi_feed_colorhist(uint32_t surface_gen, uint32_t event_idx,
 
     FIColorHist *ch = &fi_cap.hist[surface_gen];
     if (ch->width == 0) {
-        /* First sight of this generation this frame: it becomes the
-         * baseline for its colour history. */
         uint64_t remaining = fi_cap.budget.limit - fi_cap.budget.used;
         if (!fi_colorhist_init(ch, width, height, 16) ||
             ch->bytes_used > remaining) {
             fi_colorhist_free(ch);
             fi_cap.truncated = true;
-            return;
+            return NULL;
         }
-        fi_budget_try(&fi_cap.budget, ch->bytes_used);
-        remaining = fi_cap.budget.limit - fi_cap.budget.used;
-        ch->byte_budget = MIN(ch->byte_budget, ch->bytes_used + remaining);
-        uint64_t old_bytes = ch->bytes_used;
-        if (!fi_colorhist_set_baseline(ch, rgba)) {
+        if (!fi_budget_try(&fi_cap.budget, ch->bytes_used)) {
+            fi_colorhist_free(ch);
             fi_cap.truncated = true;
+            return NULL;
         }
-        fi_budget_try(&fi_cap.budget, ch->bytes_used - old_bytes);
     } else if (ch->width != width || ch->height != height) {
-        /* Dimensions changed mid-capture for this generation: skip the diff
-         * rather than corrupting the history. Missing, not wrong. */
         fi_cap.truncated = true;
-    } else {
-        uint64_t remaining = fi_cap.budget.limit - fi_cap.budget.used;
-        ch->byte_budget = MIN((uint64_t)FI_CH_BYTE_BUDGET,
-                              ch->bytes_used + remaining);
-        uint64_t old_bytes = ch->bytes_used;
-        if (!fi_colorhist_add_event(ch, event_idx, rgba)) {
-            fi_cap.truncated = true;
-        }
-        fi_budget_try(&fi_cap.budget, ch->bytes_used - old_bytes);
+        return NULL;
     }
+    return ch;
+}
+
+static bool fi_charge_colorhist_growth(FIColorHist *ch, uint64_t old_bytes)
+{
+    uint64_t growth = ch->bytes_used - old_bytes;
+    if (!fi_budget_try(&fi_cap.budget, growth)) {
+        fi_cap.truncated = true;
+        return false;
+    }
+    return true;
+}
+
+static bool fi_set_colorhist_baseline(uint32_t surface_gen,
+                                      const uint32_t *rgba, uint32_t width,
+                                      uint32_t height)
+{
+    FIColorHist *ch = fi_get_colorhist(surface_gen, width, height);
+    if (!ch) {
+        return false;
+    }
+    if (ch->has_baseline) {
+        return true;
+    }
+    uint64_t remaining = fi_cap.budget.limit - fi_cap.budget.used;
+    ch->byte_budget = MIN((uint64_t)FI_CH_BYTE_BUDGET,
+                          ch->bytes_used + remaining);
+    uint64_t old_bytes = ch->bytes_used;
+    bool set = fi_colorhist_set_baseline(ch, rgba);
+    bool charged = fi_charge_colorhist_growth(ch, old_bytes);
+    if (!set || !charged) {
+        fi_cap.truncated = true;
+        return false;
+    }
+    return true;
+}
+
+/* Feed a post-writer image into a surface's history. If a producer missed the
+ * pre-write baseline hook, retain this image as a fallback baseline and still
+ * append a zero-delta event so scanout-only surfaces remain reconstructable. */
+static void fi_feed_colorhist(uint32_t surface_gen, uint32_t event_idx,
+                              const uint32_t *rgba, uint32_t width,
+                              uint32_t height)
+{
+    if (!fi_set_colorhist_baseline(surface_gen, rgba, width, height)) {
+        return;
+    }
+    FIColorHist *ch = &fi_cap.hist[surface_gen];
+    uint64_t remaining = fi_cap.budget.limit - fi_cap.budget.used;
+    ch->byte_budget = MIN((uint64_t)FI_CH_BYTE_BUDGET,
+                          ch->bytes_used + remaining);
+    uint64_t old_bytes = ch->bytes_used;
+    bool added = fi_colorhist_add_event(ch, event_idx, rgba);
+    bool charged = fi_charge_colorhist_growth(ch, old_bytes);
+    if (!added || !charged) {
+        fi_cap.truncated = true;
+    }
+}
+
+bool xemu_frameinspect_capture_needs_baseline(uint32_t surface_gen)
+{
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING ||
+        surface_gen == FI_SURFGEN_INVALID) {
+        return false;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    bool needed = qatomic_read(&fi_state) == FI_CAP_CAPTURING &&
+                  (surface_gen >= fi_cap.hist_count ||
+                   !fi_cap.hist[surface_gen].has_baseline);
+    qemu_mutex_unlock(&fi_lock);
+    return needed;
+}
+
+void xemu_frameinspect_capture_baseline(uint32_t surface_gen,
+                                        const uint32_t *rgba,
+                                        uint32_t width, uint32_t height)
+{
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING ||
+        surface_gen == FI_SURFGEN_INVALID || !rgba) {
+        return;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    if (qatomic_read(&fi_state) == FI_CAP_CAPTURING) {
+        fi_set_colorhist_baseline(surface_gen, rgba, width, height);
+    }
+    qemu_mutex_unlock(&fi_lock);
+}
+
+bool xemu_frameinspect_capture_readback_allowed(uint32_t width,
+                                                uint32_t height)
+{
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING || !width || !height ||
+        width > UINT32_MAX / height) {
+        return false;
+    }
+    uint64_t bytes = (uint64_t)width * height * sizeof(uint32_t);
+    if (bytes > FI_CH_BYTE_BUDGET) {
+        return false;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    bool allowed = qatomic_read(&fi_state) == FI_CAP_CAPTURING &&
+                   fi_cap.budget.used <= fi_cap.budget.limit &&
+                   bytes <= fi_cap.budget.limit - fi_cap.budget.used;
+    qemu_mutex_unlock(&fi_lock);
+    return allowed;
 }
 
 void xemu_frameinspect_capture_attach_pixels(uint32_t surface_gen,
@@ -456,8 +548,12 @@ void xemu_frameinspect_capture_attach_pixels(uint32_t surface_gen,
 void xemu_frameinspect_capture_scanout(uint32_t surface_gen,
                                        uint32_t pcrtc_start,
                                        uint32_t line_offset, uint32_t flags,
-                                       const uint32_t *rgba, uint32_t width,
-                                       uint32_t height)
+                                       const uint32_t *surface_rgba,
+                                       uint32_t surface_width,
+                                       uint32_t surface_height,
+                                       const uint32_t *display_rgba,
+                                       uint32_t display_width,
+                                       uint32_t display_height)
 {
     if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
         return;
@@ -469,12 +565,27 @@ void xemu_frameinspect_capture_scanout(uint32_t surface_gen,
         return;
     }
 
+    uint32_t display_res = FI_RES_INVALID;
+    if (display_rgba && display_width && display_height &&
+        display_width <= UINT32_MAX / display_height &&
+        (uint64_t)display_width * display_height <= UINT32_MAX / 4) {
+        uint32_t len = display_width * display_height * sizeof(uint32_t);
+        uint64_t meta = ((uint64_t)display_width << 32) | display_height;
+        display_res = fi_resources_intern(&fi_cap.resources, &fi_cap.budget,
+                                          FI_RESK_SCANOUT_RGBA, display_rgba,
+                                          len, meta);
+        if (display_res == FI_RES_INVALID) {
+            fi_cap.truncated = true;
+        }
+    }
     uint32_t idx = fi_eventlog_append(&fi_cap.events, &fi_cap.budget,
                                       FI_EV_SCANOUT, surface_gen, pcrtc_start,
-                                      line_offset, flags, 0);
+                                      line_offset, flags, display_res);
     fi_cap.last_event = idx;
-    if (idx != FI_EVENT_INVALID && surface_gen != FI_SURFGEN_INVALID && rgba) {
-        fi_feed_colorhist(surface_gen, idx, rgba, width, height);
+    if (idx != FI_EVENT_INVALID && surface_gen != FI_SURFGEN_INVALID &&
+        surface_rgba) {
+        fi_feed_colorhist(surface_gen, idx, surface_rgba, surface_width,
+                          surface_height);
     }
     qemu_mutex_unlock(&fi_lock);
 }
@@ -483,7 +594,8 @@ void xemu_frameinspect_capture_methods(uint32_t first_method, bool method_inc,
                                        uint16_t subchannel,
                                        const uint32_t *words, uint32_t n,
                                        uint32_t n_labeled,
-                                       uint64_t phys_base)
+                                       uint64_t phys_base,
+                                       const uint32_t *writer_tags)
 {
     if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
         return;
@@ -514,7 +626,7 @@ void xemu_frameinspect_capture_methods(uint32_t first_method, bool method_inc,
             (method_inc ? first_method + 4 * i : first_method) :
             FI_METHOD_RAW_WORD;
         uint64_t phys_i = phys_base + 4ull * i;
-        uint32_t tag = xemu_frameinspect_lookup_tag(phys_i);
+        uint32_t tag = writer_tags ? writer_tags[i] : 0;
         uint16_t confidence = tag == 0 ? FI_ORIG_UNATTRIBUTED :
                               (tag & FI_TAG_PARTIAL) ? FI_ORIG_PARTIAL :
                                                         FI_ORIG_ATTRIBUTED;

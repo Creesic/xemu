@@ -1602,8 +1602,6 @@ static void gen_xemu_calltrace_direct(DisasContext *s,
     gen_xemu_calltrace(s, tcg_constant_tl(dest));
 }
 
-extern bool xemu_frameinspect_armed;
-
 static void gen_xemu_fi_call(DisasContext *s, TCGv callee)
 {
     gen_helper_xemu_fi_call(tcg_env, eip_next_tl(s), callee);
@@ -2602,6 +2600,7 @@ static void gen_MOVBE(DisasContext *s, X86DecodedInsn *decode)
     /* M operand type does not load/store */
     if (decode->e.op0 == X86_TYPE_M) {
         tcg_gen_qemu_st_tl(s->T0, s->A0, s->mem_index, ot | MO_BE);
+        gen_fi_store_post(s->A0, 1u << (ot & MO_SIZE));
     } else {
         tcg_gen_qemu_ld_tl(s->T0, s->A0, s->mem_index, ot | MO_BE);
     }
@@ -2672,6 +2671,7 @@ static void gen_MOVQ(DisasContext *s, X86DecodedInsn *decode)
     tcg_gen_ld_i64(s->tmp1_i64, tcg_env, decode->op[2].offset);
     if (decode->op[0].has_ea) {
         tcg_gen_qemu_st_i64(s->tmp1_i64, s->A0, s->mem_index, MO_LEUQ);
+        gen_fi_store_post(s->A0, 8);
     } else {
         /*
          * tcg_gen_gvec_dup_i64(MO_64, op0.offset, 8, vec_len, s->tmp1_64) would
@@ -4649,6 +4649,7 @@ static void gen_VMOVLPx_st(DisasContext *s, X86DecodedInsn *decode)
 {
     tcg_gen_ld_i64(s->tmp1_i64, OP_PTR2, offsetof(ZMMReg, ZMM_Q(0)));
     tcg_gen_qemu_st_i64(s->tmp1_i64, s->A0, s->mem_index, MO_LEUQ);
+    gen_fi_store_post(s->A0, 8);
 }
 
 static void gen_VMOVSD_ld(DisasContext *s, X86DecodedInsn *decode)
@@ -4686,6 +4687,7 @@ static void gen_VMOVSS_st(DisasContext *s, X86DecodedInsn *decode)
 
     tcg_gen_ld_i32(tmp, OP_PTR2, offsetof(ZMMReg, ZMM_L(0)));
     tcg_gen_qemu_st_i32(tmp, s->A0, s->mem_index, MO_LEUL);
+    gen_fi_store_post(s->A0, 4);
 }
 
 static void gen_VPMASKMOV_st(DisasContext *s, X86DecodedInsn *decode)

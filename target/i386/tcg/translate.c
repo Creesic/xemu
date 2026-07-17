@@ -628,6 +628,17 @@ static inline void gen_op_ld_v(DisasContext *s, int idx, TCGv t0, TCGv a0)
 extern bool xemu_frameinspect_armed;
 extern bool xemu_frameinspect_watch_mode;
 
+/* Vector/SSE stores bypass gen_op_st_v(). Tag them after the complete store
+ * so a fault can only lose attribution, never publish a write that did not
+ * retire. Watch-mode byte diffs remain on the scalar path (8-byte scratch). */
+static inline void gen_fi_store_post(TCGv addr, uint32_t size)
+{
+    if (xemu_frameinspect_armed) {
+        gen_helper_xemu_fi_store_post(tcg_env, addr,
+                                      tcg_constant_i32(size));
+    }
+}
+
 static inline void gen_op_st_v(DisasContext *s, int idx, TCGv t0, TCGv a0)
 {
     /* xemu frame inspector: watch mode brackets the store to capture
@@ -2890,6 +2901,7 @@ static inline void gen_stq_env_A0(DisasContext *s, int offset)
 {
     tcg_gen_ld_i64(s->tmp1_i64, tcg_env, offset);
     tcg_gen_qemu_st_i64(s->tmp1_i64, s->A0, s->mem_index, MO_LEUQ);
+    gen_fi_store_post(s->A0, 8);
 }
 
 static inline void gen_ldo_env_A0(DisasContext *s, int offset, bool align)
@@ -2914,6 +2926,7 @@ static inline void gen_sto_env_A0(DisasContext *s, int offset, bool align)
 
     tcg_gen_ld_i128(t, tcg_env, offset);
     tcg_gen_qemu_st_i128(t, s->A0, mem_index, mop);
+    gen_fi_store_post(s->A0, 16);
 }
 
 static void gen_ldy_env_A0(DisasContext *s, int offset, bool align)
@@ -2944,6 +2957,7 @@ static void gen_sty_env_A0(DisasContext *s, int offset, bool align)
     tcg_gen_addi_tl(a0_hi, s->A0, 16);
     tcg_gen_ld_i128(t, tcg_env, offset + offsetof(YMMReg, YMM_X(1)));
     tcg_gen_qemu_st_i128(t, a0_hi, mem_index, mop);
+    gen_fi_store_post(s->A0, 32);
 }
 
 #include "emit.c.inc"

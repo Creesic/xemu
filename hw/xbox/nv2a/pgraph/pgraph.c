@@ -788,7 +788,8 @@ int pgraph_method(NV2AState *d, unsigned int subchannel,
         #define LAP(i, prm) (parameters[i*2+2] == (prm))
         #define LAMP(i, mthd, prm) (LAM(i, mthd) && LAP(i, prm))
 
-        if (method == NV097_DRAW_ARRAYS && (max_lookahead_words >= 7) &&
+        if (xemu_frameinspect_capture_state() != FI_CAP_CAPTURING &&
+            method == NV097_DRAW_ARRAYS && (max_lookahead_words >= 7) &&
             pg->inline_elements_length == 0 &&
             pg->draw_arrays_length <
                 (ARRAY_SIZE(pg->draw_arrays_start) - 1) &&
