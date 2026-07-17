@@ -8,6 +8,7 @@ general:
       default: true
   screenshot_dir: string
   calltrace_dir: string
+  frameinspect_symbols: string
   calltrace_hotkey_mode:
     type: string
     default: data

@@ -27,9 +27,35 @@
 extern "C" {
 #include "../../xemu-frameinspect-capture.h"
 #include "../../xemu-frameinspect.h"
+#include "../../xemu-frameinspect-symbols.h"
+#include "../xemu-settings.h"
 }
 
 FrameInspectorWindow frame_inspector_window;
+
+/* IDA symbol map (address -> function name), loaded on demand and persisted
+ * via g_config.general.frameinspect_symbols. Not capture-scoped -- it applies
+ * to the running title's guest addresses across captures. */
+static FISymbols g_fi_symbols;
+static bool g_fi_symbols_autoload_tried;
+
+/* Format a guest address as "name+0xNN" (or "name") when a symbol is known,
+ * else "0x%08x". Writes into buf and returns it. */
+static const char *fi_sym(uint32_t addr, char *buf, size_t n)
+{
+    uint32_t off = 0;
+    const char *name = fi_symbols_lookup(&g_fi_symbols, addr, &off);
+    if (name) {
+        if (off) {
+            snprintf(buf, n, "%s+0x%x", name, off);
+        } else {
+            snprintf(buf, n, "%s", name);
+        }
+    } else {
+        snprintf(buf, n, "0x%08x", addr);
+    }
+    return buf;
+}
 
 static const char *ev_kind_name(uint8_t k)
 {
@@ -297,11 +323,13 @@ static void fi_render_call_chain(uint32_t start_node, uint32_t generation)
             break;
         }
         ImGui::PushID(depth);
-        ImGui::Text("call_site 0x%08x -> callee 0x%08x", ni.call_site,
-                   ni.callee);
-        ImGui::Text("ecx/this=0x%08x  args: %08x %08x %08x %08x %08x",
-                   ni.args[0], ni.args[1], ni.args[2], ni.args[3],
-                   ni.args[4], ni.args[5]);
+        char cs[128], ce[128];
+        ImGui::Text("%s -> %s", fi_sym(ni.call_site, cs, sizeof(cs)),
+                    fi_sym(ni.callee, ce, sizeof(ce)));
+        ImGui::Text("call_site=0x%08x callee=0x%08x  ecx/this=0x%08x  "
+                    "args: %08x %08x %08x %08x %08x",
+                    ni.call_site, ni.callee, ni.args[0], ni.args[1], ni.args[2],
+                    ni.args[3], ni.args[4], ni.args[5]);
         ImGui::SameLine();
         if (ImGui::SmallButton("copy callee")) {
             char hex[16];
@@ -410,11 +438,21 @@ static void fi_render_batch_writers(FrameInspectorWindow *w,
         } else {
             snprintf(method_ex, sizeof(method_ex), "0x%04x", writers[k].method);
         }
-        char label[96];
-        snprintf(label, sizeof(label), "node %u  -  %u method%s  (e.g. %s)%s",
-                 writers[k].node, writers[k].count,
-                 writers[k].count == 1 ? "" : "s", method_ex,
-                 writers[k].partial ? "  [partial]" : "");
+        /* Lead with the function this node represents (its callee) so the
+         * writer reads as "GlyphBuilder - 448 methods" rather than a bare id. */
+        char fn[128];
+        FINodeInfo ni =
+            xemu_frameinspect_node_info(writers[k].node, cap->origin_generation);
+        if (ni.valid) {
+            fi_sym(ni.callee, fn, sizeof(fn));
+        } else {
+            snprintf(fn, sizeof(fn), "node %u", writers[k].node);
+        }
+        char label[192];
+        snprintf(label, sizeof(label),
+                 "%s  -  %u method%s  (e.g. %s)  [node %u]%s", fn,
+                 writers[k].count, writers[k].count == 1 ? "" : "s", method_ex,
+                 writers[k].node, writers[k].partial ? "  partial" : "");
         ImGui::PushID(k);
         if (ImGui::Selectable(label, writers[k].node == cur_node)) {
             w->m_selected_rec = writers[k].first_rec;
@@ -1311,6 +1349,30 @@ void FrameInspectorWindow::Draw()
                 ImVec4(1, 0.6f, 0, 1),
                 "[TRUNCATED] capture hit a cap/budget; some data is missing.");
         }
+        /* Symbols: resolve guest addresses to IDA function names. Auto-loaded
+         * once from the persisted path; reloadable via the picker. */
+        if (!g_fi_symbols_autoload_tried) {
+            g_fi_symbols_autoload_tried = true;
+            const char *sp = g_config.general.frameinspect_symbols;
+            if (sp && sp[0]) {
+                fi_symbols_load(&g_fi_symbols, sp, NULL);
+            }
+        }
+        if (g_fi_symbols.count) {
+            ImGui::Text("Symbols: %u loaded", g_fi_symbols.count);
+        } else {
+            ImGui::TextDisabled(
+                "Symbols: none (addresses shown as hex). Load an IDA symbol "
+                "map (addr [size] name per line).");
+        }
+        FilePicker(
+            "Load symbols", g_config.general.frameinspect_symbols, nullptr, 0,
+            false, [](const char *path) {
+                xemu_settings_set_string(&g_config.general.frameinspect_symbols,
+                                         path);
+                fi_symbols_load(&g_fi_symbols, path, NULL);
+            });
+        ImGui::Separator();
         const FIEvent *scanout = fi_find_scanout_event(cap);
         if (scanout && (scanout->a2 & FI_SCANOUT_PVIDEO)) {
             ImGui::TextColored(
