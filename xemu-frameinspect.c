@@ -220,6 +220,32 @@ uint32_t xemu_frameinspect_lookup_tag(uint64_t paddr)
     return fi_alive ? fi_tagmap_lookup(&fi_tags, paddr) : 0;
 }
 
+/* Resolves against the LIVE fi_tree: valid only until the next arm (which
+ * frees and replaces it, same lifetime caveat as xemu_frameinspect_arm()'s
+ * "Captured data intentionally retained until next arm" note above, except
+ * the tree is the one live structure that IS discarded on arm, not
+ * retained). Same guard pattern as xemu_frameinspect_lookup_tag(): no lock,
+ * just the fi_alive flag -- reading is only meaningful once the UI thread
+ * is walking a paused capture. */
+FINodeInfo xemu_frameinspect_node_info(uint32_t node_id)
+{
+    FINodeInfo info;
+    memset(&info, 0, sizeof(info));
+    if (!fi_alive || node_id >= fi_tree.num_nodes) {
+        return info; /* valid = false */
+    }
+    const FINode *n = &fi_tree.nodes[node_id];
+    info.parent = n->parent;
+    info.call_site = n->call_site;
+    info.callee = n->callee;
+    if (n->n_argsets > 0 && n->argset_ids[0] < fi_tree.num_argsets) {
+        memcpy(info.args, fi_tree.argsets[n->argset_ids[0]],
+              sizeof(info.args));
+    }
+    info.valid = true;
+    return info;
+}
+
 uint64_t xemu_frameinspect_ram_size(void)
 {
     return fi_alive ? fi_tags.ram_size : 0;

@@ -24,6 +24,7 @@
 #include <vector>
 extern "C" {
 #include "../../xemu-frameinspect-capture.h"
+#include "../../xemu-frameinspect.h"
 }
 
 FrameInspectorWindow frame_inspector_window;
@@ -63,6 +64,346 @@ static int fi_find_scanout_gen(const FICapture *cap)
         }
     }
     return -1;
+}
+
+static const char *fi_confidence_name(uint16_t confidence)
+{
+    switch (confidence) {
+    case FI_ORIG_ATTRIBUTED: return "attributed";
+    case FI_ORIG_PARTIAL: return "partial";
+    case FI_ORIG_UNATTRIBUTED: return "unattributed";
+    case FI_ORIG_LOSTSYNC: return "lostsync";
+    default: return "?";
+    }
+}
+
+/* Linear scan for the FIMethodBatch whose batch_event == event_idx (the
+ * join key: FIMethodBatch.batch_event references the begin_batch event
+ * index). Returns NULL for non-batch events (clear/blit/scanout) or a
+ * split-batch event that logged no methods of its own. */
+static const FIMethodBatch *fi_find_method_batch(const FICapture *cap,
+                                                 int event_idx)
+{
+    if (event_idx < 0) {
+        return nullptr;
+    }
+    for (uint32_t i = 0; i < cap->methods.num_batches; i++) {
+        if (cap->methods.batches[i].batch_event == (uint32_t)event_idx) {
+            return &cap->methods.batches[i];
+        }
+    }
+    return nullptr;
+}
+
+/* First resource of `kind` referenced by event_idx's batch (join via
+ * cap->batch_res, keyed the same way as FIMethodBatch.batch_event). */
+static const FIResource *fi_find_batch_resource(const FICapture *cap,
+                                                int event_idx, uint32_t kind)
+{
+    if (event_idx < 0) {
+        return nullptr;
+    }
+    for (uint32_t i = 0; i < cap->num_batch_res; i++) {
+        const FIBatchResRef *ref = &cap->batch_res[i];
+        if (ref->event != (uint32_t)event_idx) {
+            continue;
+        }
+        if (ref->res_id >= cap->resources.num_res) {
+            continue;
+        }
+        if (cap->resources.res[ref->res_id].kind == kind) {
+            return &cap->resources.res[ref->res_id];
+        }
+    }
+    return nullptr;
+}
+
+static void fi_methods_tab(FrameInspectorWindow *w, const FICapture *cap,
+                          const FIMethodBatch *batch)
+{
+    if (!batch) {
+        ImGui::TextDisabled(
+            "No method records for this event (clear/blit/split-batch).");
+        return;
+    }
+
+    w->m_method_filter.Draw("Filter", 200.0f * g_viewport_mgr.m_scale);
+
+    ImGui::PushFont(g_font_mgr.m_fixed_width_font);
+    ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                            ImGuiTableFlags_ScrollY;
+    if (ImGui::BeginTable("fi_methods_tbl", 5, flags,
+                          ImVec2(0, ImGui::GetContentRegionAvail().y))) {
+        ImGui::TableSetupColumn("Method");
+        ImGui::TableSetupColumn("Sub");
+        ImGui::TableSetupColumn("Param");
+        ImGui::TableSetupColumn("Phys Addr");
+        ImGui::TableSetupColumn("Confidence");
+        ImGui::TableHeadersRow();
+
+        for (uint32_t i = batch->first_rec;
+             i < batch->first_rec + batch->rec_count; i++) {
+            const FIMethodRec *r = &cap->methods.recs[i];
+            char method_str[24];
+            if (r->method == FI_METHOD_RAW_WORD) {
+                snprintf(method_str, sizeof(method_str), "(raw dword)");
+            } else {
+                snprintf(method_str, sizeof(method_str), "0x%04x", r->method);
+            }
+            const char *conf_str = fi_confidence_name(r->confidence);
+
+            char filter_row[160];
+            snprintf(filter_row, sizeof(filter_row),
+                    "%s %u 0x%08x 0x%08x %s", method_str, r->subchannel,
+                    r->param, r->phys_addr, conf_str);
+            if (!w->m_method_filter.PassFilter(filter_row)) {
+                continue;
+            }
+
+            ImGui::PushID((int)i);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            if (ImGui::Selectable(method_str, (int)i == w->m_selected_rec,
+                                  ImGuiSelectableFlags_SpanAllColumns)) {
+                w->m_selected_rec = (int)i;
+            }
+            ImGui::TableSetColumnIndex(1);
+            ImGui::Text("%u", r->subchannel);
+            ImGui::TableSetColumnIndex(2);
+            ImGui::Text("0x%08x", r->param);
+            ImGui::TableSetColumnIndex(3);
+            ImGui::Text("0x%08x", r->phys_addr);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("copy")) {
+                char hex[16];
+                snprintf(hex, sizeof(hex), "0x%08x", r->phys_addr);
+                ImGui::SetClipboardText(hex);
+            }
+            ImGui::TableSetColumnIndex(4);
+            ImVec4 color;
+            switch (r->confidence) {
+            case FI_ORIG_ATTRIBUTED: color = ImVec4(0.3f, 0.9f, 0.3f, 1); break;
+            case FI_ORIG_PARTIAL: color = ImVec4(0.9f, 0.9f, 0.2f, 1); break;
+            default: color = ImVec4(0.6f, 0.6f, 0.6f, 1); break;
+            }
+            ImGui::TextColored(color, "%s", conf_str);
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    ImGui::PopFont();
+}
+
+/* Walks the call chain from the selected Methods-tab record's writer_node up
+ * to the root, one row per frame (innermost/writer first). Resolves each
+ * node via xemu_frameinspect_node_info(), which reads the LIVE Plan-1 call
+ * tree -- valid only until the inspector's capture is re-armed. */
+static void fi_origin_tab(const FICapture *cap, int selected_rec)
+{
+    ImGui::TextUnformatted("Call-path origin");
+    ImGui::SameLine();
+    HelpMarker("Origin resolves against the live call tree; only valid "
+              "before re-arming the inspector.");
+    ImGui::Separator();
+
+    if (selected_rec < 0 || (uint32_t)selected_rec >= cap->methods.num_recs) {
+        ImGui::TextDisabled("Origin unavailable (unattributed).");
+        return;
+    }
+    const FIMethodRec *rec = &cap->methods.recs[selected_rec];
+    if (rec->confidence != FI_ORIG_ATTRIBUTED) {
+        ImGui::TextDisabled("Origin unavailable (unattributed).");
+        return;
+    }
+
+    ImGui::PushFont(g_font_mgr.m_fixed_width_font);
+    uint32_t node = rec->writer_node;
+    if (node == FI_NODE_ROOT) {
+        ImGui::TextDisabled(
+            "Origin is the root frame (call path not tracked further).");
+    }
+    int indents = 0;
+    int depth = 0;
+    while (node != FI_NODE_ROOT && node != FI_NODE_INVALID) {
+        FINodeInfo ni = xemu_frameinspect_node_info(node);
+        if (!ni.valid) {
+            ImGui::TextColored(ImVec4(1, 0.6f, 0, 1),
+                              "origin unavailable (capture re-armed)");
+            break;
+        }
+        ImGui::PushID(depth);
+        ImGui::Text("call_site 0x%08x -> callee 0x%08x", ni.call_site,
+                   ni.callee);
+        ImGui::Text("ecx/this=0x%08x  args: %08x %08x %08x %08x %08x",
+                   ni.args[0], ni.args[1], ni.args[2], ni.args[3],
+                   ni.args[4], ni.args[5]);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("copy callee")) {
+            char hex[16];
+            snprintf(hex, sizeof(hex), "0x%08x", ni.callee);
+            ImGui::SetClipboardText(hex);
+        }
+        ImGui::PopID();
+        ImGui::Indent();
+        indents++;
+        node = ni.parent;
+        depth++;
+    }
+    for (int i = 0; i < indents; i++) {
+        ImGui::Unindent();
+    }
+    ImGui::PopFont();
+}
+
+static void fi_state_tab(const FICapture *cap, int event_idx)
+{
+    const FIResource *regs = fi_find_batch_resource(cap, event_idx, FI_RESK_REGS);
+    if (!regs) {
+        ImGui::TextDisabled("No register-file resource for this event.");
+        return;
+    }
+    ImGui::Text("Registers: %u bytes (raw dword dump; named-register "
+               "decoding is out of scope)", regs->len);
+    ImGui::BeginChild("fi_state_regs", ImVec2(0, 0), true);
+    ImGui::PushFont(g_font_mgr.m_fixed_width_font);
+    const uint8_t *base = cap->resources.blob + regs->off;
+    uint32_t nwords = regs->len / 4;
+    uint32_t nrows = (nwords + 7) / 8;
+    ImGuiListClipper clipper;
+    clipper.Begin((int)nrows);
+    while (clipper.Step()) {
+        for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
+            uint32_t first = (uint32_t)row * 8;
+            char line[128];
+            int p = snprintf(line, sizeof(line), "0x%04x:", first * 4);
+            for (uint32_t k = 0; k < 8 && first + k < nwords; k++) {
+                uint32_t word;
+                memcpy(&word, base + (uint64_t)(first + k) * 4, 4);
+                p += snprintf(line + p, sizeof(line) - p, " %08x", word);
+            }
+            ImGui::TextUnformatted(line);
+        }
+    }
+    ImGui::PopFont();
+    ImGui::EndChild();
+}
+
+static void fi_resources_tab(const FICapture *cap, int event_idx)
+{
+    ImGui::TextDisabled(
+        "Texture/palette bytes are shown as metadata only; decoded inline "
+        "previews are a follow-up.");
+    ImGui::Separator();
+
+    if (event_idx < 0) {
+        ImGui::TextDisabled("Select an event.");
+        return;
+    }
+    bool any = false;
+    for (uint32_t i = 0; i < cap->num_batch_res; i++) {
+        const FIBatchResRef *ref = &cap->batch_res[i];
+        if (ref->event != (uint32_t)event_idx) {
+            continue;
+        }
+        if (ref->res_id >= cap->resources.num_res) {
+            continue;
+        }
+        const FIResource *r = &cap->resources.res[ref->res_id];
+        any = true;
+        ImGui::PushID((int)i);
+        switch (r->kind) {
+        case FI_RESK_REGS:
+            ImGui::TextUnformatted("Registers (32 KiB) -- see State tab");
+            break;
+        case FI_RESK_TEXTURE: {
+            /* meta pack from pgraph_gl_bind_textures() (draw.c): color_format
+             * in the high 32 bits, width in bits 16-31, height in bits 0-15. */
+            uint32_t color_format = (uint32_t)(r->meta >> 32);
+            uint32_t width = (uint32_t)((r->meta >> 16) & 0xFFFF);
+            uint32_t height = (uint32_t)(r->meta & 0xFFFF);
+            ImGui::Text("Texture: %u bytes, format=0x%02x %ux%u", r->len,
+                       color_format, width, height);
+            break;
+        }
+        case FI_RESK_PALETTE:
+            ImGui::Text("Palette: %u bytes", r->len);
+            break;
+        case FI_RESK_TEXTURE_RTREF:
+            ImGui::TextColored(
+                ImVec4(0.4f, 0.8f, 1.0f, 1.0f),
+                "Render-target texture -> surface @ 0x%llx (dependency)",
+                (unsigned long long)r->meta);
+            break;
+        default:
+            ImGui::Text("Unknown resource kind %u, %u bytes", r->kind, r->len);
+            break;
+        }
+        ImGui::PopID();
+    }
+    if (!any) {
+        ImGui::TextDisabled("No resources referenced by this event.");
+    }
+}
+
+static void fi_pixels_tab(const FICapture *cap, int pinned_pixel)
+{
+    if (pinned_pixel < 0) {
+        ImGui::TextDisabled(
+            "Hover + click a pixel in the frame to pin its history.");
+        return;
+    }
+    int gen = fi_find_scanout_gen(cap);
+    if (gen < 0 || !cap->hist || (uint32_t)gen >= cap->hist_count) {
+        ImGui::TextDisabled("No colour history available for the scanout surface.");
+        return;
+    }
+    const FIColorHist *ch = &cap->hist[gen];
+    if ((uint32_t)pinned_pixel >= ch->npix) {
+        ImGui::TextDisabled("Pinned pixel is out of range for this capture.");
+        return;
+    }
+
+    FIColorTouch touches[128];
+    int n = fi_colorhist_pixel_history(ch, (uint32_t)pinned_pixel, touches,
+                                       128);
+    ImGui::Text("Pixel index %d: %d touch(es)", pinned_pixel, n);
+    if (n == 0) {
+        ImGui::TextDisabled("No colour-change history for this pixel.");
+        return;
+    }
+    if (ImGui::BeginTable("fi_pixels_tbl", 3,
+                          ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("Event");
+        ImGui::TableSetupColumn("Kind");
+        ImGui::TableSetupColumn("Before -> After");
+        ImGui::TableHeadersRow();
+        ImVec2 sw(16.0f * g_viewport_mgr.m_scale, 16.0f * g_viewport_mgr.m_scale);
+        for (int i = 0; i < n; i++) {
+            const FIColorTouch *t = &touches[i];
+            ImGui::PushID(i);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("#%u", t->event_id);
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(t->event_id < cap->events.count ?
+                                   ev_kind_name(cap->events.events[t->event_id].kind) :
+                                   "?");
+            ImGui::TableSetColumnIndex(2);
+            ImGui::ColorButton("before", fi_rgba_to_imvec4(t->before),
+                              ImGuiColorEditFlags_NoTooltip |
+                                  ImGuiColorEditFlags_NoBorder,
+                              sw);
+            ImGui::SameLine();
+            ImGui::TextUnformatted("->");
+            ImGui::SameLine();
+            ImGui::ColorButton("after", fi_rgba_to_imvec4(t->after),
+                              ImGuiColorEditFlags_NoTooltip |
+                                  ImGuiColorEditFlags_NoBorder,
+                              sw);
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
 }
 
 /* (Re)build m_frame_tex from the scanout generation's final reconstructed
@@ -148,6 +489,7 @@ void FrameInspectorWindow::Draw()
 
     if (new_capture) {
         m_pinned_pixel = -1; /* stale index into a possibly-differently-sized image */
+        m_selected_rec = -1; /* stale index into the old capture's methods log */
     }
     if (new_capture || m_frame_tex == 0) {
         fi_rebuild_frame_texture(this, cap);
@@ -280,16 +622,58 @@ void FrameInspectorWindow::Draw()
         }
         if (m_selected_event >= 0 &&
             m_selected_event < (int)cap->events.count) {
-            const FIEvent *ev = &cap->events.events[m_selected_event];
-            ImGui::PushFont(g_font_mgr.m_fixed_width_font);
-            ImGui::Text("kind:       %s", ev_kind_name(ev->kind));
-            ImGui::Text("surface_gen: %u", ev->surface_gen);
-            ImGui::Text("seq:        %u", ev->seq);
-            ImGui::Text("a0:         0x%08x", ev->a0);
-            ImGui::Text("a1:         0x%08x", ev->a1);
-            ImGui::Text("a2:         0x%08x", ev->a2);
-            ImGui::Text("a3:         0x%08x", ev->a3);
-            ImGui::PopFont();
+            /* Anchor the Methods-tab selection to the current event's
+             * batch, defaulting to its first ATTRIBUTED record whenever the
+             * selection doesn't belong to it (new event/capture, no batch,
+             * or first display) -- an in-range selection means the user
+             * already picked a row in the Methods tab, so leave it alone. */
+            const FIMethodBatch *cur_batch =
+                fi_find_method_batch(cap, m_selected_event);
+            bool rec_in_range =
+                cur_batch && m_selected_rec >= (int)cur_batch->first_rec &&
+                m_selected_rec <
+                    (int)(cur_batch->first_rec + cur_batch->rec_count);
+            if (!rec_in_range) {
+                m_selected_rec = -1;
+                if (cur_batch) {
+                    for (uint32_t i = cur_batch->first_rec;
+                         i < cur_batch->first_rec + cur_batch->rec_count;
+                         i++) {
+                        if (cap->methods.recs[i].confidence ==
+                            FI_ORIG_ATTRIBUTED) {
+                            m_selected_rec = (int)i;
+                            break;
+                        }
+                    }
+                    if (m_selected_rec < 0 && cur_batch->rec_count > 0) {
+                        m_selected_rec = (int)cur_batch->first_rec;
+                    }
+                }
+            }
+
+            if (ImGui::BeginTabBar("fi_tabs")) {
+                if (ImGui::BeginTabItem("Origin")) {
+                    fi_origin_tab(cap, m_selected_rec);
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("Methods")) {
+                    fi_methods_tab(this, cap, cur_batch);
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("State")) {
+                    fi_state_tab(cap, m_selected_event);
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("Resources")) {
+                    fi_resources_tab(cap, m_selected_event);
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("Pixels")) {
+                    fi_pixels_tab(cap, m_pinned_pixel);
+                    ImGui::EndTabItem();
+                }
+                ImGui::EndTabBar();
+            }
         } else {
             ImGui::TextDisabled("Select an event");
         }

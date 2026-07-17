@@ -25,6 +25,12 @@ public:
     bool m_is_open = false;
     unsigned m_last_seen_events = 0;
     int m_selected_event = -1;
+    /* Selected FIMethodRec index in the Methods tab (a global index into
+     * cap->methods.recs), shared with the Origin tab. -1 = none. Reset to
+     * the current batch's first ATTRIBUTED record whenever it falls outside
+     * that batch's record range (new event, new capture, or no batch). */
+    int m_selected_rec = -1;
+    ImGuiTextFilter m_method_filter;
 
     /* Frozen-frame GL texture (Task 3): reconstructed final scanout image.
      * m_frame_tex == 0 means no image is currently held. Deleted+recreated

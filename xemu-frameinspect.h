@@ -64,6 +64,27 @@ void xemu_frameinspect_record_store_watched(uint32_t thread_key,
 
 /* Lookup (PFIFO thread, Plan 2) and UI (Plan 3): */
 uint32_t xemu_frameinspect_lookup_tag(uint64_t paddr);
+/* Mirrors xemu-frameinspect-calltree.h's sentinels (same spelling, so
+ * redefinition is a no-op if both headers end up included in one TU): the
+ * root/unknown call-path node, and "no such node". Exposed here too so UI
+ * callers of xemu_frameinspect_node_info() (a C++ TU) don't need to include
+ * calltree.h, which is C-only (its calloc()/malloc() results rely on C's
+ * implicit void* conversion and won't compile as C++). */
+#define FI_NODE_INVALID 0xFFFFFFFFu
+#define FI_NODE_ROOT    0u
+/* One call-path node's shape (parent/call_site/callee) and its first
+ * argument set, resolved against the LIVE call tree. Valid only until the
+ * next xemu_frameinspect_arm() (a re-arm frees the tree this reads); UI
+ * callers (Plan 3) must treat `valid == false` as "unavailable", never
+ * fabricate a chain. */
+typedef struct {
+    uint32_t parent;
+    uint32_t call_site;
+    uint32_t callee;
+    uint32_t args[6];
+    bool valid;
+} FINodeInfo;
+FINodeInfo xemu_frameinspect_node_info(uint32_t node_id);
 /* Armed capture's RAM size (bytes), or 0 if no capture is live. Used by
  * the store helpers to tell real RAM apart from mapped MMIO/device
  * memory before doing a debug-read byte diff. */
