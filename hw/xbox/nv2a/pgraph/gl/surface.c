@@ -797,24 +797,22 @@ static void surface_download_to_buffer(NV2AState *d, SurfaceBinding *surface,
     bind_current_surface(d);
 }
 
-/* Frame inspector: readback of the current colour binding, forced to
- * canonical RGBA8888 regardless of the surface's native GL storage format.
- * Follows the same FBO bind/readback/restore pattern as
- * surface_download_to_buffer() above, but always reads GL_RGBA/
- * GL_UNSIGNED_BYTE via glo_readpixels() instead of the surface's own
- * fmt.gl_format/gl_type. */
-uint32_t *pgraph_gl_fi_readback_color(NV2AState *d, uint32_t *out_w,
-                                      uint32_t *out_h)
+/* Frame inspector: readback of a given surface binding, forced to canonical
+ * RGBA8888 regardless of the surface's native GL storage format. Follows the
+ * same FBO bind/readback/restore pattern as surface_download_to_buffer()
+ * above, but always reads GL_RGBA/GL_UNSIGNED_BYTE via glo_readpixels()
+ * instead of the surface's own fmt.gl_format/gl_type. Returns a freshly
+ * g_malloc'd width*height uint32_t buffer (caller frees with g_free), or
+ * NULL if `s` is NULL, not a colour surface, or has no pixels. out_w/out_h
+ * are set only on a non-NULL return. Does not gate on capture state; callers
+ * check xemu_frameinspect_capture_state() themselves. */
+uint32_t *pgraph_gl_fi_readback_surface(NV2AState *d, SurfaceBinding *s,
+                                        uint32_t *out_w, uint32_t *out_h)
 {
-    if (xemu_frameinspect_capture_state() != FI_CAP_CAPTURING) {
+    if (!s || !s->color || !s->width || !s->height) {
         return NULL;
     }
     PGRAPHState *pg = &d->pgraph;
-    PGRAPHGLState *r = pg->gl_renderer_state;
-    SurfaceBinding *s = r->color_binding;
-    if (!s || !s->width || !s->height) {
-        return NULL;
-    }
 
     unsigned int width = s->width, height = s->height;
     pgraph_apply_scaling_factor(pg, &width, &height);
@@ -847,6 +845,20 @@ uint32_t *pgraph_gl_fi_readback_color(NV2AState *d, uint32_t *out_w,
     *out_w = width;
     *out_h = height;
     return buf;
+}
+
+/* Frame inspector: readback of the current colour binding. See
+ * pgraph_gl_fi_readback_surface() above for the readback details; this
+ * wrapper adds the capture-state gate and picks r->color_binding as the
+ * surface. */
+uint32_t *pgraph_gl_fi_readback_color(NV2AState *d, uint32_t *out_w,
+                                      uint32_t *out_h)
+{
+    if (xemu_frameinspect_capture_state() != FI_CAP_CAPTURING) {
+        return NULL;
+    }
+    PGRAPHGLState *r = d->pgraph.gl_renderer_state;
+    return pgraph_gl_fi_readback_surface(d, r->color_binding, out_w, out_h);
 }
 
 static void surface_download(NV2AState *d, SurfaceBinding *surface, bool force)

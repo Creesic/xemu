@@ -24,6 +24,7 @@
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "hw/xbox/nv2a/pgraph/util.h"
 #include "renderer.h"
+#include "xemu-frameinspect-capture.h"
 
 #include <math.h>
 
@@ -401,6 +402,45 @@ void pgraph_gl_sync(NV2AState *d)
 
     qatomic_set(&d->pgraph.sync_pending, false);
     qemu_event_set(&d->pgraph.sync_complete);
+}
+
+/* Frame inspector: record the scanout event -- which surface is actually
+ * displayed, its final pixels, and the PCRTC/PVIDEO state -- as the last
+ * event of the captured frame. Resolves the display surface using the same
+ * recipe as pgraph_gl_sync() above. */
+void pgraph_gl_fi_capture_scanout(NV2AState *d)
+{
+    if (xemu_frameinspect_capture_state() != FI_CAP_CAPTURING) {
+        return;
+    }
+
+    VGADisplayParams vga_display_params;
+    d->vga.get_params(&d->vga, &vga_display_params);
+    uint32_t line_offset = vga_display_params.line_offset;
+
+    uint32_t flags =
+        (d->pvideo.regs[NV_PVIDEO_BUFFER] & NV_PVIDEO_BUFFER_0_USE) ?
+            FI_SCANOUT_PVIDEO : 0;
+
+    SurfaceBinding *surface =
+        pgraph_gl_surface_get_within(d, d->pcrtc.start + line_offset);
+    if (surface == NULL || !surface->color || !surface->width ||
+        !surface->height) {
+        /* Can't resolve the displayed surface: still record the scanout
+         * event, just with no surface/pixels attached (missing, never
+         * wrong). */
+        xemu_frameinspect_capture_scanout(FI_SURFGEN_INVALID,
+                                          (uint32_t)d->pcrtc.start,
+                                          line_offset, flags, NULL, 0, 0);
+        return;
+    }
+
+    uint32_t surface_gen = pgraph_gl_fi_intern_surface(d, surface);
+    uint32_t w = 0, h = 0;
+    uint32_t *rgba = pgraph_gl_fi_readback_surface(d, surface, &w, &h);
+    xemu_frameinspect_capture_scanout(surface_gen, (uint32_t)d->pcrtc.start,
+                                      line_offset, flags, rgba, w, h);
+    g_free(rgba);
 }
 
 int pgraph_gl_get_framebuffer_surface(NV2AState *d)

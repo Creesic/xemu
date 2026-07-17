@@ -273,6 +273,20 @@ uint32_t pgraph_gl_fi_intern_current_zeta(NV2AState *d);
  * a non-NULL return. */
 uint32_t *pgraph_gl_fi_readback_color(NV2AState *d, uint32_t *out_w,
                                       uint32_t *out_h);
+/* Frame inspector: readback of a GIVEN surface binding (not necessarily the
+ * current colour binding), forced to canonical RGBA8888 at surface scale.
+ * Returns a freshly g_malloc'd width*height uint32_t buffer (caller frees
+ * with g_free), or NULL if the surface is NULL, not a colour surface, or has
+ * no pixels. out_w/out_h are set only on a non-NULL return. Does not gate on
+ * capture state; callers check xemu_frameinspect_capture_state()
+ * themselves. */
+uint32_t *pgraph_gl_fi_readback_surface(NV2AState *d, SurfaceBinding *s,
+                                        uint32_t *out_w, uint32_t *out_h);
+/* Frame inspector: record the scanout event (displayed surface + its final
+ * pixels + PCRTC/PVIDEO state) if a capture is in progress. Call at the top
+ * of the FLIP_STALL handler, before the capture module's on_flip publish, so
+ * it lands as the last event of the captured frame. */
+void pgraph_gl_fi_capture_scanout(NV2AState *d);
 void pgraph_gl_sync(NV2AState *d);
 void pgraph_gl_update_entire_memory_buffer(NV2AState *d);
 void pgraph_gl_init_display(NV2AState *d);

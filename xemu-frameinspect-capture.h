@@ -121,6 +121,27 @@ void xemu_frameinspect_capture_clear(uint32_t surface_gen,
 void xemu_frameinspect_capture_blit(uint32_t surface_gen, uint32_t source_addr,
                                     uint32_t dest_addr, uint32_t size,
                                     uint32_t operation);
+/* Flag bits for xemu_frameinspect_capture_scanout()'s `flags` parameter. */
+#define FI_SCANOUT_PVIDEO 0x1u /* PVIDEO overlay was active at scanout time.
+                                * Known v1 limitation: the overlay's content
+                                * is NOT captured or attributed anywhere in
+                                * the capture; this bit only records that it
+                                * was on screen. */
+/* Record the scanout event: which surface was actually displayed, its final
+ * pixels, and the PCRTC/PVIDEO state that produced it. Intended to be called
+ * once, as the last event of a captured frame (see
+ * pgraph_gl_fi_capture_scanout() in the GL renderer, called from
+ * NV097_FLIP_STALL before the capture module's own on_flip publish runs).
+ * `surface_gen` may be FI_SURFGEN_INVALID and `rgba` may be NULL if the
+ * display surface could not be resolved -- the event is still recorded
+ * (missing, never wrong). The appended FI_EV_SCANOUT event's a0/a1/a2 are
+ * pcrtc_start/line_offset/flags; a3 is unused (0). No-op unless capturing.
+ * Caller retains ownership of rgba. */
+void xemu_frameinspect_capture_scanout(uint32_t surface_gen,
+                                       uint32_t pcrtc_start,
+                                       uint32_t line_offset, uint32_t flags,
+                                       const uint32_t *rgba, uint32_t width,
+                                       uint32_t height);
 uint32_t xemu_frameinspect_capture_intern_surface(const FISurfaceKey *k);
 /* The ONE entry point every writer event (batch/clear/blit) calls with the
  * post-writer RGBA8888 image of the affected colour generation. Appends the

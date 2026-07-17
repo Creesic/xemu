@@ -480,6 +480,32 @@ void xemu_frameinspect_capture_attach_pixels(uint32_t surface_gen,
     qemu_mutex_unlock(&fi_lock);
 }
 
+void xemu_frameinspect_capture_scanout(uint32_t surface_gen,
+                                       uint32_t pcrtc_start,
+                                       uint32_t line_offset, uint32_t flags,
+                                       const uint32_t *rgba, uint32_t width,
+                                       uint32_t height)
+{
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        return;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        qemu_mutex_unlock(&fi_lock);
+        return;
+    }
+
+    uint32_t idx = fi_eventlog_append(&fi_cap.events, &fi_cap.budget,
+                                      FI_EV_SCANOUT, surface_gen, pcrtc_start,
+                                      line_offset, flags, 0);
+    fi_cap.last_event = idx;
+    if (idx != FI_EVENT_INVALID && surface_gen != FI_SURFGEN_INVALID && rgba) {
+        fi_feed_colorhist(surface_gen, idx, rgba, width, height);
+    }
+    qemu_mutex_unlock(&fi_lock);
+}
+
 void xemu_frameinspect_capture_methods(uint32_t first_method, bool method_inc,
                                        uint16_t subchannel,
                                        const uint32_t *words, uint32_t n,

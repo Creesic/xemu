@@ -101,6 +101,9 @@ static void pgraph_gl_finalize(NV2AState *d)
 
 static void pgraph_gl_flip_stall(NV2AState *d)
 {
+    /* Capture the scanout before the renderdoc frame terminator marker, so
+     * it can't interleave with the frame boundary that follows. */
+    pgraph_gl_fi_capture_scanout(d);
     NV2A_GL_DFRAME_TERMINATOR();
     glFinish();
 }
