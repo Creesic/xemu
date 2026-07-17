@@ -24,6 +24,7 @@
 #include "widgets.hh"
 #include "monitor.hh"
 #include "debug.hh"
+#include "frame-inspector.hh"
 #include "actions.hh"
 #include "compat.hh"
 #include "update.hh"
@@ -222,6 +223,7 @@ void ShowMainMenu()
             ImGui::MenuItem("Monitor", "~", &monitor_window.is_open);
             ImGui::MenuItem("Audio", NULL, &apu_window.m_is_open);
             ImGui::MenuItem("Video", NULL, &video_window.m_is_open);
+            ImGui::MenuItem("Frame Inspector", NULL, &frame_inspector_window.m_is_open);
             ImGui::Separator();
             if (ImGui::BeginMenu("Call Trace")) {
                 if (!xemu_calltrace_armed) {

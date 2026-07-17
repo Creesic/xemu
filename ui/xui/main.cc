@@ -47,6 +47,7 @@
 #include "notifications.hh"
 #include "monitor.hh"
 #include "debug.hh"
+#include "frame-inspector.hh"
 #include "welcome.hh"
 #include "menubar.hh"
 #include "compat.hh"
@@ -311,6 +312,7 @@ void xemu_hud_update(void)
     apu_window.Draw();
     video_window.Draw();
     compatibility_reporter_window.Draw();
+    frame_inspector_window.Draw();
 #if defined(_WIN32)
     update_window.Draw();
 #endif
