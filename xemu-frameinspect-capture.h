@@ -143,23 +143,13 @@ void xemu_frameinspect_capture_scanout(uint32_t surface_gen,
                                        const uint32_t *rgba, uint32_t width,
                                        uint32_t height);
 uint32_t xemu_frameinspect_capture_intern_surface(const FISurfaceKey *k);
-/* The ONE entry point every writer event (batch/clear/blit) calls with the
- * post-writer RGBA8888 image of the affected colour generation. Appends the
- * matching event (tagged with surface_gen) and feeds the image to that
- * generation's colour history (lazily allocated; the first image seen for a
- * generation becomes its baseline). No-op unless capturing. If surface_gen
- * is invalid or rgba is NULL, the event is still recorded but colour history
- * is skipped (missing data, never wrong data). Caller retains ownership of
- * rgba. */
-void xemu_frameinspect_capture_writer(uint8_t kind, uint32_t surface_gen,
-                                      const uint32_t *rgba, uint32_t width,
-                                      uint32_t height);
 /* Attach a readback image to the most-recently appended event (the one left
- * by begin_batch/clear/blit) without appending a new event of its own. Feeds
- * the image to surface_gen's colour history the same way capture_writer()
- * does. No-op unless capturing, or if there is no pending event, or if
- * surface_gen is invalid, or if rgba is NULL (missing data, never wrong
- * data). Caller retains ownership of rgba. */
+ * by begin_batch/clear/blit/scanout) without appending a new event of its
+ * own. Feeds the image to surface_gen's colour history (lazily allocated;
+ * the first image seen for a generation becomes its baseline). No-op unless
+ * capturing, or if there is no pending event, or if surface_gen is invalid,
+ * or if rgba is NULL (missing data, never wrong data). Caller retains
+ * ownership of rgba. */
 void xemu_frameinspect_capture_attach_pixels(uint32_t surface_gen,
                                              const uint32_t *rgba,
                                              uint32_t width, uint32_t height);

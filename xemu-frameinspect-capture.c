@@ -436,33 +436,6 @@ static void fi_feed_colorhist(uint32_t surface_gen, uint32_t event_idx,
     }
 }
 
-void xemu_frameinspect_capture_writer(uint8_t kind, uint32_t surface_gen,
-                                      const uint32_t *rgba, uint32_t width,
-                                      uint32_t height)
-{
-    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
-        return;
-    }
-    fi_capture_sync_init();
-    qemu_mutex_lock(&fi_lock);
-    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
-        qemu_mutex_unlock(&fi_lock);
-        return;
-    }
-
-    uint32_t idx = fi_eventlog_append(&fi_cap.events, &fi_cap.budget, kind,
-                                      surface_gen, 0, 0, 0, 0);
-    if (surface_gen == FI_SURFGEN_INVALID || !rgba || idx == FI_EVENT_INVALID) {
-        /* Event recorded (if it fit); no pixels to diff -> "missing", never
-         * wrong. */
-        qemu_mutex_unlock(&fi_lock);
-        return;
-    }
-
-    fi_feed_colorhist(surface_gen, idx, rgba, width, height);
-    qemu_mutex_unlock(&fi_lock);
-}
-
 void xemu_frameinspect_capture_attach_pixels(uint32_t surface_gen,
                                              const uint32_t *rgba,
                                              uint32_t width, uint32_t height)
