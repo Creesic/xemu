@@ -21,6 +21,7 @@
 #include "viewport-manager.hh"
 #include "font-manager.hh"
 #include "widgets.hh"
+#include <cstdlib>
 #include <vector>
 extern "C" {
 #include "../../xemu-frameinspect-capture.h"
@@ -75,6 +76,19 @@ static const char *fi_confidence_name(uint16_t confidence)
     case FI_ORIG_LOSTSYNC: return "lostsync";
     default: return "?";
     }
+}
+
+/* Mirrors xemu-frameinspect-tagmap.h's tag encoding (tag==0 => unattributed;
+ * else node_id+1, with the high bit flagging a store that covered only part
+ * of the dword). Defined locally rather than including tagmap.h: that header
+ * is C-only (its calloc()/free() results rely on C's implicit void*
+ * conversion and won't compile as C++) -- the same reasoning
+ * xemu-frameinspect.h documents for mirroring FI_NODE_* instead of including
+ * calltree.h there. */
+static constexpr uint32_t FI_TAG_PARTIAL_BIT = 0x80000000u;
+static uint32_t fi_tag_to_node(uint32_t tag)
+{
+    return (tag & 0x7FFFFFFFu) - 1u;
 }
 
 /* Linear scan for the FIMethodBatch whose batch_event == event_idx (the
@@ -194,30 +208,16 @@ static void fi_methods_tab(FrameInspectorWindow *w, const FICapture *cap,
     ImGui::PopFont();
 }
 
-/* Walks the call chain from the selected Methods-tab record's writer_node up
- * to the root, one row per frame (innermost/writer first). Resolves each
- * node via xemu_frameinspect_node_info(), which reads the LIVE Plan-1 call
- * tree -- valid only until the inspector's capture is re-armed. */
-static void fi_origin_tab(const FICapture *cap, int selected_rec)
+/* Walks a call chain from start_node up to the root, one row per frame
+ * (innermost/writer first). Resolves each node via
+ * xemu_frameinspect_node_info(), which reads the LIVE Plan-1 call tree --
+ * valid only until the inspector's capture is re-armed. Shared by the
+ * Origin tab (Task 4, walking a method record's writer_node) and the
+ * Address Lookup panel (Task 6, walking a tag map hit's node). */
+static void fi_render_call_chain(uint32_t start_node)
 {
-    ImGui::TextUnformatted("Call-path origin");
-    ImGui::SameLine();
-    HelpMarker("Origin resolves against the live call tree; only valid "
-              "before re-arming the inspector.");
-    ImGui::Separator();
-
-    if (selected_rec < 0 || (uint32_t)selected_rec >= cap->methods.num_recs) {
-        ImGui::TextDisabled("Origin unavailable (unattributed).");
-        return;
-    }
-    const FIMethodRec *rec = &cap->methods.recs[selected_rec];
-    if (rec->confidence != FI_ORIG_ATTRIBUTED) {
-        ImGui::TextDisabled("Origin unavailable (unattributed).");
-        return;
-    }
-
     ImGui::PushFont(g_font_mgr.m_fixed_width_font);
-    uint32_t node = rec->writer_node;
+    uint32_t node = start_node;
     if (node == FI_NODE_ROOT) {
         ImGui::TextDisabled(
             "Origin is the root frame (call path not tracked further).");
@@ -253,6 +253,29 @@ static void fi_origin_tab(const FICapture *cap, int selected_rec)
         ImGui::Unindent();
     }
     ImGui::PopFont();
+}
+
+/* Resolves the selected Methods-tab record's writer_node and renders its
+ * call chain via fi_render_call_chain(). */
+static void fi_origin_tab(const FICapture *cap, int selected_rec)
+{
+    ImGui::TextUnformatted("Call-path origin");
+    ImGui::SameLine();
+    HelpMarker("Origin resolves against the live call tree; only valid "
+              "before re-arming the inspector.");
+    ImGui::Separator();
+
+    if (selected_rec < 0 || (uint32_t)selected_rec >= cap->methods.num_recs) {
+        ImGui::TextDisabled("Origin unavailable (unattributed).");
+        return;
+    }
+    const FIMethodRec *rec = &cap->methods.recs[selected_rec];
+    if (rec->confidence != FI_ORIG_ATTRIBUTED) {
+        ImGui::TextDisabled("Origin unavailable (unattributed).");
+        return;
+    }
+
+    fi_render_call_chain(rec->writer_node);
 }
 
 static void fi_state_tab(const FICapture *cap, int event_idx)
@@ -404,6 +427,58 @@ static void fi_pixels_tab(const FICapture *cap, int pinned_pixel)
         }
         ImGui::EndTable();
     }
+}
+
+/* Task 6: manual "who wrote this guest physical address" lookup. Unlike the
+ * rest of the window, this reads module globals directly
+ * (xemu_frameinspect_lookup_tag() / xemu_frameinspect_node_info(), the live
+ * tag map + call tree) rather than the acquired FICapture snapshot -- so it
+ * is not gated on cap and not reset when a new capture publishes. Same
+ * re-arm caveat as the Origin tab: valid only until the inspector is next
+ * armed. */
+static void fi_address_lookup_panel(FrameInspectorWindow *w)
+{
+    ImGui::TextUnformatted("Who wrote a guest physical address");
+    ImGui::SameLine();
+    HelpMarker("Resolves against the live tag map + call tree; valid only "
+              "before re-arming the inspector. Address is guest physical "
+              "(RAM-relative).");
+
+    bool submit = ImGui::InputText(
+        "Guest addr (hex)", w->m_lookup_addr, sizeof(w->m_lookup_addr),
+        ImGuiInputTextFlags_CharsHexadecimal |
+            ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    if (ImGui::Button("Lookup")) {
+        submit = true;
+    }
+
+    if (submit) {
+        uint64_t addr = strtoull(w->m_lookup_addr, nullptr, 16);
+        w->m_lookup_result_addr = addr;
+        w->m_lookup_tag = xemu_frameinspect_lookup_tag(addr);
+        w->m_lookup_done = true;
+    }
+
+    if (!w->m_lookup_done) {
+        return;
+    }
+
+    ImGui::Text("Address: 0x%llx",
+               (unsigned long long)w->m_lookup_result_addr);
+    if (w->m_lookup_tag == 0) {
+        ImGui::TextDisabled(
+            "unattributed (no tagged writer, or written before arming)");
+        return;
+    }
+
+    bool partial = (w->m_lookup_tag & FI_TAG_PARTIAL_BIT) != 0;
+    uint32_t node_id = fi_tag_to_node(w->m_lookup_tag);
+    ImGui::TextColored(partial ? ImVec4(0.9f, 0.9f, 0.2f, 1) :
+                                 ImVec4(0.3f, 0.9f, 0.3f, 1),
+                       "%s (node %u)", partial ? "partial" : "attributed",
+                       node_id);
+    fi_render_call_chain(node_id);
 }
 
 /* (Re)builds m_frame_tex from cap->hist[gen] reconstructed at event_index.
@@ -728,6 +803,10 @@ void FrameInspectorWindow::Draw()
             ImGui::TextDisabled("Select an event");
         }
         ImGui::EndChild();
+
+        if (ImGui::CollapsingHeader("Address Lookup")) {
+            fi_address_lookup_panel(this);
+        }
     }
     ImGui::End();
 

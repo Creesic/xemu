@@ -50,6 +50,16 @@ public:
      * event (the default). Reset to -1 whenever a new capture publishes. */
     int m_timeline_idx = -1;
 
+    /* Address Lookup panel (Task 6): hex input buffer (digits only -- see
+     * ImGuiInputTextFlags_CharsHexadecimal) and the last lookup's result.
+     * m_lookup_tag/node_info() read module globals (the live tag map / call
+     * tree), not this capture's snapshot, so this state is not reset on a
+     * new capture the way the other per-capture fields above are. */
+    char m_lookup_addr[19] = "";
+    uint64_t m_lookup_result_addr = 0;
+    uint32_t m_lookup_tag = 0;
+    bool m_lookup_done = false;
+
     void Draw();
     void ReleaseTexture();
     /* (Re)builds m_frame_tex from cap->hist[gen] reconstructed at
