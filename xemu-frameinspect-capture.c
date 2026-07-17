@@ -70,6 +70,10 @@ static void fi_capture_reset(FICapture *c)
         fi_budget_release(&c->budget, c->methods_bytes);
     }
     fi_methodlog_free(&c->methods);
+    if (c->batch_res_bytes) {
+        fi_budget_release(&c->budget, c->batch_res_bytes);
+    }
+    free(c->batch_res);
     memset(c, 0, sizeof(*c));
 }
 
@@ -246,11 +250,11 @@ void xemu_frameinspect_capture_shutdown(void)
 
 FICaptureState xemu_frameinspect_capture_state(void)
 {
-    fi_capture_sync_init();
-    qemu_mutex_lock(&fi_lock);
-    FICaptureState state = qatomic_read(&fi_state);
-    qemu_mutex_unlock(&fi_lock);
-    return state;
+    /* All fi_state writes are already qatomic_set under fi_lock; reading it
+     * needs no lock (and no sync_init, which only exists to lazily init that
+     * lock). This removes the residual per-draw/clear/blit locked call from
+     * the hot path when idle. */
+    return qatomic_read(&fi_state);
 }
 
 uint32_t xemu_frameinspect_capture_intern_surface(const FISurfaceKey *k)
@@ -533,6 +537,69 @@ void xemu_frameinspect_capture_methods(uint32_t first_method, bool method_inc,
     qemu_mutex_unlock(&fi_lock);
 }
 
+uint32_t xemu_frameinspect_capture_resource(uint32_t kind, const void *data,
+                                            uint32_t len, uint64_t meta)
+{
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        return FI_RES_INVALID;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        qemu_mutex_unlock(&fi_lock);
+        return FI_RES_INVALID;
+    }
+    uint32_t id = fi_resources_intern(&fi_cap.resources, &fi_cap.budget, kind,
+                                      data, len, meta);
+    if (id == FI_RES_INVALID) {
+        /* The pool already flags itself truncated on every failure path;
+         * mirror that onto the capture-wide flag too. */
+        fi_cap.truncated = true;
+    }
+    qemu_mutex_unlock(&fi_lock);
+    return id;
+}
+
+void xemu_frameinspect_capture_batch_resource_ref(uint32_t res_id)
+{
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        return;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    if (qatomic_read(&fi_state) == FI_CAP_CAPTURING && fi_cap.batch_open &&
+        fi_cap.open_batch_event != FI_EVENT_INVALID &&
+        res_id != FI_RES_INVALID) {
+        if (fi_cap.num_batch_res >= fi_cap.cap_batch_res) {
+            uint32_t nc = fi_cap.cap_batch_res ? fi_cap.cap_batch_res * 2 : 256;
+            uint64_t old_bytes =
+                (uint64_t)fi_cap.cap_batch_res * sizeof(FIBatchResRef);
+            uint64_t new_bytes = (uint64_t)nc * sizeof(FIBatchResRef);
+            if (fi_budget_try(&fi_cap.budget, new_bytes - old_bytes)) {
+                FIBatchResRef *nb = (FIBatchResRef *)realloc(
+                    fi_cap.batch_res, (size_t)new_bytes);
+                if (nb) {
+                    fi_cap.batch_res = nb;
+                    fi_cap.cap_batch_res = nc;
+                    fi_cap.batch_res_bytes += new_bytes - old_bytes;
+                } else {
+                    fi_budget_release(&fi_cap.budget, new_bytes - old_bytes);
+                    fi_cap.truncated = true;
+                }
+            } else {
+                fi_cap.truncated = true;
+            }
+        }
+        if (fi_cap.num_batch_res < fi_cap.cap_batch_res) {
+            fi_cap.batch_res[fi_cap.num_batch_res].event =
+                fi_cap.open_batch_event;
+            fi_cap.batch_res[fi_cap.num_batch_res].res_id = res_id;
+            fi_cap.num_batch_res++;
+        }
+    }
+    qemu_mutex_unlock(&fi_lock);
+}
+
 const FICapture *xemu_frameinspect_capture_acquire(void)
 {
     fi_capture_sync_init();
@@ -572,8 +639,9 @@ char *xemu_frameinspect_capture_summary(void)
         return g_strdup("Frame inspector: no capture");
     }
     char *summary = g_strdup_printf(
-        "Captured frame: %u events, %u surfaces, %u methods%s", c->events.count,
-        c->surfaces.num_gens, c->methods.num_recs,
+        "Captured frame: %u events, %u surfaces, %u methods, %u resources%s",
+        c->events.count, c->surfaces.num_gens, c->methods.num_recs,
+        c->resources.num_res,
         (c->truncated || c->events.truncated || c->surfaces.truncated ||
          c->resources.truncated || c->methods.truncated) ? " [TRUNCATED]" : "");
     xemu_frameinspect_capture_release(c);

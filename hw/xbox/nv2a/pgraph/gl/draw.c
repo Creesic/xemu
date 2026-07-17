@@ -180,6 +180,70 @@ void pgraph_gl_draw_begin(NV2AState *d)
                                       : FI_SURFGEN_INVALID);
 
     pgraph_gl_bind_textures(d);
+
+    if (xemu_frameinspect_capture_state() == FI_CAP_CAPTURING) {
+        /* Snapshot the full PGRAPH register file and the textures this batch
+         * consumes (now that pgraph_gl_bind_textures() has resolved texture
+         * state), content-hash-deduplicated into fi_cap.resources and
+         * referenced from this batch. One 32 KiB register hash per draw is
+         * acceptable since capture only runs for a single frame. */
+        uint32_t regs_res = xemu_frameinspect_capture_resource(
+            FI_RESK_REGS, pg->regs_, sizeof(pg->regs_), 0);
+        xemu_frameinspect_capture_batch_resource_ref(regs_res);
+
+        for (int i = 0; i < NV2A_MAX_TEXTURES; i++) {
+            /* Mirror pgraph_gl_bind_textures()'s enable check exactly. */
+            if (!pgraph_is_texture_enabled(pg, i)) {
+                continue;
+            }
+
+            TextureShape state = pgraph_get_texture_shape(pg, i);
+            hwaddr texture_vram_offset, palette_vram_offset;
+            size_t length, palette_length;
+            length = pgraph_get_texture_length(pg, &state);
+            texture_vram_offset = pgraph_get_texture_phys_addr(pg, i);
+            palette_vram_offset = pgraph_get_texture_palette_phys_addr_length(
+                pg, i, &palette_length);
+
+            if (length == 0 || length > (16u << 20)) {
+                /* Absurd/zero length: skip rather than snapshot garbage.
+                 * Missing, never wrong. */
+                continue;
+            }
+
+            SurfaceBinding *surface =
+                pgraph_gl_surface_get(d, texture_vram_offset);
+            bool rt_backed = surface &&
+                pgraph_gl_check_surface_to_texture_compatibility(surface,
+                                                                  &state);
+
+            uint32_t tex_res;
+            if (rt_backed) {
+                /* Rendered surface: its guest-RAM bytes are stale/invalid, so
+                 * record a dependency reference instead of reading VRAM. */
+                tex_res = xemu_frameinspect_capture_resource(
+                    FI_RESK_TEXTURE_RTREF, NULL, 0, surface->vram_addr);
+                xemu_frameinspect_capture_batch_resource_ref(tex_res);
+            } else {
+                uint64_t meta = ((uint64_t)state.color_format << 32) |
+                                 ((uint64_t)state.width << 16) | state.height;
+                tex_res = xemu_frameinspect_capture_resource(
+                    FI_RESK_TEXTURE, d->vram_ptr + texture_vram_offset,
+                    (uint32_t)length, meta);
+                xemu_frameinspect_capture_batch_resource_ref(tex_res);
+
+                bool is_indexed = (state.color_format ==
+                    NV097_SET_TEXTURE_FORMAT_COLOR_SZ_I8_A8R8G8B8);
+                if (is_indexed && palette_length > 0) {
+                    uint32_t pal_res = xemu_frameinspect_capture_resource(
+                        FI_RESK_PALETTE, d->vram_ptr + palette_vram_offset,
+                        (uint32_t)palette_length, palette_vram_offset);
+                    xemu_frameinspect_capture_batch_resource_ref(pal_res);
+                }
+            }
+        }
+    }
+
     pgraph_gl_bind_shaders(pg);
 
     glColorMask(mask_red, mask_green, mask_blue, mask_alpha);

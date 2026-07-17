@@ -49,6 +49,24 @@ typedef enum {
     FI_CAP_FLIP_FAILED,
 } FICaptureFlipResult;
 
+/* Resource kinds recorded via xemu_frameinspect_capture_resource(). RTREF is
+ * a dependency reference to a rendered surface (not guest RAM): len is 0 and
+ * meta is the surface's vram addr, since the surface's RAM bytes are
+ * stale/invalid while it's a render target. */
+enum {
+    FI_RESK_REGS = 1,
+    FI_RESK_TEXTURE,
+    FI_RESK_PALETTE,
+    FI_RESK_TEXTURE_RTREF,
+};
+
+/* One batch->resource reference: `event` is the FI_EV_BATCH event index the
+ * resource belongs to, `res_id` indexes FICapture.resources. */
+typedef struct FIBatchResRef {
+    uint32_t event;
+    uint32_t res_id;
+} FIBatchResRef;
+
 typedef struct FICapture {
     FISurfaceStore surfaces;
     FIResourcePool resources;
@@ -72,6 +90,13 @@ typedef struct FICapture {
                                * (batch/clear/blit), or FI_EVENT_INVALID;
                                * used by attach_pixels() to find the event
                                * to feed the colour history for. */
+    FIBatchResRef *batch_res; /* growable [cap_batch_res], batch->resource
+                               * references appended by
+                               * capture_batch_resource_ref() */
+    uint32_t num_batch_res, cap_batch_res;
+    uint64_t batch_res_bytes; /* total budget charged for `batch_res`,
+                               * released in full on reset, symmetric with
+                               * fi_budget_try (like methods_bytes) */
     uint32_t refcount;        /* protected by the capture-module lock */
     bool batch_open;
     bool truncated;
@@ -134,6 +159,18 @@ void xemu_frameinspect_capture_methods(uint32_t first_method, bool method_inc,
                                        const uint32_t *words, uint32_t n,
                                        uint32_t n_labeled,
                                        uint64_t phys_base);
+/* Intern a content-hash-deduplicated resource snapshot (register file,
+ * texture, palette, or an RTREF dependency reference) into the capture's
+ * resource pool. Returns its id, or FI_RES_INVALID if not capturing or the
+ * pool is full/truncated. No-op (returns FI_RES_INVALID) unless capturing
+ * (lock-free fast-path). */
+uint32_t xemu_frameinspect_capture_resource(uint32_t kind, const void *data,
+                                            uint32_t len, uint64_t meta);
+/* Reference a resource (by id, as returned by capture_resource()) from the
+ * currently open batch, so the UI can join batch -> resources. No-op unless
+ * capturing, no batch is open, or res_id is FI_RES_INVALID (lock-free
+ * fast-path). */
+void xemu_frameinspect_capture_batch_resource_ref(uint32_t res_id);
 /* Published immutable capture for the UI (Plan 3); caller must release it. */
 const FICapture *xemu_frameinspect_capture_acquire(void);
 void xemu_frameinspect_capture_release(const FICapture *capture);
