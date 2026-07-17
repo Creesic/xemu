@@ -123,10 +123,16 @@ void xemu_frameinspect_capture_attach_pixels(uint32_t surface_gen,
  * subsequent words are at first_method + 4*i if method_inc, else all at
  * first_method (non-incrementing method type). `phys_base` is the guest
  * physical (vram-relative) address of word 0; word i is at phys_base + 4*i.
- * No-op unless capturing (lock-free fast-path). */
+ * Words 0..n_labeled-1 are parameters of first_method; words n_labeled..n-1
+ * are extra dwords consumed by pgraph_method's lookahead squash (raw
+ * pushbuffer command headers/params belonging to later commands, not
+ * parameters of first_method) and are logged as FI_METHOD_RAW_WORD instead
+ * of being mislabeled with fabricated method/param values. No-op unless
+ * capturing (lock-free fast-path). */
 void xemu_frameinspect_capture_methods(uint32_t first_method, bool method_inc,
                                        uint16_t subchannel,
                                        const uint32_t *words, uint32_t n,
+                                       uint32_t n_labeled,
                                        uint64_t phys_base);
 /* Published immutable capture for the UI (Plan 3); caller must release it. */
 const FICapture *xemu_frameinspect_capture_acquire(void);

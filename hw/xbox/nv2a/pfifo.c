@@ -348,10 +348,20 @@ static void pfifo_run_pusher(NV2AState *d)
              * (non-capturing) case, so this is safe to call unconditionally
              * without adding a locked capture_state() check to the hot
              * per-burst path. */
+            /* pgraph_method()'s lookahead can squash a following command
+             * sequence into num_words_processed (see pgraph.c's "Squash
+             * repeated BEGIN,DRAW_ARRAYS,END"), so num_words_processed may
+             * exceed the current command's own parameter count. Only the
+             * first n_labeled words are actual parameters of `method`; any
+             * tail beyond that is raw pushbuffer dwords belonging to later
+             * commands and must not be labeled as such. */
+            uint32_t n_labeled = MIN((uint32_t)num_words_processed,
+                (uint32_t)MIN(method_count, num_words_available));
             xemu_frameinspect_capture_methods(
                 method,
                 method_type == NV_PFIFO_CACHE1_DMA_STATE_METHOD_TYPE_INC,
                 method_subchannel, word_ptr, (uint32_t)num_words_processed,
+                n_labeled,
                 (uint64_t)((uint8_t *)word_ptr - d->vram_ptr));
 
             dma_get_v += (num_words_processed-1)*4;

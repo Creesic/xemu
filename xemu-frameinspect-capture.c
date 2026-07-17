@@ -479,6 +479,7 @@ void xemu_frameinspect_capture_attach_pixels(uint32_t surface_gen,
 void xemu_frameinspect_capture_methods(uint32_t first_method, bool method_inc,
                                        uint16_t subchannel,
                                        const uint32_t *words, uint32_t n,
+                                       uint32_t n_labeled,
                                        uint64_t phys_base)
 {
     if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
@@ -506,7 +507,9 @@ void xemu_frameinspect_capture_methods(uint32_t first_method, bool method_inc,
 
     uint32_t appended = 0;
     for (uint32_t i = 0; i < n; i++) {
-        uint32_t method_i = method_inc ? first_method + 4 * i : first_method;
+        uint32_t method_i = i < n_labeled ?
+            (method_inc ? first_method + 4 * i : first_method) :
+            FI_METHOD_RAW_WORD;
         uint64_t phys_i = phys_base + 4ull * i;
         uint32_t tag = xemu_frameinspect_lookup_tag(phys_i);
         uint16_t confidence = tag == 0 ? FI_ORIG_UNATTRIBUTED :

@@ -28,6 +28,7 @@
 #include <string.h>
 
 #define FI_METHOD_INVALID     0xFFFFFFFFu
+#define FI_METHOD_RAW_WORD 0xFFFFu  /* record is a raw pushbuffer dword consumed by lookahead, not a decoded method; param holds the raw word */
 #define FI_METHODLOG_CAP       (1u << 22)
 #define FI_METHODLOG_BATCH_CAP (1u << 18)
 
