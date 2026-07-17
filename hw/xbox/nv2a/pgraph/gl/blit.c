@@ -231,9 +231,12 @@ void pgraph_gl_image_blit(NV2AState *d)
     if (xemu_frameinspect_capture_state() == FI_CAP_CAPTURING) {
         /* NOTE: reads back the CURRENT colour binding, which may not be
          * surf_dest (the blit destination) if it isn't currently bound as
-         * the colour render target. In that case this attaches no pixels
-         * (or the wrong generation's, which attach_pixels rejects since the
-         * gen won't match) -- missing, never wrong. */
+         * the colour render target. attach_pixels has no gen-comparison: it
+         * feeds whatever gen is passed here, whether or not it matches the
+         * blit destination. In practice this just means the readback may
+         * capture the wrong surface's pixels (or none), which degrades to
+         * an empty/near-empty diff -- a known blit-readback limitation, not
+         * a protective rejection. */
         uint32_t w = 0, h = 0;
         uint32_t *rgba = pgraph_gl_fi_readback_color(d, &w, &h);
         xemu_frameinspect_capture_attach_pixels(

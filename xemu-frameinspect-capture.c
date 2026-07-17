@@ -265,12 +265,9 @@ bool xemu_frameinspect_capture_begin_batch(uint32_t surface_gen,
     uint32_t idx = fi_eventlog_append(&fi_cap.events, &fi_cap.budget,
                                       FI_EV_BATCH, surface_gen,
                                       zeta_surface_gen, 0, 0, 0);
-    bool appended = idx != FI_EVENT_INVALID;
-    if (appended) {
-        fi_cap.last_event = idx;
-    }
+    fi_cap.last_event = idx;
     qemu_mutex_unlock(&fi_lock);
-    return appended;
+    return idx != FI_EVENT_INVALID;
 }
 
 void xemu_frameinspect_capture_end_batch(void)
@@ -296,9 +293,10 @@ void xemu_frameinspect_capture_split_batch(void)
     fi_capture_sync_init();
     qemu_mutex_lock(&fi_lock);
     if (qatomic_read(&fi_state) == FI_CAP_CAPTURING && fi_cap.batch_open) {
-        fi_eventlog_append(&fi_cap.events, &fi_cap.budget, FI_EV_BATCH,
-                           fi_cap.open_batch_gen,
-                           fi_cap.open_batch_zeta_gen, 0, 0, 0);
+        uint32_t idx = fi_eventlog_append(&fi_cap.events, &fi_cap.budget,
+                                          FI_EV_BATCH, fi_cap.open_batch_gen,
+                                          fi_cap.open_batch_zeta_gen, 0, 0, 0);
+        fi_cap.last_event = idx;
     }
     qemu_mutex_unlock(&fi_lock);
 }
@@ -316,9 +314,7 @@ void xemu_frameinspect_capture_clear(uint32_t surface_gen,
         uint32_t idx = fi_eventlog_append(&fi_cap.events, &fi_cap.budget,
                                           FI_EV_CLEAR, surface_gen,
                                           zeta_surface_gen, parameter, 0, 0);
-        if (idx != FI_EVENT_INVALID) {
-            fi_cap.last_event = idx;
-        }
+        fi_cap.last_event = idx;
     }
     qemu_mutex_unlock(&fi_lock);
 }
@@ -336,9 +332,7 @@ void xemu_frameinspect_capture_blit(uint32_t surface_gen, uint32_t source_addr,
         uint32_t idx = fi_eventlog_append(&fi_cap.events, &fi_cap.budget,
                                           FI_EV_BLIT, surface_gen, source_addr,
                                           dest_addr, size, operation);
-        if (idx != FI_EVENT_INVALID) {
-            fi_cap.last_event = idx;
-        }
+        fi_cap.last_event = idx;
     }
     qemu_mutex_unlock(&fi_lock);
 }
