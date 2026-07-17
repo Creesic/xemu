@@ -136,6 +136,14 @@ void pgraph_gl_clear_surface(NV2AState *d, uint32_t parameter)
                    : FI_SURFGEN_INVALID,
         parameter);
 
+    if (xemu_frameinspect_capture_state() == FI_CAP_CAPTURING) {
+        uint32_t w = 0, h = 0;
+        uint32_t *rgba = pgraph_gl_fi_readback_color(d, &w, &h);
+        xemu_frameinspect_capture_attach_pixels(
+            pgraph_gl_fi_intern_current_color(d), rgba, w, h);
+        g_free(rgba);
+    }
+
     pg->clearing = false;
 }
 
@@ -388,6 +396,13 @@ void pgraph_gl_draw_end(NV2AState *d)
         r->zeta_binding->draw_time = pg->draw_time;
     }
 
+    if (xemu_frameinspect_capture_state() == FI_CAP_CAPTURING) {
+        uint32_t w = 0, h = 0;
+        uint32_t *rgba = pgraph_gl_fi_readback_color(d, &w, &h);
+        xemu_frameinspect_capture_attach_pixels(
+            pgraph_gl_fi_intern_current_color(d), rgba, w, h);
+        g_free(rgba);
+    }
     xemu_frameinspect_capture_end_batch();
 
     pgraph_gl_set_surface_dirty(pg, color_write, depth_test || stencil_test);

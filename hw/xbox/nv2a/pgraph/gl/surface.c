@@ -822,6 +822,16 @@ uint32_t *pgraph_gl_fi_readback_color(NV2AState *d, uint32_t *out_w,
     uint32_t *buf =
         (uint32_t *)g_malloc((size_t)width * height * sizeof(uint32_t));
 
+    /* Detach whatever the FBO currently has bound (mirrors
+     * surface_download_to_buffer()'s discipline) so a stale depth/stencil
+     * attachment from the last draw can't make the framebuffer incomplete
+     * or leave depth writes enabled while we read colour. */
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                           0, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D,
+                           0, 0);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
+                           GL_TEXTURE_2D, 0, 0);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
                            s->gl_buffer, 0);
     assert(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
@@ -830,6 +840,8 @@ uint32_t *pgraph_gl_fi_readback_color(NV2AState *d, uint32_t *out_w,
                   width * sizeof(uint32_t), width, height, false, buf);
 
     /* Re-bind original framebuffer target */
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                           0, 0);
     bind_current_surface(d);
 
     *out_w = width;

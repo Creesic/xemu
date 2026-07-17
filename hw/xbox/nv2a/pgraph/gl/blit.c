@@ -227,4 +227,17 @@ void pgraph_gl_image_blit(NV2AState *d)
                                    source_addr + source_offset,
                                    dest_addr, clipped_dest_size,
                                    image_blit->operation);
+
+    if (xemu_frameinspect_capture_state() == FI_CAP_CAPTURING) {
+        /* NOTE: reads back the CURRENT colour binding, which may not be
+         * surf_dest (the blit destination) if it isn't currently bound as
+         * the colour render target. In that case this attaches no pixels
+         * (or the wrong generation's, which attach_pixels rejects since the
+         * gen won't match) -- missing, never wrong. */
+        uint32_t w = 0, h = 0;
+        uint32_t *rgba = pgraph_gl_fi_readback_color(d, &w, &h);
+        xemu_frameinspect_capture_attach_pixels(
+            pgraph_gl_fi_intern_current_color(d), rgba, w, h);
+        g_free(rgba);
+    }
 }

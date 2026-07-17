@@ -57,6 +57,10 @@ typedef struct FICapture {
     uint32_t hist_count;
     uint32_t open_batch_gen;  /* surface gen of the batch currently open, or INVALID */
     uint32_t open_batch_zeta_gen;
+    uint32_t last_event;      /* index of the most-recently appended event
+                               * (batch/clear/blit), or FI_EVENT_INVALID;
+                               * used by attach_pixels() to find the event
+                               * to feed the colour history for. */
     uint32_t refcount;        /* protected by the capture-module lock */
     bool batch_open;
     bool truncated;
@@ -93,6 +97,15 @@ uint32_t xemu_frameinspect_capture_intern_surface(const FISurfaceKey *k);
 void xemu_frameinspect_capture_writer(uint8_t kind, uint32_t surface_gen,
                                       const uint32_t *rgba, uint32_t width,
                                       uint32_t height);
+/* Attach a readback image to the most-recently appended event (the one left
+ * by begin_batch/clear/blit) without appending a new event of its own. Feeds
+ * the image to surface_gen's colour history the same way capture_writer()
+ * does. No-op unless capturing, or if there is no pending event, or if
+ * surface_gen is invalid, or if rgba is NULL (missing data, never wrong
+ * data). Caller retains ownership of rgba. */
+void xemu_frameinspect_capture_attach_pixels(uint32_t surface_gen,
+                                             const uint32_t *rgba,
+                                             uint32_t width, uint32_t height);
 /* Published immutable capture for the UI (Plan 3); caller must release it. */
 const FICapture *xemu_frameinspect_capture_acquire(void);
 void xemu_frameinspect_capture_release(const FICapture *capture);
