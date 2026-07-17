@@ -96,22 +96,23 @@ bool xemu_frameinspect_capture_arm(uint64_t ram_size)
 {
     fi_capture_sync_init();
     qemu_mutex_lock(&fi_lock);
-    if (fi_state != FI_CAP_IDLE && fi_state != FI_CAP_DONE) {
+    if (qatomic_read(&fi_state) != FI_CAP_IDLE &&
+        qatomic_read(&fi_state) != FI_CAP_DONE) {
         qemu_mutex_unlock(&fi_lock);
         return false;
     }
-    fi_state = FI_CAP_ARMING;
+    qatomic_set(&fi_state, FI_CAP_ARMING);
     /* Lead-in: enable Plan-1 guest instrumentation now so writes during the
      * frame before the captured frame are tagged. */
     xemu_frameinspect_arm(ram_size);
     bool armed = xemu_frameinspect_is_armed();
 
-    if (fi_state == FI_CAP_ARMING && armed) {
-        fi_state = FI_CAP_ARMED;
+    if (qatomic_read(&fi_state) == FI_CAP_ARMING && armed) {
+        qatomic_set(&fi_state, FI_CAP_ARMED);
         qemu_mutex_unlock(&fi_lock);
         return true;
     }
-    fi_state = FI_CAP_IDLE;
+    qatomic_set(&fi_state, FI_CAP_IDLE);
     if (armed) {
         xemu_frameinspect_disarm();
     }
@@ -124,25 +125,26 @@ FICaptureFlipResult xemu_frameinspect_capture_on_flip(bool opengl_active)
     fi_capture_sync_init();
     qemu_mutex_lock(&fi_lock);
     if (!opengl_active &&
-        (fi_state == FI_CAP_ARMED || fi_state == FI_CAP_CAPTURING)) {
-        if (fi_state == FI_CAP_CAPTURING) {
+        (qatomic_read(&fi_state) == FI_CAP_ARMED ||
+         qatomic_read(&fi_state) == FI_CAP_CAPTURING)) {
+        if (qatomic_read(&fi_state) == FI_CAP_CAPTURING) {
             fi_capture_reset(&fi_cap);
         }
-        fi_state = FI_CAP_IDLE;
+        qatomic_set(&fi_state, FI_CAP_IDLE);
         xemu_frameinspect_disarm();
         qemu_mutex_unlock(&fi_lock);
         return FI_CAP_FLIP_FAILED;
     }
-    switch (fi_state) {
+    switch (qatomic_read(&fi_state)) {
     case FI_CAP_ARMED:
         /* First flip after arming: the captured frame starts now. */
         if (!fi_capture_alloc(&fi_cap)) {
-            fi_state = FI_CAP_IDLE;
+            qatomic_set(&fi_state, FI_CAP_IDLE);
             xemu_frameinspect_disarm();
             qemu_mutex_unlock(&fi_lock);
             return FI_CAP_FLIP_FAILED;
         }
-        fi_state = FI_CAP_CAPTURING;
+        qatomic_set(&fi_state, FI_CAP_CAPTURING);
         qemu_mutex_unlock(&fi_lock);
         return FI_CAP_FLIP_NONE;
     case FI_CAP_CAPTURING: {
@@ -150,7 +152,7 @@ FICaptureFlipResult xemu_frameinspect_capture_on_flip(bool opengl_active)
         FICapture *done = (FICapture *)malloc(sizeof(FICapture));
         if (!done) {
             fi_capture_reset(&fi_cap);
-            fi_state = FI_CAP_IDLE;
+            qatomic_set(&fi_state, FI_CAP_IDLE);
             xemu_frameinspect_disarm();
             qemu_mutex_unlock(&fi_lock);
             return FI_CAP_FLIP_FAILED;
@@ -161,7 +163,7 @@ FICaptureFlipResult xemu_frameinspect_capture_on_flip(bool opengl_active)
         FICapture *old = fi_published;
         fi_published = done;
         bool destroy_old = old && --old->refcount == 0;
-        fi_state = FI_CAP_PAUSE_PENDING;
+        qatomic_set(&fi_state, FI_CAP_PAUSE_PENDING);
         xemu_frameinspect_disarm();     /* end lead-in instrumentation */
         qemu_mutex_unlock(&fi_lock);
         if (destroy_old) {
@@ -179,9 +181,9 @@ bool xemu_frameinspect_capture_pause_complete(void)
 {
     fi_capture_sync_init();
     qemu_mutex_lock(&fi_lock);
-    bool pending = fi_state == FI_CAP_PAUSE_PENDING;
-    if (fi_state == FI_CAP_PAUSE_PENDING) {
-        fi_state = FI_CAP_DONE;
+    bool pending = qatomic_read(&fi_state) == FI_CAP_PAUSE_PENDING;
+    if (qatomic_read(&fi_state) == FI_CAP_PAUSE_PENDING) {
+        qatomic_set(&fi_state, FI_CAP_DONE);
     }
     qemu_mutex_unlock(&fi_lock);
     return pending;
@@ -191,14 +193,15 @@ bool xemu_frameinspect_capture_cancel(void)
 {
     fi_capture_sync_init();
     qemu_mutex_lock(&fi_lock);
-    bool active = fi_state == FI_CAP_ARMING || fi_state == FI_CAP_ARMED ||
-                  fi_state == FI_CAP_CAPTURING ||
-                  fi_state == FI_CAP_PAUSE_PENDING;
-    if (fi_state == FI_CAP_CAPTURING) {
+    bool active = qatomic_read(&fi_state) == FI_CAP_ARMING ||
+                  qatomic_read(&fi_state) == FI_CAP_ARMED ||
+                  qatomic_read(&fi_state) == FI_CAP_CAPTURING ||
+                  qatomic_read(&fi_state) == FI_CAP_PAUSE_PENDING;
+    if (qatomic_read(&fi_state) == FI_CAP_CAPTURING) {
         fi_capture_reset(&fi_cap);
     }
     if (active) {
-        fi_state = FI_CAP_IDLE;
+        qatomic_set(&fi_state, FI_CAP_IDLE);
         xemu_frameinspect_disarm();
     }
     qemu_mutex_unlock(&fi_lock);
@@ -213,7 +216,7 @@ void xemu_frameinspect_capture_shutdown(void)
     FICapture *published = fi_published;
     fi_published = NULL;
     bool destroy = published && --published->refcount == 0;
-    fi_state = FI_CAP_IDLE;
+    qatomic_set(&fi_state, FI_CAP_IDLE);
     qemu_mutex_unlock(&fi_lock);
     if (destroy) {
         fi_capture_destroy(published);
@@ -224,16 +227,19 @@ FICaptureState xemu_frameinspect_capture_state(void)
 {
     fi_capture_sync_init();
     qemu_mutex_lock(&fi_lock);
-    FICaptureState state = fi_state;
+    FICaptureState state = qatomic_read(&fi_state);
     qemu_mutex_unlock(&fi_lock);
     return state;
 }
 
 uint32_t xemu_frameinspect_capture_intern_surface(const FISurfaceKey *k)
 {
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        return FI_SURFGEN_INVALID;
+    }
     fi_capture_sync_init();
     qemu_mutex_lock(&fi_lock);
-    uint32_t id = fi_state == FI_CAP_CAPTURING && k
+    uint32_t id = qatomic_read(&fi_state) == FI_CAP_CAPTURING && k
                       ? fi_surfaces_intern(&fi_cap.surfaces, k)
                       : FI_SURFGEN_INVALID;
     qemu_mutex_unlock(&fi_lock);
@@ -243,9 +249,12 @@ uint32_t xemu_frameinspect_capture_intern_surface(const FISurfaceKey *k)
 bool xemu_frameinspect_capture_begin_batch(uint32_t surface_gen,
                                            uint32_t zeta_surface_gen)
 {
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        return false;
+    }
     fi_capture_sync_init();
     qemu_mutex_lock(&fi_lock);
-    if (fi_state != FI_CAP_CAPTURING) {
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
         qemu_mutex_unlock(&fi_lock);
         return false;
     }
@@ -262,9 +271,12 @@ bool xemu_frameinspect_capture_begin_batch(uint32_t surface_gen,
 
 void xemu_frameinspect_capture_end_batch(void)
 {
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        return;
+    }
     fi_capture_sync_init();
     qemu_mutex_lock(&fi_lock);
-    if (fi_state == FI_CAP_CAPTURING) {
+    if (qatomic_read(&fi_state) == FI_CAP_CAPTURING) {
         fi_cap.open_batch_gen = FI_SURFGEN_INVALID;
         fi_cap.open_batch_zeta_gen = FI_SURFGEN_INVALID;
         fi_cap.batch_open = false;
@@ -274,9 +286,12 @@ void xemu_frameinspect_capture_end_batch(void)
 
 void xemu_frameinspect_capture_split_batch(void)
 {
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        return;
+    }
     fi_capture_sync_init();
     qemu_mutex_lock(&fi_lock);
-    if (fi_state == FI_CAP_CAPTURING && fi_cap.batch_open) {
+    if (qatomic_read(&fi_state) == FI_CAP_CAPTURING && fi_cap.batch_open) {
         fi_eventlog_append(&fi_cap.events, &fi_cap.budget, FI_EV_BATCH,
                            fi_cap.open_batch_gen,
                            fi_cap.open_batch_zeta_gen, 0, 0, 0);
@@ -288,9 +303,12 @@ void xemu_frameinspect_capture_clear(uint32_t surface_gen,
                                      uint32_t zeta_surface_gen,
                                      uint32_t parameter)
 {
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        return;
+    }
     fi_capture_sync_init();
     qemu_mutex_lock(&fi_lock);
-    if (fi_state == FI_CAP_CAPTURING) {
+    if (qatomic_read(&fi_state) == FI_CAP_CAPTURING) {
         fi_eventlog_append(&fi_cap.events, &fi_cap.budget, FI_EV_CLEAR,
                            surface_gen, zeta_surface_gen, parameter, 0, 0);
     }
@@ -301,9 +319,12 @@ void xemu_frameinspect_capture_blit(uint32_t surface_gen, uint32_t source_addr,
                                     uint32_t dest_addr, uint32_t size,
                                     uint32_t operation)
 {
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        return;
+    }
     fi_capture_sync_init();
     qemu_mutex_lock(&fi_lock);
-    if (fi_state == FI_CAP_CAPTURING) {
+    if (qatomic_read(&fi_state) == FI_CAP_CAPTURING) {
         fi_eventlog_append(&fi_cap.events, &fi_cap.budget, FI_EV_BLIT,
                            surface_gen, source_addr, dest_addr, size,
                            operation);
@@ -315,9 +336,12 @@ void xemu_frameinspect_capture_writer(uint8_t kind, uint32_t surface_gen,
                                       const uint32_t *rgba, uint32_t width,
                                       uint32_t height)
 {
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        return;
+    }
     fi_capture_sync_init();
     qemu_mutex_lock(&fi_lock);
-    if (fi_state != FI_CAP_CAPTURING) {
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
         qemu_mutex_unlock(&fi_lock);
         return;
     }
@@ -412,6 +436,10 @@ void xemu_frameinspect_capture_release(const FICapture *capture)
     qemu_mutex_lock(&fi_lock);
     FICapture *mutable_capture = (FICapture *)capture;
     assert(mutable_capture->refcount > 0);
+    if (mutable_capture->refcount == 0) {
+        qemu_mutex_unlock(&fi_lock);
+        return;
+    }
     bool destroy = --mutable_capture->refcount == 0;
     qemu_mutex_unlock(&fi_lock);
     if (destroy) {
