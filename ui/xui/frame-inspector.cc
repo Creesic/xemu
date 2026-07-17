@@ -406,16 +406,17 @@ static void fi_pixels_tab(const FICapture *cap, int pinned_pixel)
     }
 }
 
-/* (Re)build m_frame_tex from the scanout generation's final reconstructed
- * image. Always deletes any existing texture first (no per-capture leak).
- * Leaves m_frame_tex == 0 on any failure (no scanout event, gen out of
- * range, colour history not initialized, or reconstruct failure). */
-static void fi_rebuild_frame_texture(FrameInspectorWindow *w,
-                                     const FICapture *cap)
+/* (Re)builds m_frame_tex from cap->hist[gen] reconstructed at event_index.
+ * Always deletes any existing texture first (no per-capture/per-scrub
+ * leak). Leaves m_frame_tex == 0 on any failure (gen out of range, colour
+ * history not initialized, event_index out of range, or reconstruct
+ * failure). Shared by the initial "show final frame" build and the Task 5
+ * timeline scrubber. */
+void FrameInspectorWindow::UploadFrame(const FICapture *cap, int gen,
+                                       uint32_t event_index)
 {
-    w->ReleaseTexture();
+    ReleaseTexture();
 
-    int gen = fi_find_scanout_gen(cap);
     if (gen < 0 || !cap->hist || (uint32_t)gen >= cap->hist_count) {
         return;
     }
@@ -423,13 +424,12 @@ static void fi_rebuild_frame_texture(FrameInspectorWindow *w,
     if (ch->width == 0 || ch->height == 0) {
         return; /* not inited */
     }
-    uint32_t num_ev = fi_colorhist_num_events(ch);
-    if (num_ev == 0) {
+    if (event_index >= fi_colorhist_num_events(ch)) {
         return;
     }
 
     std::vector<uint32_t> pixels((size_t)ch->width * ch->height);
-    if (!fi_colorhist_reconstruct(ch, num_ev - 1, pixels.data())) {
+    if (!fi_colorhist_reconstruct(ch, event_index, pixels.data())) {
         return;
     }
 
@@ -445,10 +445,10 @@ static void fi_rebuild_frame_texture(FrameInspectorWindow *w,
                 pixels.data());
     glBindTexture(GL_TEXTURE_2D, 0);
 
-    w->m_frame_tex = tex;
-    w->m_frame_w = (int)ch->width;
-    w->m_frame_h = (int)ch->height;
-    w->m_frame_gen = gen;
+    m_frame_tex = tex;
+    m_frame_w = (int)ch->width;
+    m_frame_h = (int)ch->height;
+    m_frame_gen = gen;
 }
 
 void FrameInspectorWindow::ReleaseTexture()
@@ -461,6 +461,46 @@ void FrameInspectorWindow::ReleaseTexture()
     m_frame_w = 0;
     m_frame_h = 0;
     m_frame_gen = -1;
+}
+
+/* Timeline scrubber (Task 5): lets the user re-reconstruct the currently
+ * displayed frame at any event of the scanout generation's colour history,
+ * not just the final one -- watch the frame build up draw by draw. Only
+ * shown when the scanout gen (m_frame_gen, set by UploadFrame on success)
+ * has more than one recorded event. Note: only the scanout generation is
+ * scrubbable in v1; offscreen render targets (other surfaces) would need a
+ * per-surface timeline of their own (out of scope, see HelpMarker). */
+static void fi_timeline_scrubber(FrameInspectorWindow *w, const FICapture *cap)
+{
+    if (w->m_frame_gen < 0 || (uint32_t)w->m_frame_gen >= cap->hist_count) {
+        return;
+    }
+    const FIColorHist *ch = &cap->hist[w->m_frame_gen];
+    uint32_t num_ev = fi_colorhist_num_events(ch);
+    if (num_ev <= 1) {
+        return; /* nothing to scrub through */
+    }
+
+    int idx = (w->m_timeline_idx < 0) ? (int)(num_ev - 1) : w->m_timeline_idx;
+    if (ImGui::SliderInt("Timeline", &idx, 0, (int)num_ev - 1)) {
+        w->m_timeline_idx = idx;
+        w->UploadFrame(cap, w->m_frame_gen, (uint32_t)idx);
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Latest")) {
+        w->m_timeline_idx = -1;
+        w->UploadFrame(cap, w->m_frame_gen, num_ev - 1);
+    }
+    ImGui::SameLine();
+    HelpMarker("Only the scanout generation is scrubbable in v1; offscreen "
+              "render targets would need a per-surface timeline of their "
+              "own (out of scope).");
+
+    uint32_t shown =
+        (w->m_timeline_idx < 0) ? num_ev - 1 : (uint32_t)w->m_timeline_idx;
+    const char *kind = shown < cap->events.count ?
+                       ev_kind_name(cap->events.events[shown].kind) : "?";
+    ImGui::Text("event %u / %u: %s", shown, num_ev - 1, kind);
 }
 
 void FrameInspectorWindow::Draw()
@@ -490,9 +530,18 @@ void FrameInspectorWindow::Draw()
     if (new_capture) {
         m_pinned_pixel = -1; /* stale index into a possibly-differently-sized image */
         m_selected_rec = -1; /* stale index into the old capture's methods log */
+        m_timeline_idx = -1; /* show the final frame first on a new capture */
     }
     if (new_capture || m_frame_tex == 0) {
-        fi_rebuild_frame_texture(this, cap);
+        int gen = fi_find_scanout_gen(cap);
+        uint32_t num_ev = (gen >= 0 && cap->hist && (uint32_t)gen < cap->hist_count) ?
+                          fi_colorhist_num_events(&cap->hist[gen]) :
+                          0;
+        bool have_idx = m_timeline_idx >= 0 && num_ev > 0 &&
+                        (uint32_t)m_timeline_idx < num_ev;
+        uint32_t idx = have_idx ? (uint32_t)m_timeline_idx :
+                                  (num_ev > 0 ? num_ev - 1 : 0);
+        UploadFrame(cap, gen, idx);
     }
 
     ImGui::SetNextWindowSize(ImVec2(900.0f * g_viewport_mgr.m_scale,
@@ -612,6 +661,7 @@ void FrameInspectorWindow::Draw()
                     m_pinned_pixel = (int)pixel_index;
                 }
             }
+            fi_timeline_scrubber(this, cap);
             ImGui::Separator();
         } else {
             ImGui::TextDisabled(

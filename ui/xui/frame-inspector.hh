@@ -19,6 +19,8 @@
 #pragma once
 #include "common.hh"
 
+struct FICapture;
+
 class FrameInspectorWindow
 {
 public:
@@ -43,8 +45,21 @@ public:
      * added in Task 4. */
     int m_pinned_pixel = -1;
 
+    /* Timeline scrubber (Task 5): event index within the scanout gen's
+     * colour history that m_frame_tex currently shows. -1 = latest/final
+     * event (the default). Reset to -1 whenever a new capture publishes. */
+    int m_timeline_idx = -1;
+
     void Draw();
     void ReleaseTexture();
+    /* (Re)builds m_frame_tex from cap->hist[gen] reconstructed at
+     * event_index. Reused by the initial "show final frame" path and by the
+     * Task 5 timeline scrubber to re-reconstruct at an arbitrary event.
+     * Deletes any existing texture first; leaves m_frame_tex == 0 on
+     * failure (gen invalid, hist not inited, event_index out of range, or
+     * reconstruct failure). */
+    void UploadFrame(const struct FICapture *cap, int gen,
+                     uint32_t event_index);
 };
 
 extern FrameInspectorWindow frame_inspector_window;
