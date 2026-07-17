@@ -33,7 +33,20 @@ extern "C" {
 
 #define FI_CAP_BUDGET_DEFAULT (1ull << 30)
 
-typedef enum { FI_CAP_IDLE, FI_CAP_ARMED, FI_CAP_CAPTURING, FI_CAP_DONE } FICaptureState;
+typedef enum {
+    FI_CAP_IDLE,
+    FI_CAP_ARMING,
+    FI_CAP_ARMED,
+    FI_CAP_CAPTURING,
+    FI_CAP_PAUSE_PENDING,
+    FI_CAP_DONE,
+} FICaptureState;
+
+typedef enum {
+    FI_CAP_FLIP_NONE,
+    FI_CAP_FLIP_COMPLETE,
+    FI_CAP_FLIP_FAILED,
+} FICaptureFlipResult;
 
 typedef struct FICapture {
     FISurfaceStore surfaces;
@@ -43,19 +56,31 @@ typedef struct FICapture {
     FIColorHist *hist;        /* [surfaces.num_gens], allocated lazily in 2B */
     uint32_t hist_count;
     uint32_t open_batch_gen;  /* surface gen of the batch currently open, or INVALID */
+    uint32_t open_batch_zeta_gen;
+    uint32_t refcount;        /* protected by the capture-module lock */
+    bool batch_open;
     bool truncated;
 } FICapture;
 
 /* Arm a one-shot capture: begins the lead-in (Plan-1 instrumentation on). */
-void xemu_frameinspect_capture_arm(uint64_t ram_size);
-/* Called on the pfifo thread at each NV097_FLIP_STALL. Returns true when the
- * capture just completed and the caller should request the VM pause. */
-bool xemu_frameinspect_capture_on_flip(void);
+bool xemu_frameinspect_capture_arm(uint64_t ram_size);
+/* Called on the pfifo thread at each NV097_FLIP_STALL. */
+FICaptureFlipResult xemu_frameinspect_capture_on_flip(bool opengl_active);
+bool xemu_frameinspect_capture_pause_complete(void);
+bool xemu_frameinspect_capture_cancel(void);
+void xemu_frameinspect_capture_shutdown(void);
 FICaptureState xemu_frameinspect_capture_state(void);
 /* Skeleton event recorders (Task 7 calls these; 2B extends them). */
-void xemu_frameinspect_capture_begin_batch(uint32_t surface_gen);
+bool xemu_frameinspect_capture_begin_batch(uint32_t surface_gen,
+                                           uint32_t zeta_surface_gen);
 void xemu_frameinspect_capture_end_batch(void);
-void xemu_frameinspect_capture_event(uint8_t kind, uint32_t surface_gen);
+void xemu_frameinspect_capture_split_batch(void);
+void xemu_frameinspect_capture_clear(uint32_t surface_gen,
+                                     uint32_t zeta_surface_gen,
+                                     uint32_t parameter);
+void xemu_frameinspect_capture_blit(uint32_t surface_gen, uint32_t source_addr,
+                                    uint32_t dest_addr, uint32_t size,
+                                    uint32_t operation);
 uint32_t xemu_frameinspect_capture_intern_surface(const FISurfaceKey *k);
 /* The ONE entry point every writer event (batch/clear/blit) calls with the
  * post-writer RGBA8888 image of the affected colour generation. Appends the
@@ -68,8 +93,9 @@ uint32_t xemu_frameinspect_capture_intern_surface(const FISurfaceKey *k);
 void xemu_frameinspect_capture_writer(uint8_t kind, uint32_t surface_gen,
                                       const uint32_t *rgba, uint32_t width,
                                       uint32_t height);
-/* Published immutable capture for the UI (Plan 3); NULL until first publish. */
-const FICapture *xemu_frameinspect_capture_get(void);
+/* Published immutable capture for the UI (Plan 3); caller must release it. */
+const FICapture *xemu_frameinspect_capture_acquire(void);
+void xemu_frameinspect_capture_release(const FICapture *capture);
 /* Human-readable one-line summary of the published capture (g_strdup'd). */
 char *xemu_frameinspect_capture_summary(void);
 

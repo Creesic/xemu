@@ -21,6 +21,7 @@
 
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "qemu/main-loop.h"
+#include "xemu-frameinspect-capture.h"
 
 void nv2a_update_irq(NV2AState *d)
 {
@@ -281,6 +282,7 @@ static void nv2a_unlock_fifo(NV2AState *d)
 
 static void nv2a_reset(NV2AState *d)
 {
+    xemu_frameinspect_capture_cancel();
     nv2a_lock_fifo(d);
     bool halted = qatomic_read(&d->pfifo.halt);
     if (!halted) {
@@ -368,6 +370,7 @@ static void nv2a_exitfn(PCIDevice *dev)
     qemu_cond_broadcast(&d->pfifo.fifo_cond);
     qemu_thread_join(&d->pfifo.thread);
 
+    xemu_frameinspect_capture_shutdown();
     pgraph_destroy(&d->pgraph);
 }
 

@@ -22,134 +22,330 @@
 
 #include "qemu/osdep.h"
 #include "qemu/atomic.h"
+#include "qemu/thread.h"
 #include "xemu-frameinspect.h"
 #include "xemu-frameinspect-capture.h"
 
 static FICapture fi_cap;                 /* capture in progress */
 static FICaptureState fi_state = FI_CAP_IDLE;
-static const FICapture *fi_published;    /* immutable, read by UI thread */
-static uint64_t fi_cap_ram_size;
+static FICapture *fi_published;          /* immutable, protected by fi_lock */
+static QemuMutex fi_lock;
+static int fi_lock_state;
+
+static void fi_capture_sync_init(void)
+{
+    if (qatomic_load_acquire(&fi_lock_state) == 2) {
+        return;
+    }
+    if (qatomic_cmpxchg(&fi_lock_state, 0, 1) == 0) {
+        qemu_mutex_init(&fi_lock);
+        qatomic_store_release(&fi_lock_state, 2);
+        return;
+    }
+    while (qatomic_load_acquire(&fi_lock_state) != 2) {
+        cpu_relax();
+    }
+}
 
 static void fi_capture_reset(FICapture *c)
 {
-    fi_surfaces_free(&c->surfaces);
-    fi_resources_free(&c->resources);
-    fi_eventlog_free(&c->events);
     for (uint32_t i = 0; i < c->hist_count; i++) {
+        fi_budget_release(&c->budget, c->hist[i].bytes_used);
         fi_colorhist_free(&c->hist[i]);
     }
+    if (c->hist) {
+        fi_budget_release(&c->budget,
+                          (uint64_t)c->hist_count * sizeof(FIColorHist));
+    }
     free(c->hist);
+    if (c->surfaces.gens) {
+        fi_budget_release(&c->budget,
+                          (uint64_t)FI_SURF_MAX_GENS * sizeof(FISurfaceGen));
+    }
+    fi_surfaces_free(&c->surfaces);
+    fi_resources_free(&c->resources, &c->budget);
+    fi_eventlog_free(&c->events, &c->budget);
     memset(c, 0, sizeof(*c));
+}
+
+static void fi_capture_destroy(FICapture *c)
+{
+    fi_capture_reset(c);
+    free(c);
 }
 
 static bool fi_capture_alloc(FICapture *c)
 {
     memset(c, 0, sizeof(*c));
     c->open_batch_gen = FI_SURFGEN_INVALID;
+    c->open_batch_zeta_gen = FI_SURFGEN_INVALID;
     c->budget.limit = FI_CAP_BUDGET_DEFAULT;
-    if (!fi_surfaces_init(&c->surfaces) || !fi_resources_init(&c->resources) ||
-        !fi_eventlog_init(&c->events)) {
+    uint64_t surface_bytes =
+        (uint64_t)FI_SURF_MAX_GENS * sizeof(FISurfaceGen);
+    if (!fi_budget_try(&c->budget, surface_bytes) ||
+        !fi_surfaces_init(&c->surfaces) ||
+        !fi_resources_init(&c->resources, &c->budget) ||
+        !fi_eventlog_init(&c->events, &c->budget)) {
         fi_capture_reset(c);
         return false;
     }
     return true;
 }
 
-void xemu_frameinspect_capture_arm(uint64_t ram_size)
+bool xemu_frameinspect_capture_arm(uint64_t ram_size)
 {
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
     if (fi_state != FI_CAP_IDLE && fi_state != FI_CAP_DONE) {
-        return; /* a capture is already in flight */
+        qemu_mutex_unlock(&fi_lock);
+        return false;
     }
-    fi_cap_ram_size = ram_size;
-    fi_state = FI_CAP_ARMED;
+    fi_state = FI_CAP_ARMING;
     /* Lead-in: enable Plan-1 guest instrumentation now so writes during the
      * frame before the captured frame are tagged. */
     xemu_frameinspect_arm(ram_size);
+    bool armed = xemu_frameinspect_is_armed();
+
+    if (fi_state == FI_CAP_ARMING && armed) {
+        fi_state = FI_CAP_ARMED;
+        qemu_mutex_unlock(&fi_lock);
+        return true;
+    }
+    fi_state = FI_CAP_IDLE;
+    if (armed) {
+        xemu_frameinspect_disarm();
+    }
+    qemu_mutex_unlock(&fi_lock);
+    return false;
 }
 
-bool xemu_frameinspect_capture_on_flip(void)
+FICaptureFlipResult xemu_frameinspect_capture_on_flip(bool opengl_active)
 {
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    if (!opengl_active &&
+        (fi_state == FI_CAP_ARMED || fi_state == FI_CAP_CAPTURING)) {
+        if (fi_state == FI_CAP_CAPTURING) {
+            fi_capture_reset(&fi_cap);
+        }
+        fi_state = FI_CAP_IDLE;
+        xemu_frameinspect_disarm();
+        qemu_mutex_unlock(&fi_lock);
+        return FI_CAP_FLIP_FAILED;
+    }
     switch (fi_state) {
     case FI_CAP_ARMED:
         /* First flip after arming: the captured frame starts now. */
         if (!fi_capture_alloc(&fi_cap)) {
             fi_state = FI_CAP_IDLE;
             xemu_frameinspect_disarm();
-            return false;
+            qemu_mutex_unlock(&fi_lock);
+            return FI_CAP_FLIP_FAILED;
         }
         fi_state = FI_CAP_CAPTURING;
-        return false;
+        qemu_mutex_unlock(&fi_lock);
+        return FI_CAP_FLIP_NONE;
     case FI_CAP_CAPTURING: {
         /* Second flip: the captured frame ended. Finalize + publish. */
         FICapture *done = (FICapture *)malloc(sizeof(FICapture));
-        if (done) {
-            *done = fi_cap;             /* transfer ownership of buffers */
-            memset(&fi_cap, 0, sizeof(fi_cap));
-            const FICapture *old = fi_published;
-            qatomic_store_release(&fi_published, done);
-            if (old) {
-                fi_capture_reset((FICapture *)old);
-                free((void *)old);
-            }
-        } else {
+        if (!done) {
             fi_capture_reset(&fi_cap);
+            fi_state = FI_CAP_IDLE;
+            xemu_frameinspect_disarm();
+            qemu_mutex_unlock(&fi_lock);
+            return FI_CAP_FLIP_FAILED;
         }
-        fi_state = FI_CAP_DONE;
+        *done = fi_cap;                 /* transfer ownership of buffers */
+        memset(&fi_cap, 0, sizeof(fi_cap));
+        done->refcount = 1;             /* published-pointer ownership */
+        FICapture *old = fi_published;
+        fi_published = done;
+        bool destroy_old = old && --old->refcount == 0;
+        fi_state = FI_CAP_PAUSE_PENDING;
         xemu_frameinspect_disarm();     /* end lead-in instrumentation */
-        return true;                    /* request the pause */
+        qemu_mutex_unlock(&fi_lock);
+        if (destroy_old) {
+            fi_capture_destroy(old);
+        }
+        return FI_CAP_FLIP_COMPLETE;
     }
     default:
-        return false;
+        qemu_mutex_unlock(&fi_lock);
+        return FI_CAP_FLIP_NONE;
     }
 }
 
-FICaptureState xemu_frameinspect_capture_state(void) { return fi_state; }
+bool xemu_frameinspect_capture_pause_complete(void)
+{
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    bool pending = fi_state == FI_CAP_PAUSE_PENDING;
+    if (fi_state == FI_CAP_PAUSE_PENDING) {
+        fi_state = FI_CAP_DONE;
+    }
+    qemu_mutex_unlock(&fi_lock);
+    return pending;
+}
+
+bool xemu_frameinspect_capture_cancel(void)
+{
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    bool active = fi_state == FI_CAP_ARMING || fi_state == FI_CAP_ARMED ||
+                  fi_state == FI_CAP_CAPTURING ||
+                  fi_state == FI_CAP_PAUSE_PENDING;
+    if (fi_state == FI_CAP_CAPTURING) {
+        fi_capture_reset(&fi_cap);
+    }
+    if (active) {
+        fi_state = FI_CAP_IDLE;
+        xemu_frameinspect_disarm();
+    }
+    qemu_mutex_unlock(&fi_lock);
+    return active;
+}
+
+void xemu_frameinspect_capture_shutdown(void)
+{
+    xemu_frameinspect_capture_cancel();
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    FICapture *published = fi_published;
+    fi_published = NULL;
+    bool destroy = published && --published->refcount == 0;
+    fi_state = FI_CAP_IDLE;
+    qemu_mutex_unlock(&fi_lock);
+    if (destroy) {
+        fi_capture_destroy(published);
+    }
+}
+
+FICaptureState xemu_frameinspect_capture_state(void)
+{
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    FICaptureState state = fi_state;
+    qemu_mutex_unlock(&fi_lock);
+    return state;
+}
 
 uint32_t xemu_frameinspect_capture_intern_surface(const FISurfaceKey *k)
 {
-    if (fi_state != FI_CAP_CAPTURING) return FI_SURFGEN_INVALID;
-    return fi_surfaces_intern(&fi_cap.surfaces, k);
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    uint32_t id = fi_state == FI_CAP_CAPTURING && k
+                      ? fi_surfaces_intern(&fi_cap.surfaces, k)
+                      : FI_SURFGEN_INVALID;
+    qemu_mutex_unlock(&fi_lock);
+    return id;
 }
 
-void xemu_frameinspect_capture_begin_batch(uint32_t surface_gen)
+bool xemu_frameinspect_capture_begin_batch(uint32_t surface_gen,
+                                           uint32_t zeta_surface_gen)
 {
-    if (fi_state != FI_CAP_CAPTURING) return;
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    if (fi_state != FI_CAP_CAPTURING) {
+        qemu_mutex_unlock(&fi_lock);
+        return false;
+    }
     fi_cap.open_batch_gen = surface_gen;
-    fi_eventlog_append(&fi_cap.events, FI_EV_BATCH, surface_gen, 0, 0, 0, 0);
+    fi_cap.open_batch_zeta_gen = zeta_surface_gen;
+    fi_cap.batch_open = true;
+    bool appended = fi_eventlog_append(
+                        &fi_cap.events, &fi_cap.budget, FI_EV_BATCH,
+                        surface_gen, zeta_surface_gen, 0, 0, 0) !=
+                    FI_EVENT_INVALID;
+    qemu_mutex_unlock(&fi_lock);
+    return appended;
 }
 
 void xemu_frameinspect_capture_end_batch(void)
 {
-    if (fi_state != FI_CAP_CAPTURING) return;
-    fi_cap.open_batch_gen = FI_SURFGEN_INVALID;
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    if (fi_state == FI_CAP_CAPTURING) {
+        fi_cap.open_batch_gen = FI_SURFGEN_INVALID;
+        fi_cap.open_batch_zeta_gen = FI_SURFGEN_INVALID;
+        fi_cap.batch_open = false;
+    }
+    qemu_mutex_unlock(&fi_lock);
 }
 
-void xemu_frameinspect_capture_event(uint8_t kind, uint32_t surface_gen)
+void xemu_frameinspect_capture_split_batch(void)
 {
-    if (fi_state != FI_CAP_CAPTURING) return;
-    fi_eventlog_append(&fi_cap.events, kind, surface_gen, 0, 0, 0, 0);
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    if (fi_state == FI_CAP_CAPTURING && fi_cap.batch_open) {
+        fi_eventlog_append(&fi_cap.events, &fi_cap.budget, FI_EV_BATCH,
+                           fi_cap.open_batch_gen,
+                           fi_cap.open_batch_zeta_gen, 0, 0, 0);
+    }
+    qemu_mutex_unlock(&fi_lock);
+}
+
+void xemu_frameinspect_capture_clear(uint32_t surface_gen,
+                                     uint32_t zeta_surface_gen,
+                                     uint32_t parameter)
+{
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    if (fi_state == FI_CAP_CAPTURING) {
+        fi_eventlog_append(&fi_cap.events, &fi_cap.budget, FI_EV_CLEAR,
+                           surface_gen, zeta_surface_gen, parameter, 0, 0);
+    }
+    qemu_mutex_unlock(&fi_lock);
+}
+
+void xemu_frameinspect_capture_blit(uint32_t surface_gen, uint32_t source_addr,
+                                    uint32_t dest_addr, uint32_t size,
+                                    uint32_t operation)
+{
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    if (fi_state == FI_CAP_CAPTURING) {
+        fi_eventlog_append(&fi_cap.events, &fi_cap.budget, FI_EV_BLIT,
+                           surface_gen, source_addr, dest_addr, size,
+                           operation);
+    }
+    qemu_mutex_unlock(&fi_lock);
 }
 
 void xemu_frameinspect_capture_writer(uint8_t kind, uint32_t surface_gen,
                                       const uint32_t *rgba, uint32_t width,
                                       uint32_t height)
 {
-    if (fi_state != FI_CAP_CAPTURING) return;
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    if (fi_state != FI_CAP_CAPTURING) {
+        qemu_mutex_unlock(&fi_lock);
+        return;
+    }
 
-    uint32_t idx = fi_eventlog_append(&fi_cap.events, kind, surface_gen,
-                                      0, 0, 0, 0);
+    uint32_t idx = fi_eventlog_append(&fi_cap.events, &fi_cap.budget, kind,
+                                      surface_gen, 0, 0, 0, 0);
     if (surface_gen == FI_SURFGEN_INVALID || !rgba || idx == FI_EVENT_INVALID) {
         /* Event recorded (if it fit); no pixels to diff -> "missing", never
          * wrong. */
+        qemu_mutex_unlock(&fi_lock);
         return;
     }
 
     if (surface_gen >= fi_cap.hist_count) {
         uint32_t new_count = surface_gen + 1;
-        FIColorHist *nh = (FIColorHist *)realloc(
-            fi_cap.hist, new_count * sizeof(FIColorHist));
-        if (!nh) {
+        uint64_t old_bytes = (uint64_t)fi_cap.hist_count * sizeof(FIColorHist);
+        uint64_t new_bytes = (uint64_t)new_count * sizeof(FIColorHist);
+        if (!fi_budget_try(&fi_cap.budget, new_bytes - old_bytes)) {
             fi_cap.truncated = true;
+            qemu_mutex_unlock(&fi_lock);
+            return;
+        }
+        FIColorHist *nh = (FIColorHist *)realloc(
+            fi_cap.hist, (size_t)new_bytes);
+        if (!nh) {
+            fi_budget_release(&fi_cap.budget, new_bytes - old_bytes);
+            fi_cap.truncated = true;
+            qemu_mutex_unlock(&fi_lock);
             return;
         }
         memset(&nh[fi_cap.hist_count], 0,
@@ -162,30 +358,78 @@ void xemu_frameinspect_capture_writer(uint8_t kind, uint32_t surface_gen,
     if (ch->width == 0) {
         /* First sight of this generation this frame: it becomes the
          * baseline for its colour history. */
+        uint64_t remaining = fi_cap.budget.limit - fi_cap.budget.used;
         if (!fi_colorhist_init(ch, width, height, 16) ||
-            !fi_colorhist_set_baseline(ch, rgba)) {
+            ch->bytes_used > remaining) {
+            fi_colorhist_free(ch);
+            fi_cap.truncated = true;
+            qemu_mutex_unlock(&fi_lock);
+            return;
+        }
+        fi_budget_try(&fi_cap.budget, ch->bytes_used);
+        remaining = fi_cap.budget.limit - fi_cap.budget.used;
+        ch->byte_budget = MIN(ch->byte_budget, ch->bytes_used + remaining);
+        uint64_t old_bytes = ch->bytes_used;
+        if (!fi_colorhist_set_baseline(ch, rgba)) {
             fi_cap.truncated = true;
         }
+        fi_budget_try(&fi_cap.budget, ch->bytes_used - old_bytes);
     } else if (ch->width != width || ch->height != height) {
-        /* Dimensions changed mid-capture for this generation (e.g. a
-         * rebind that reused the gen id): skip the diff rather than risk
-         * corrupting the history. Missing, not wrong. */
-    } else if (!fi_colorhist_add_event(ch, idx, rgba)) {
+        /* Dimensions changed mid-capture for this generation: skip the diff
+         * rather than corrupting the history. Missing, not wrong. */
         fi_cap.truncated = true;
+    } else {
+        uint64_t remaining = fi_cap.budget.limit - fi_cap.budget.used;
+        ch->byte_budget = MIN((uint64_t)FI_CH_BYTE_BUDGET,
+                              ch->bytes_used + remaining);
+        uint64_t old_bytes = ch->bytes_used;
+        if (!fi_colorhist_add_event(ch, idx, rgba)) {
+            fi_cap.truncated = true;
+        }
+        fi_budget_try(&fi_cap.budget, ch->bytes_used - old_bytes);
     }
+    qemu_mutex_unlock(&fi_lock);
 }
 
-const FICapture *xemu_frameinspect_capture_get(void)
+const FICapture *xemu_frameinspect_capture_acquire(void)
 {
-    return qatomic_load_acquire(&fi_published);
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    FICapture *capture = fi_published;
+    if (capture) {
+        capture->refcount++;
+    }
+    qemu_mutex_unlock(&fi_lock);
+    return capture;
+}
+
+void xemu_frameinspect_capture_release(const FICapture *capture)
+{
+    if (!capture) {
+        return;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    FICapture *mutable_capture = (FICapture *)capture;
+    assert(mutable_capture->refcount > 0);
+    bool destroy = --mutable_capture->refcount == 0;
+    qemu_mutex_unlock(&fi_lock);
+    if (destroy) {
+        fi_capture_destroy(mutable_capture);
+    }
 }
 
 char *xemu_frameinspect_capture_summary(void)
 {
-    const FICapture *c = xemu_frameinspect_capture_get();
-    if (!c) return g_strdup("Frame inspector: no capture");
-    return g_strdup_printf("Captured frame: %u events, %u surfaces%s",
-                           c->events.count, c->surfaces.num_gens,
-                           (c->events.truncated || c->surfaces.truncated)
-                               ? " [TRUNCATED]" : "");
+    const FICapture *c = xemu_frameinspect_capture_acquire();
+    if (!c) {
+        return g_strdup("Frame inspector: no capture");
+    }
+    char *summary = g_strdup_printf(
+        "Captured frame: %u events, %u surfaces%s", c->events.count,
+        c->surfaces.num_gens,
+        (c->truncated || c->events.truncated || c->surfaces.truncated ||
+         c->resources.truncated) ? " [TRUNCATED]" : "");
+    xemu_frameinspect_capture_release(c);
+    return summary;
 }

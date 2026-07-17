@@ -457,10 +457,25 @@ static void handle_keydown(SDL_Event *ev)
         case SDL_SCANCODE_I: {
             gui_keysym = 1;
             if (xemu_get_xbe_info() != NULL) {
+#ifdef CONFIG_OPENGL
+                if (g_config.display.renderer !=
+                    CONFIG_DISPLAY_RENDERER_OPENGL) {
+                    xemu_queue_notification(
+                        "Frame inspector requires the OpenGL backend");
+                    break;
+                }
                 MachineState *ms = MACHINE(qdev_get_machine());
-                xemu_frameinspect_capture_arm(ms->ram_size);
+                if (xemu_frameinspect_capture_arm(ms->ram_size)) {
+                    xemu_queue_notification(
+                        "Frame inspector: capturing next frame...");
+                } else {
+                    xemu_queue_notification(
+                        "Frame inspector: unable to arm capture");
+                }
+#else
                 xemu_queue_notification(
-                    "Frame inspector: capturing next frame...");
+                    "Frame inspector requires an OpenGL build");
+#endif
             } else {
                 xemu_queue_notification("Load a game before inspecting");
             }

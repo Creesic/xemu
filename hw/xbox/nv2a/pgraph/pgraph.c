@@ -795,6 +795,7 @@ int pgraph_method(NV2AState *d, unsigned int subchannel,
             LAMP(0, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_END) &&
             LAMP(1, NV097_SET_BEGIN_END, pg->primitive_mode) &&
             LAM(2, NV097_DRAW_ARRAYS)) {
+            xemu_frameinspect_capture_split_batch();
             num_words_consumed += 4;
             pg->draw_arrays_prevent_connect = true;
         }
@@ -903,6 +904,14 @@ DEF_METHOD(NV097, FLIP_INCREMENT_WRITE)
 
 static void fi_capture_pause_bh(void *opaque)
 {
+    FICaptureFlipResult result = GPOINTER_TO_INT(opaque);
+    if (result == FI_CAP_FLIP_FAILED) {
+        xemu_queue_notification("Frame inspector: capture failed");
+        return;
+    }
+    if (!xemu_frameinspect_capture_pause_complete()) {
+        return;
+    }
     /* Runs in the main loop under the BQL; safe to stop the VM here. */
     vm_stop(RUN_STATE_PAUSED);
     char *msg = xemu_frameinspect_capture_summary();
@@ -916,11 +925,18 @@ DEF_METHOD(NV097, FLIP_STALL)
     d->pgraph.renderer->ops.surface_update(d, false, true, true);
     d->pgraph.renderer->ops.flip_stall(d);
     nv2a_profile_flip_stall();
-    if (xemu_frameinspect_capture_on_flip()) {
+    bool opengl_active = false;
+#ifdef CONFIG_OPENGL
+    opengl_active = d->pgraph.renderer->type == CONFIG_DISPLAY_RENDERER_OPENGL;
+#endif
+    FICaptureFlipResult result =
+        xemu_frameinspect_capture_on_flip(opengl_active);
+    if (result != FI_CAP_FLIP_NONE) {
         /* This handler runs on the pfifo thread without the BQL;
          * defer vm_stop() to the BQL-holding main loop. */
         aio_bh_schedule_oneshot(qemu_get_aio_context(),
-                                fi_capture_pause_bh, NULL);
+                                fi_capture_pause_bh,
+                                GINT_TO_POINTER(result));
     }
     pg->waiting_for_flip = true;
 }

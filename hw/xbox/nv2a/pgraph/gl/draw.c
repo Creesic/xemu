@@ -129,8 +129,12 @@ void pgraph_gl_clear_surface(NV2AState *d, uint32_t parameter)
         r->zeta_binding->cleared = full_clear && write_zeta;
     }
 
-    xemu_frameinspect_capture_event(FI_EV_CLEAR,
-                                    pgraph_gl_fi_intern_current_color(d));
+    xemu_frameinspect_capture_clear(
+        write_color ? pgraph_gl_fi_intern_current_color(d)
+                    : FI_SURFGEN_INVALID,
+        write_zeta ? pgraph_gl_fi_intern_current_zeta(d)
+                   : FI_SURFGEN_INVALID,
+        parameter);
 
     pg->clearing = false;
 }
@@ -161,7 +165,11 @@ void pgraph_gl_draw_begin(NV2AState *d)
 
     assert(r->color_binding || r->zeta_binding);
 
-    xemu_frameinspect_capture_begin_batch(pgraph_gl_fi_intern_current_color(d));
+    xemu_frameinspect_capture_begin_batch(
+        color_write ? pgraph_gl_fi_intern_current_color(d)
+                    : FI_SURFGEN_INVALID,
+        pgraph_zeta_write_enabled(pg) ? pgraph_gl_fi_intern_current_zeta(d)
+                                      : FI_SURFGEN_INVALID);
 
     pgraph_gl_bind_textures(d);
     pgraph_gl_bind_shaders(pg);

@@ -31,15 +31,17 @@
 #define FI_SURF_MAX_GENS   4096u
 
 typedef struct FISurfaceKey {
-    uint32_t addr;
+    uint64_t addr;
+    uint64_t size;
     uint32_t format;
     uint32_t pitch;
     uint32_t width;
     uint32_t height;
+    uint32_t aa;
+    uint32_t scale;   /* internal scale factor at capture time */
     uint8_t swizzle;
-    uint8_t color;   /* 1 = colour surface, 0 = zeta */
-    uint8_t aa;
-    uint8_t scale;   /* internal scale factor at capture time */
+    uint8_t color;    /* 1 = colour surface, 0 = zeta */
+    uint8_t z_format; /* fixed/float zeta interpretation */
 } FISurfaceKey;
 
 typedef struct FISurfaceGen {
@@ -72,7 +74,12 @@ static inline void fi_surfaces_free(FISurfaceStore *s)
 
 static inline bool fi_surf_key_eq(const FISurfaceKey *a, const FISurfaceKey *b)
 {
-    return memcmp(a, b, sizeof(FISurfaceKey)) == 0;
+    return a->addr == b->addr && a->size == b->size &&
+           a->format == b->format && a->pitch == b->pitch &&
+           a->width == b->width && a->height == b->height &&
+           a->aa == b->aa && a->scale == b->scale &&
+           a->swizzle == b->swizzle && a->color == b->color &&
+           a->z_format == b->z_format;
 }
 
 static inline uint32_t fi_surfaces_intern(FISurfaceStore *s,
@@ -91,11 +98,15 @@ static inline uint32_t fi_surfaces_intern(FISurfaceStore *s,
         s->truncated = true;
         return FI_SURFGEN_INVALID;
     }
+    if (!k->size || k->addr > UINT64_MAX - k->size) {
+        s->truncated = true;
+        return FI_SURFGEN_INVALID;
+    }
     uint32_t id = s->num_gens++;
     FISurfaceGen *g = &s->gens[id];
     memset(g, 0, sizeof(*g));
     g->key = *k;
-    g->extent = (uint64_t)k->addr + (uint64_t)k->pitch * k->height;
+    g->extent = k->addr + k->size;
     g->prev_at_addr = FI_SURFGEN_INVALID;
     g->generation = 0;
     for (uint32_t i = id; i-- > 0; ) {
@@ -110,7 +121,7 @@ static inline uint32_t fi_surfaces_intern(FISurfaceStore *s,
         if (s->gens[i].key.addr == k->addr) {
             continue;
         }
-        bool overlap = (uint64_t)k->addr < s->gens[i].extent &&
+        bool overlap = k->addr < s->gens[i].extent &&
                        s->gens[i].key.addr < g->extent;
         if (overlap) {
             g->alias = true;

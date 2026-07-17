@@ -222,6 +222,9 @@ void pgraph_gl_image_blit(NV2AState *d)
     memory_region_set_client_dirty(d->vram, dest_addr, clipped_dest_size,
                                    DIRTY_MEMORY_NV2A_TEX);
 
-    xemu_frameinspect_capture_event(FI_EV_BLIT,
-                                    pgraph_gl_fi_intern_current_color(d));
+    uint32_t surface_gen = pgraph_gl_fi_intern_surface(d, surf_dest);
+    xemu_frameinspect_capture_blit(surface_gen,
+                                   source_addr + source_offset,
+                                   dest_addr, clipped_dest_size,
+                                   image_blit->operation);
 }

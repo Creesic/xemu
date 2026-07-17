@@ -33,31 +33,38 @@ static void surface_download_to_buffer(NV2AState *d, SurfaceBinding *surface,
                                        uint8_t *pixels);
 static void surface_get_dimensions(PGRAPHState *pg, unsigned int *width, unsigned int *height);
 
-/* Frame inspector: build a FISurfaceKey from the current colour binding and
- * intern it, returning the surface generation id (or FI_SURFGEN_INVALID when
- * not capturing or no colour surface is bound). */
-uint32_t pgraph_gl_fi_intern_current_color(NV2AState *d)
+uint32_t pgraph_gl_fi_intern_surface(NV2AState *d,
+                                     const SurfaceBinding *s)
 {
-    if (xemu_frameinspect_capture_state() != FI_CAP_CAPTURING) {
-        return FI_SURFGEN_INVALID;
-    }
-    PGRAPHState *pg = &d->pgraph;
-    PGRAPHGLState *r = pg->gl_renderer_state;
-    SurfaceBinding *s = r->color_binding;
     if (!s) {
         return FI_SURFGEN_INVALID;
     }
+    PGRAPHState *pg = &d->pgraph;
     FISurfaceKey k = { 0 };
     k.addr = s->vram_addr;
-    k.format = s->fmt.gl_internal_format;
+    k.size = s->size;
+    k.format = s->color ? s->shape.color_format : s->shape.zeta_format;
     k.pitch = s->pitch;
     k.width = s->width;
     k.height = s->height;
     k.swizzle = s->swizzle ? 1 : 0;
-    k.color = 1;
-    k.aa = (uint8_t)s->shape.anti_aliasing;
-    k.scale = (uint8_t)pg->surface_scale_factor;
+    k.color = s->color ? 1 : 0;
+    k.z_format = s->shape.z_format;
+    k.aa = s->shape.anti_aliasing;
+    k.scale = pg->surface_scale_factor;
     return xemu_frameinspect_capture_intern_surface(&k);
+}
+
+uint32_t pgraph_gl_fi_intern_current_color(NV2AState *d)
+{
+    PGRAPHGLState *r = d->pgraph.gl_renderer_state;
+    return pgraph_gl_fi_intern_surface(d, r->color_binding);
+}
+
+uint32_t pgraph_gl_fi_intern_current_zeta(NV2AState *d)
+{
+    PGRAPHGLState *r = d->pgraph.gl_renderer_state;
+    return pgraph_gl_fi_intern_surface(d, r->zeta_binding);
 }
 
 void pgraph_gl_set_surface_scale_factor(NV2AState *d, unsigned int scale)

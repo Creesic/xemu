@@ -261,9 +261,11 @@ void pgraph_gl_mark_textures_possibly_dirty(NV2AState *d, hwaddr addr, hwaddr si
 void pgraph_gl_process_pending_reports(NV2AState *d);
 void pgraph_gl_surface_flush(NV2AState *d);
 void pgraph_gl_surface_update(NV2AState *d, bool upload, bool color_write, bool zeta_write);
-/* Frame inspector: intern the current colour binding as a surface
- * generation (no-op returning FI_SURFGEN_INVALID when not capturing). */
+/* Frame inspector: intern a binding as a capture-local surface generation. */
+uint32_t pgraph_gl_fi_intern_surface(NV2AState *d,
+                                     const SurfaceBinding *surface);
 uint32_t pgraph_gl_fi_intern_current_color(NV2AState *d);
+uint32_t pgraph_gl_fi_intern_current_zeta(NV2AState *d);
 /* Frame inspector: readback of the current colour binding as canonical
  * RGBA8888 at surface scale. Returns a freshly g_malloc'd width*height
  * uint32_t buffer (caller frees with g_free), or NULL if not capturing / no
