@@ -24,6 +24,7 @@ class FrameInspectorWindow
 public:
     bool m_is_open = false;
     unsigned m_last_seen_events = 0;
+    int m_selected_event = -1;
 
     void Draw();
 };
