@@ -20,6 +20,7 @@
  */
 
 #include "nv2a_int.h"
+#include "xemu-frameinspect-capture.h"
 
 typedef struct RAMHTEntry {
     uint32_t handle;
@@ -342,6 +343,16 @@ static void pfifo_run_pusher(NV2AState *d)
             if (num_words_processed < 0) {
                 break;
             }
+
+            /* Lock-free fast-path inside capture_methods() handles the idle
+             * (non-capturing) case, so this is safe to call unconditionally
+             * without adding a locked capture_state() check to the hot
+             * per-burst path. */
+            xemu_frameinspect_capture_methods(
+                method,
+                method_type == NV_PFIFO_CACHE1_DMA_STATE_METHOD_TYPE_INC,
+                method_subchannel, word_ptr, (uint32_t)num_words_processed,
+                (uint64_t)((uint8_t *)word_ptr - d->vram_ptr));
 
             dma_get_v += (num_words_processed-1)*4;
 

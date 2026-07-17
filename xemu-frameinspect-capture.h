@@ -26,6 +26,7 @@
 #include "xemu-frameinspect-colorhist.h"
 #include "xemu-frameinspect-resources.h"
 #include "xemu-frameinspect-eventlog.h"
+#include "xemu-frameinspect-methodlog.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -52,11 +53,21 @@ typedef struct FICapture {
     FISurfaceStore surfaces;
     FIResourcePool resources;
     FIEventLog events;
+    FIMethodLog methods;
     FIBudget budget;
+    uint64_t methods_bytes;  /* total budget charged for `methods`, released
+                              * in full on reset (init alloc + per-call
+                              * growth charges, symmetric with fi_budget_try) */
     FIColorHist *hist;        /* [surfaces.num_gens], allocated lazily in 2B */
     uint32_t hist_count;
     uint32_t open_batch_gen;  /* surface gen of the batch currently open, or INVALID */
     uint32_t open_batch_zeta_gen;
+    uint32_t open_batch_event; /* event idx begin_batch appended for the
+                                * currently open batch, or FI_EVENT_INVALID;
+                                * used (instead of last_event) to mark the
+                                * batch's method-log range, since a clear/blit
+                                * inside the batch can move last_event. */
+    uint32_t batch_first_rec; /* methods.num_recs when the open batch began */
     uint32_t last_event;      /* index of the most-recently appended event
                                * (batch/clear/blit), or FI_EVENT_INVALID;
                                * used by attach_pixels() to find the event
@@ -106,6 +117,17 @@ void xemu_frameinspect_capture_writer(uint8_t kind, uint32_t surface_gen,
 void xemu_frameinspect_capture_attach_pixels(uint32_t surface_gen,
                                              const uint32_t *rgba,
                                              uint32_t width, uint32_t height);
+/* Log a burst of pushbuffer method words dispatched by the PFIFO pusher in
+ * one pfifo_run_puller() call, with each word's guest-code origin looked up
+ * from the Plan-1 RAM-wide tag map. `first_method` is the method of word 0;
+ * subsequent words are at first_method + 4*i if method_inc, else all at
+ * first_method (non-incrementing method type). `phys_base` is the guest
+ * physical (vram-relative) address of word 0; word i is at phys_base + 4*i.
+ * No-op unless capturing (lock-free fast-path). */
+void xemu_frameinspect_capture_methods(uint32_t first_method, bool method_inc,
+                                       uint16_t subchannel,
+                                       const uint32_t *words, uint32_t n,
+                                       uint64_t phys_base);
 /* Published immutable capture for the UI (Plan 3); caller must release it. */
 const FICapture *xemu_frameinspect_capture_acquire(void);
 void xemu_frameinspect_capture_release(const FICapture *capture);
