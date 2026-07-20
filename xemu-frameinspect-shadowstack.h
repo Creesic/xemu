@@ -37,6 +37,9 @@
 
 typedef struct FIFrame {
     uint32_t node;
+    uint32_t call_site;
+    uint32_t callee;
+    uint32_t args[6];
     uint32_t expected_ret;
     uint32_t esp_at_call;             /* ESP before the CALL pushed */
     uint32_t watch_invoc;             /* FI_INVOC_INVALID if unwatched */
@@ -115,6 +118,101 @@ static inline uint32_t fi_shadow_current(FIShadow *s, uint32_t thread_key)
     return st->frames[st->depth - 1].node;
 }
 
+static inline const FIFrame *fi_shadow_current_frame(FIShadow *s,
+                                                      uint32_t thread_key)
+{
+    FIStack *st = fi_shadow_stack(s, thread_key);
+    return st && st->depth ? &st->frames[st->depth - 1] : NULL;
+}
+
+static inline void fi_shadow_add_args(FICallTree *tree, uint32_t node,
+                                      const uint32_t args[6])
+{
+    if (node >= tree->num_nodes) {
+        return;
+    }
+    FINode *n = &tree->nodes[node];
+    for (uint32_t i = 0; i < n->n_argsets; i++) {
+        uint32_t id = n->argset_ids[i];
+        if (id < tree->num_argsets &&
+            memcmp(tree->argsets[id], args, sizeof(uint32_t) * 6) == 0) {
+            return;
+        }
+    }
+    if (n->n_argsets >= FI_NODE_ARGSETS || n->argsets_truncated) {
+        n->argsets_truncated = 1;
+        return;
+    }
+    uint16_t old_count = n->n_argsets;
+    fi_calltree_add_args(tree, node, args);
+    if (tree->pool_truncated && n->n_argsets == old_count) {
+        n->argsets_truncated = 1;
+    }
+}
+
+/* Materialize only paths that reach a RAM store. Each live frame caches its
+ * resulting immutable node, so repeated stores under the same path are O(1). */
+static inline uint32_t fi_shadow_materialize(FIShadow *s, uint32_t thread_key)
+{
+    FIStack *st = fi_shadow_stack(s, thread_key);
+    if (!st || st->depth == 0) {
+        return FI_NODE_ROOT;
+    }
+    uint32_t parent = FI_NODE_ROOT;
+    for (uint32_t i = 0; i < st->depth; i++) {
+        FIFrame *f = &st->frames[i];
+        if (f->node == FI_NODE_ROOT) {
+            for (uint32_t j = i + 1; j < st->depth; j++) {
+                st->frames[j].node = FI_NODE_ROOT;
+            }
+            return FI_NODE_ROOT;
+        }
+        if (f->node == FI_NODE_INVALID) {
+            uint32_t node = fi_calltree_intern(s->tree, parent, f->call_site,
+                                               f->callee);
+            if (node == FI_NODE_INVALID) {
+                for (uint32_t j = i; j < st->depth; j++) {
+                    st->frames[j].node = FI_NODE_ROOT;
+                }
+                return FI_NODE_ROOT;
+            }
+            f->node = node;
+            fi_shadow_add_args(s->tree, node, f->args);
+        }
+        parent = f->node;
+    }
+    return parent;
+}
+
+static inline uint32_t fi_shadow_call_lazy(FIShadow *s, uint32_t thread_key,
+                                            uint32_t call_site,
+                                            uint32_t callee,
+                                            uint32_t ret_addr, uint32_t esp,
+                                            const uint32_t args[6])
+{
+    FIStack *st = fi_shadow_stack(s, thread_key);
+    if (!st) {
+        return FI_NODE_ROOT;
+    }
+    while (st->depth > 0 && esp > st->frames[st->depth - 1].esp_at_call) {
+        fi_ss_pop_one(st, false, NULL, NULL);
+    }
+    if (st->depth < FI_SS_MAX_DEPTH) {
+        FIFrame *f = &st->frames[st->depth++];
+        f->node = FI_NODE_INVALID;
+        f->call_site = call_site;
+        f->callee = callee;
+        memcpy(f->args, args, sizeof(f->args));
+        f->expected_ret = ret_addr;
+        f->esp_at_call = esp;
+        f->watch_invoc = FI_INVOC_INVALID;
+        if (st->watch_depth) {
+            st->watch_depth++;
+        }
+    }
+    return FI_NODE_ROOT;
+}
+
 static inline uint32_t fi_shadow_call(FIShadow *s, uint32_t thread_key,
                                       uint32_t call_site, uint32_t callee,
                                       uint32_t ret_addr, uint32_t esp)
@@ -137,6 +235,9 @@ static inline uint32_t fi_shadow_call(FIShadow *s, uint32_t thread_key,
     if (st->depth < FI_SS_MAX_DEPTH) {
         FIFrame *f = &st->frames[st->depth++];
         f->node = node;
+        f->call_site = call_site;
+        f->callee = callee;
+        memset(f->args, 0, sizeof(f->args));
         f->expected_ret = ret_addr;
         f->esp_at_call = esp;
         f->watch_invoc = FI_INVOC_INVALID;

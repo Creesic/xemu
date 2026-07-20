@@ -27,6 +27,8 @@
 #include "xemu-frameinspect-resources.h"
 #include "xemu-frameinspect-eventlog.h"
 #include "xemu-frameinspect-methodlog.h"
+#include "xemu-frameinspect-commandlog.h"
+#include "xemu-frameinspect-origin.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -38,6 +40,8 @@ typedef enum {
     FI_CAP_IDLE,
     FI_CAP_ARMING,
     FI_CAP_ARMED,
+    FI_CAP_LEAD_IN,
+    FI_CAP_LEAD_IN_2,
     FI_CAP_CAPTURING,
     FI_CAP_PAUSE_PENDING,
     FI_CAP_DONE,
@@ -73,6 +77,7 @@ typedef struct FICapture {
     FIResourcePool resources;
     FIEventLog events;
     FIMethodLog methods;
+    FICommandLog commands;
     FIBudget budget;
     uint64_t methods_bytes;  /* total budget charged for `methods`, released
                               * in full on reset (init alloc + per-call
@@ -86,7 +91,9 @@ typedef struct FICapture {
                                 * used (instead of last_event) to mark the
                                 * batch's method-log range, since a clear/blit
                                 * inside the batch can move last_event. */
-    uint32_t batch_first_rec; /* methods.num_recs when the open batch began */
+    uint32_t batch_first_rec; /* first setup/draw method owned by open batch */
+    uint32_t batch_pending_first_rec; /* first setup method not yet assigned;
+                                       * attached to the following draw batch */
     uint32_t last_event;      /* index of the most-recently appended event
                                * (batch/clear/blit), or FI_EVENT_INVALID;
                                * used by attach_pixels() to find the event
@@ -98,7 +105,8 @@ typedef struct FICapture {
     uint64_t batch_res_bytes; /* total budget charged for `batch_res`,
                                * released in full on reset, symmetric with
                                * fi_budget_try (like methods_bytes) */
-    uint32_t origin_generation; /* live call-tree generation for method origins */
+    FIOriginSnapshot origins; /* immutable call paths and argument sets */
+    uint32_t origin_generation; /* source generation retained for diagnostics */
     uint32_t refcount;        /* protected by the capture-module lock */
     uint64_t capture_id;      /* monotonically increasing publication identity */
     bool batch_open;
@@ -190,6 +198,10 @@ void xemu_frameinspect_capture_methods(uint32_t first_method, bool method_inc,
                                        uint32_t n_labeled,
                                        uint64_t phys_base,
                                        const uint32_t *writer_tags);
+/* Append one decoded PFIFO pushbuffer word. Returns its immutable record id,
+ * or FI_COMMAND_INVALID when not capturing or when the log is truncated.
+ * The caller retains ownership of rec. */
+uint32_t xemu_frameinspect_capture_command(const FICommandRec *rec);
 /* Intern a content-hash-deduplicated resource snapshot (register file,
  * texture, palette, or an RTREF dependency reference) into the capture's
  * resource pool. Returns its id, or FI_RES_INVALID if not capturing or the

@@ -21,6 +21,7 @@
 
 #include "nv2a_int.h"
 #include "xemu-frameinspect.h"
+#include "xemu-frameinspect-tagmap.h"
 #include "xemu-frameinspect-capture.h"
 
 #define FI_PFIFO_SNAPSHOT_MAX 2052u /* 11-bit method count + 4 lookahead words */
@@ -36,6 +37,23 @@ typedef struct RAMHTEntry {
 static void pfifo_run_pusher(NV2AState *d);
 static uint32_t ramht_hash(NV2AState *d, uint32_t handle);
 static RAMHTEntry ramht_lookup(NV2AState *d, uint32_t handle);
+
+static void pfifo_fi_init_command(FICommandRec *rec, hwaddr dma_instance,
+                                  uint32_t dma_get, uint64_t phys_addr,
+                                  uint32_t raw, uint32_t tag,
+                                  FICommandKind kind)
+{
+    memset(rec, 0, sizeof(*rec));
+    rec->phys_addr = phys_addr;
+    rec->dma_instance = dma_instance;
+    rec->dma_get = dma_get;
+    rec->raw = raw;
+    rec->writer_node = tag ? FI_TAG_NODE(tag) : 0;
+    rec->confidence = tag == 0 ? FI_ORIG_UNATTRIBUTED :
+                      (tag & FI_TAG_PARTIAL) ? FI_ORIG_PARTIAL :
+                                               FI_ORIG_ATTRIBUTED;
+    rec->kind = kind;
+}
 
 /* PFIFO - MMIO and DMA FIFO submission to PGRAPH and VPE */
 uint64_t pfifo_read(void *opaque, hwaddr addr, unsigned int size)
@@ -315,7 +333,19 @@ static void pfifo_run_pusher(NV2AState *d)
 
         uint32_t *word_ptr = (uint32_t*)(dma + dma_get_v);
         uint32_t word = ldl_le_p(word_ptr);
+        uint32_t word_get = dma_get_v;
+        uint64_t word_phys = (uint64_t)((uint8_t *)word_ptr - d->vram_ptr);
         dma_get_v += 4;
+
+        bool fi_capturing =
+            xemu_frameinspect_capture_state() == FI_CAP_CAPTURING;
+        if (!fi_capturing) {
+            d->pfifo.fi_command_capture_active = false;
+            d->pfifo.fi_command_packet = FI_COMMAND_INVALID;
+        } else if (!d->pfifo.fi_command_capture_active) {
+            d->pfifo.fi_command_capture_active = true;
+            d->pfifo.fi_command_packet = FI_COMMAND_INVALID;
+        }
 
         uint32_t method_type =
             GET_MASK(*dma_state, NV_PFIFO_CACHE1_DMA_STATE_METHOD_TYPE);
@@ -343,7 +373,7 @@ static void pfifo_run_pusher(NV2AState *d)
             *status &= ~NV_PFIFO_CACHE1_STATUS_LOW_MARK;
 
             uint32_t fi_count = 0;
-            if (xemu_frameinspect_capture_state() == FI_CAP_CAPTURING) {
+            if (fi_capturing) {
                 fi_count = MIN((uint32_t)num_words_available,
                                method_count + 4);
                 assert(fi_count <= FI_PFIFO_SNAPSHOT_MAX);
@@ -386,6 +416,26 @@ static void pfifo_run_pusher(NV2AState *d)
                     method_type == NV_PFIFO_CACHE1_DMA_STATE_METHOD_TYPE_INC,
                     method_subchannel, fi_words, captured, n_labeled,
                     (uint64_t)((uint8_t *)word_ptr - d->vram_ptr), fi_tags);
+                for (uint32_t i = 0; i < n_labeled; i++) {
+                    FICommandRec rec;
+                    pfifo_fi_init_command(
+                        &rec, dma_instance, word_get + 4 * i,
+                        word_phys + 4ull * i, fi_words[i], fi_tags[i],
+                        FI_CMD_METHOD_PARAM);
+                    rec.data.parameter.packet = d->pfifo.fi_command_packet;
+                    rec.data.parameter.method =
+                        method_type ==
+                            NV_PFIFO_CACHE1_DMA_STATE_METHOD_TYPE_INC ?
+                        method + 4 * i : method;
+                    rec.data.parameter.parameter_index = *dma_dcount + i;
+                    rec.data.parameter.subchannel = method_subchannel;
+                    rec.data.parameter.method_type =
+                        method_type ==
+                            NV_PFIFO_CACHE1_DMA_STATE_METHOD_TYPE_INC ?
+                        FI_CMD_METHOD_INCREASING :
+                        FI_CMD_METHOD_NON_INCREASING;
+                    xemu_frameinspect_capture_command(&rec);
+                }
             }
 
             dma_get_v += (num_words_processed-1)*4;
@@ -405,18 +455,46 @@ static void pfifo_run_pusher(NV2AState *d)
             /* match all forms */
             if ((word & 0xe0000003) == 0x20000000) {
                 /* old jump */
+                if (fi_capturing) {
+                    FICommandRec rec;
+                    uint32_t tag = xemu_frameinspect_lookup_tag(word_phys);
+                    pfifo_fi_init_command(&rec, dma_instance, word_get,
+                                          word_phys, word, tag,
+                                          FI_CMD_OLD_JUMP);
+                    rec.data.control.target = word & 0x1fffffff;
+                    xemu_frameinspect_capture_command(&rec);
+                }
+                d->pfifo.fi_command_packet = FI_COMMAND_INVALID;
                 d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET_JMP_SHADOW] =
                     dma_get_v;
                 dma_get_v = word & 0x1fffffff;
                 NV2A_DPRINTF("pb OLD_JMP 0x%x\n", dma_get_v);
             } else if ((word & 3) == 1) {
                 /* jump */
+                if (fi_capturing) {
+                    FICommandRec rec;
+                    uint32_t tag = xemu_frameinspect_lookup_tag(word_phys);
+                    pfifo_fi_init_command(&rec, dma_instance, word_get,
+                                          word_phys, word, tag, FI_CMD_JUMP);
+                    rec.data.control.target = word & 0xfffffffc;
+                    xemu_frameinspect_capture_command(&rec);
+                }
+                d->pfifo.fi_command_packet = FI_COMMAND_INVALID;
                 d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET_JMP_SHADOW] =
                     dma_get_v;
                 dma_get_v = word & 0xfffffffc;
                 NV2A_DPRINTF("pb JMP 0x%x\n", dma_get_v);
             } else if ((word & 3) == 2) {
                 /* call */
+                if (fi_capturing) {
+                    FICommandRec rec;
+                    uint32_t tag = xemu_frameinspect_lookup_tag(word_phys);
+                    pfifo_fi_init_command(&rec, dma_instance, word_get,
+                                          word_phys, word, tag, FI_CMD_CALL);
+                    rec.data.control.target = word & 0xfffffffc;
+                    xemu_frameinspect_capture_command(&rec);
+                }
+                d->pfifo.fi_command_packet = FI_COMMAND_INVALID;
                 if (subroutine_state) {
                     SET_MASK(*dma_state, NV_PFIFO_CACHE1_DMA_STATE_ERROR,
                              NV_PFIFO_CACHE1_DMA_STATE_ERROR_CALL);
@@ -430,6 +508,16 @@ static void pfifo_run_pusher(NV2AState *d)
                 }
             } else if (word == 0x00020000) {
                 /* return */
+                if (fi_capturing) {
+                    FICommandRec rec;
+                    uint32_t tag = xemu_frameinspect_lookup_tag(word_phys);
+                    pfifo_fi_init_command(&rec, dma_instance, word_get,
+                                          word_phys, word, tag, FI_CMD_RETURN);
+                    rec.data.control.target = subroutine_state ?
+                        *dma_subroutine & 0xfffffffc : 0;
+                    xemu_frameinspect_capture_command(&rec);
+                }
+                d->pfifo.fi_command_packet = FI_COMMAND_INVALID;
                 if (!subroutine_state) {
                     SET_MASK(*dma_state, NV_PFIFO_CACHE1_DMA_STATE_ERROR,
                              NV_PFIFO_CACHE1_DMA_STATE_ERROR_RETURN);
@@ -442,6 +530,19 @@ static void pfifo_run_pusher(NV2AState *d)
                 }
             } else if ((word & 0xe0030003) == 0) {
                 /* increasing methods */
+                if (fi_capturing) {
+                    FICommandRec rec;
+                    uint32_t tag = xemu_frameinspect_lookup_tag(word_phys);
+                    pfifo_fi_init_command(&rec, dma_instance, word_get,
+                                          word_phys, word, tag,
+                                          FI_CMD_METHOD_HEADER);
+                    rec.data.header.method = word & 0x1ffc;
+                    rec.data.header.count = (word >> 18) & 0x7ff;
+                    rec.data.header.subchannel = (word >> 13) & 7;
+                    rec.data.header.method_type = FI_CMD_METHOD_INCREASING;
+                    d->pfifo.fi_command_packet =
+                        xemu_frameinspect_capture_command(&rec);
+                }
                 SET_MASK(*dma_state, NV_PFIFO_CACHE1_DMA_STATE_METHOD,
                          (word & 0x1fff) >> 2 );
                 SET_MASK(*dma_state, NV_PFIFO_CACHE1_DMA_STATE_SUBCHANNEL,
@@ -453,6 +554,20 @@ static void pfifo_run_pusher(NV2AState *d)
                 *dma_dcount = 0;
             } else if ((word & 0xe0030003) == 0x40000000) {
                 /* non-increasing methods */
+                if (fi_capturing) {
+                    FICommandRec rec;
+                    uint32_t tag = xemu_frameinspect_lookup_tag(word_phys);
+                    pfifo_fi_init_command(&rec, dma_instance, word_get,
+                                          word_phys, word, tag,
+                                          FI_CMD_METHOD_HEADER);
+                    rec.data.header.method = word & 0x1ffc;
+                    rec.data.header.count = (word >> 18) & 0x7ff;
+                    rec.data.header.subchannel = (word >> 13) & 7;
+                    rec.data.header.method_type =
+                        FI_CMD_METHOD_NON_INCREASING;
+                    d->pfifo.fi_command_packet =
+                        xemu_frameinspect_capture_command(&rec);
+                }
                 SET_MASK(*dma_state, NV_PFIFO_CACHE1_DMA_STATE_METHOD,
                          (word & 0x1fff) >> 2 );
                 SET_MASK(*dma_state, NV_PFIFO_CACHE1_DMA_STATE_SUBCHANNEL,
@@ -463,6 +578,15 @@ static void pfifo_run_pusher(NV2AState *d)
                          NV_PFIFO_CACHE1_DMA_STATE_METHOD_TYPE_NON_INC);
                 *dma_dcount = 0;
             } else {
+                if (fi_capturing) {
+                    FICommandRec rec;
+                    uint32_t tag = xemu_frameinspect_lookup_tag(word_phys);
+                    pfifo_fi_init_command(&rec, dma_instance, word_get,
+                                          word_phys, word, tag,
+                                          FI_CMD_RESERVED);
+                    xemu_frameinspect_capture_command(&rec);
+                }
+                d->pfifo.fi_command_packet = FI_COMMAND_INVALID;
                 NV2A_DPRINTF("pb reserved cmd 0x%x - 0x%x\n",
                              dma_get_v, word);
                 SET_MASK(*dma_state, NV_PFIFO_CACHE1_DMA_STATE_ERROR,

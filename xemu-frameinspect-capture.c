@@ -71,10 +71,15 @@ static void fi_capture_reset(FICapture *c)
         fi_budget_release(&c->budget, c->methods_bytes);
     }
     fi_methodlog_free(&c->methods);
+    fi_commandlog_free(&c->commands, &c->budget);
     if (c->batch_res_bytes) {
         fi_budget_release(&c->budget, c->batch_res_bytes);
     }
     free(c->batch_res);
+    if (c->origins.bytes) {
+        fi_budget_release(&c->budget, c->origins.bytes);
+    }
+    fi_origin_snapshot_free(&c->origins);
     memset(c, 0, sizeof(*c));
 }
 
@@ -103,6 +108,7 @@ static bool fi_capture_alloc(FICapture *c)
         !fi_surfaces_init(&c->surfaces) ||
         !fi_resources_init(&c->resources, &c->budget) ||
         !fi_eventlog_init(&c->events, &c->budget) ||
+        !fi_commandlog_init(&c->commands, &c->budget) ||
         !fi_budget_try(&c->budget, methods_bytes)) {
         fi_capture_reset(c);
         return false;
@@ -119,6 +125,159 @@ static bool fi_capture_alloc(FICapture *c)
     return true;
 }
 
+static void fi_capture_command_diag(const FICapture *c)
+{
+    uint32_t kinds[FI_CMD_RESERVED + 1] = {};
+    uint32_t unknown = 0;
+    uint32_t orphan_params = 0;
+    uint32_t invalid_links = 0;
+    uint32_t malformed = 0;
+    uint32_t unresolved_origins = 0;
+
+    for (uint32_t i = 0; i < c->commands.num_recs; i++) {
+        const FICommandRec *rec = &c->commands.recs[i];
+        if (rec->kind <= FI_CMD_RESERVED) {
+            kinds[rec->kind]++;
+        } else {
+            unknown++;
+            malformed++;
+            continue;
+        }
+        if (rec->seq != i) {
+            malformed++;
+        }
+        if ((rec->confidence == FI_ORIG_ATTRIBUTED ||
+             rec->confidence == FI_ORIG_PARTIAL) &&
+            !fi_origin_snapshot_node(&c->origins, rec->writer_node)) {
+            unresolved_origins++;
+        }
+
+        switch (rec->kind) {
+        case FI_CMD_METHOD_HEADER: {
+            uint32_t raw_type = rec->raw & 0xe0030003;
+            uint8_t method_type = raw_type == 0 ?
+                FI_CMD_METHOD_INCREASING : FI_CMD_METHOD_NON_INCREASING;
+            if ((raw_type != 0 && raw_type != 0x40000000) ||
+                rec->data.header.method != (rec->raw & 0x1ffc) ||
+                rec->data.header.subchannel != ((rec->raw >> 13) & 7) ||
+                rec->data.header.count != ((rec->raw >> 18) & 0x7ff) ||
+                rec->data.header.method_type != method_type) {
+                malformed++;
+            }
+            break;
+        }
+        case FI_CMD_METHOD_PARAM: {
+            uint32_t packet = rec->data.parameter.packet;
+            if (packet == FI_COMMAND_INVALID) {
+                orphan_params++;
+                break;
+            }
+            if (packet >= i || packet >= c->commands.num_recs ||
+                c->commands.recs[packet].kind != FI_CMD_METHOD_HEADER) {
+                invalid_links++;
+                break;
+            }
+            const FICommandRec *header = &c->commands.recs[packet];
+            uint32_t parameter_index = rec->data.parameter.parameter_index;
+            uint32_t expected_method = header->data.header.method;
+            if (header->data.header.method_type == FI_CMD_METHOD_INCREASING) {
+                expected_method += 4 * parameter_index;
+            }
+            if (parameter_index >= header->data.header.count ||
+                rec->data.parameter.method != expected_method ||
+                rec->data.parameter.subchannel !=
+                    header->data.header.subchannel ||
+                rec->data.parameter.method_type !=
+                    header->data.header.method_type) {
+                invalid_links++;
+            }
+            break;
+        }
+        case FI_CMD_OLD_JUMP:
+            if ((rec->raw & 0xe0000003) != 0x20000000 ||
+                rec->data.control.target != (rec->raw & 0x1fffffff)) {
+                malformed++;
+            }
+            break;
+        case FI_CMD_JUMP:
+            if ((rec->raw & 3) != 1 ||
+                rec->data.control.target != (rec->raw & 0xfffffffc)) {
+                malformed++;
+            }
+            break;
+        case FI_CMD_CALL:
+            if ((rec->raw & 3) != 2 ||
+                rec->data.control.target != (rec->raw & 0xfffffffc)) {
+                malformed++;
+            }
+            break;
+        case FI_CMD_RETURN:
+            if (rec->raw != 0x00020000) {
+                malformed++;
+            }
+            break;
+        case FI_CMD_RESERVED:
+            break;
+        default:
+            g_assert_not_reached();
+        }
+    }
+
+    fprintf(stderr,
+            "FI_COMMAND_DIAG records=%u headers=%u params=%u jumps=%u "
+            "old_jumps=%u calls=%u returns=%u reserved=%u unknown=%u "
+            "orphan_params=%u invalid_links=%u malformed=%u "
+            "unresolved_origins=%u truncated=%u\n",
+            c->commands.num_recs, kinds[FI_CMD_METHOD_HEADER],
+            kinds[FI_CMD_METHOD_PARAM], kinds[FI_CMD_JUMP],
+            kinds[FI_CMD_OLD_JUMP], kinds[FI_CMD_CALL], kinds[FI_CMD_RETURN],
+            kinds[FI_CMD_RESERVED], unknown, orphan_params, invalid_links,
+            malformed, unresolved_origins, c->commands.truncated);
+}
+
+static void fi_capture_batch_origin_diag(const FICapture *c)
+{
+    for (uint32_t i = 0; i < c->methods.num_batches; i++) {
+        const FIMethodBatch *batch = &c->methods.batches[i];
+        if (batch->first_rec > c->methods.num_recs ||
+            batch->rec_count > c->methods.num_recs - batch->first_rec) {
+            fprintf(stderr,
+                    "FI_BATCH_ORIGIN batch=%u event=%u invalid_range=1\n",
+                    i, batch->batch_event);
+            continue;
+        }
+        uint32_t resolved = 0;
+        uint32_t root = 0;
+        uint32_t unattributed = 0;
+        uint32_t phys_min = UINT32_MAX;
+        uint32_t phys_max = 0;
+        for (uint32_t j = batch->first_rec;
+             j < batch->first_rec + batch->rec_count; j++) {
+            const FIMethodRec *rec = &c->methods.recs[j];
+            if (rec->phys_addr < phys_min) {
+                phys_min = rec->phys_addr;
+            }
+            if (rec->phys_addr > phys_max) {
+                phys_max = rec->phys_addr;
+            }
+            if (rec->confidence != FI_ORIG_ATTRIBUTED &&
+                rec->confidence != FI_ORIG_PARTIAL) {
+                unattributed++;
+            } else if (rec->writer_node == FI_NODE_ROOT) {
+                root++;
+            } else {
+                resolved++;
+            }
+        }
+        fprintf(stderr,
+                "FI_BATCH_ORIGIN batch=%u event=%u methods=%u resolved=%u "
+                "root=%u unattributed=%u phys=0x%08x-0x%08x\n",
+                i, batch->batch_event, batch->rec_count, resolved, root,
+                unattributed, phys_min == UINT32_MAX ? 0 : phys_min, phys_max);
+    }
+    fflush(stderr);
+}
+
 bool xemu_frameinspect_capture_arm(uint64_t ram_size)
 {
     fi_capture_sync_init();
@@ -129,8 +288,8 @@ bool xemu_frameinspect_capture_arm(uint64_t ram_size)
         return false;
     }
     qatomic_set(&fi_state, FI_CAP_ARMING);
-    /* Lead-in: enable Plan-1 guest instrumentation now so writes during the
-     * frame before the captured frame are tagged. */
+    /* Lead-in: enable guest instrumentation now so writes during the frame
+     * before the captured frame are tagged. */
     xemu_frameinspect_arm(ram_size);
     bool armed = xemu_frameinspect_is_armed();
 
@@ -153,6 +312,8 @@ FICaptureFlipResult xemu_frameinspect_capture_on_flip(bool opengl_active)
     qemu_mutex_lock(&fi_lock);
     if (!opengl_active &&
         (qatomic_read(&fi_state) == FI_CAP_ARMED ||
+         qatomic_read(&fi_state) == FI_CAP_LEAD_IN ||
+         qatomic_read(&fi_state) == FI_CAP_LEAD_IN_2 ||
          qatomic_read(&fi_state) == FI_CAP_CAPTURING)) {
         if (qatomic_read(&fi_state) == FI_CAP_CAPTURING) {
             fi_capture_reset(&fi_cap);
@@ -164,7 +325,17 @@ FICaptureFlipResult xemu_frameinspect_capture_on_flip(bool opengl_active)
     }
     switch (qatomic_read(&fi_state)) {
     case FI_CAP_ARMED:
-        /* First flip after arming: the captured frame starts now. */
+        /* The hotkey can arrive immediately before a flip. Establish a frame
+         * boundary first so provenance always gets one complete lead-in. */
+        qatomic_set(&fi_state, FI_CAP_LEAD_IN);
+        qemu_mutex_unlock(&fi_lock);
+        return FI_CAP_FLIP_NONE;
+    case FI_CAP_LEAD_IN:
+        qatomic_set(&fi_state, FI_CAP_LEAD_IN_2);
+        qemu_mutex_unlock(&fi_lock);
+        return FI_CAP_FLIP_NONE;
+    case FI_CAP_LEAD_IN_2:
+        /* Two complete instrumented frames elapsed; capture the next frame. */
         if (!fi_capture_alloc(&fi_cap)) {
             qatomic_set(&fi_state, FI_CAP_IDLE);
             xemu_frameinspect_disarm();
@@ -175,12 +346,27 @@ FICaptureFlipResult xemu_frameinspect_capture_on_flip(bool opengl_active)
         qemu_mutex_unlock(&fi_lock);
         return FI_CAP_FLIP_NONE;
     case FI_CAP_CAPTURING: {
-        /* Second flip: the captured frame ended. Finalize + publish. */
+        /* Following flip: the captured frame ended. Finalize + publish. */
+        xemu_frameinspect_disarm();
+        uint64_t origin_limit = fi_cap.budget.limit - fi_cap.budget.used;
+        bool origins_copied = xemu_frameinspect_snapshot_origins(
+            &fi_cap.origins, origin_limit);
+        if (origins_copied &&
+            !fi_budget_try(&fi_cap.budget, fi_cap.origins.bytes)) {
+            uint32_t truncation =
+                fi_cap.origins.truncation | FI_ORIGIN_TRUNC_BUDGET;
+            fi_origin_snapshot_free(&fi_cap.origins);
+            fi_cap.origins.truncation = truncation;
+            origins_copied = false;
+        }
+        if (!origins_copied || fi_cap.origins.truncation) {
+            fi_cap.truncated = true;
+        }
+
         FICapture *done = (FICapture *)malloc(sizeof(FICapture));
         if (!done) {
             fi_capture_reset(&fi_cap);
             qatomic_set(&fi_state, FI_CAP_IDLE);
-            xemu_frameinspect_disarm();
             qemu_mutex_unlock(&fi_lock);
             return FI_CAP_FLIP_FAILED;
         }
@@ -188,11 +374,41 @@ FICaptureFlipResult xemu_frameinspect_capture_on_flip(bool opengl_active)
         memset(&fi_cap, 0, sizeof(fi_cap));
         done->refcount = 1;             /* published-pointer ownership */
         done->capture_id = ++fi_next_capture_id;
+        uint32_t attributed = 0;
+        uint32_t partial = 0;
+        uint32_t unattributed = 0;
+        uint32_t root = 0;
+        for (uint32_t i = 0; i < done->methods.num_recs; i++) {
+            if ((done->methods.recs[i].confidence == FI_ORIG_ATTRIBUTED ||
+                 done->methods.recs[i].confidence == FI_ORIG_PARTIAL) &&
+                done->methods.recs[i].writer_node == FI_NODE_ROOT) {
+                root++;
+            }
+            switch (done->methods.recs[i].confidence) {
+            case FI_ORIG_ATTRIBUTED:
+                attributed++;
+                break;
+            case FI_ORIG_PARTIAL:
+                partial++;
+                break;
+            default:
+                unattributed++;
+                break;
+            }
+        }
+        char *origin_status = xemu_frameinspect_status_line();
+        fprintf(stderr,
+                "FI_ORIGIN_DIAG methods=%u attributed=%u partial=%u "
+                "unattributed=%u root=%u %s\n",
+                done->methods.num_recs, attributed, partial, unattributed, root,
+                origin_status);
+        g_free(origin_status);
+        fi_capture_batch_origin_diag(done);
+        fi_capture_command_diag(done);
         FICapture *old = fi_published;
         fi_published = done;
         bool destroy_old = old && --old->refcount == 0;
         qatomic_set(&fi_state, FI_CAP_PAUSE_PENDING);
-        xemu_frameinspect_disarm();     /* end lead-in instrumentation */
         qemu_mutex_unlock(&fi_lock);
         if (destroy_old) {
             fi_capture_destroy(old);
@@ -223,6 +439,8 @@ bool xemu_frameinspect_capture_cancel(void)
     qemu_mutex_lock(&fi_lock);
     bool active = qatomic_read(&fi_state) == FI_CAP_ARMING ||
                   qatomic_read(&fi_state) == FI_CAP_ARMED ||
+                  qatomic_read(&fi_state) == FI_CAP_LEAD_IN ||
+                  qatomic_read(&fi_state) == FI_CAP_LEAD_IN_2 ||
                   qatomic_read(&fi_state) == FI_CAP_CAPTURING ||
                   qatomic_read(&fi_state) == FI_CAP_PAUSE_PENDING;
     if (qatomic_read(&fi_state) == FI_CAP_CAPTURING) {
@@ -294,7 +512,8 @@ bool xemu_frameinspect_capture_begin_batch(uint32_t surface_gen,
                                       zeta_surface_gen, 0, 0, 0);
     fi_cap.last_event = idx;
     fi_cap.open_batch_event = idx;
-    fi_cap.batch_first_rec = fi_cap.methods.num_recs;
+    fi_cap.batch_first_rec = MIN(fi_cap.batch_pending_first_rec,
+                                 fi_cap.methods.num_recs);
     qemu_mutex_unlock(&fi_lock);
     return idx != FI_EVENT_INVALID;
 }
@@ -311,9 +530,13 @@ void xemu_frameinspect_capture_end_batch(void)
             uint32_t rec_count = fi_cap.methods.num_recs - fi_cap.batch_first_rec;
             if (rec_count > 0) {
                 fi_methodlog_mark_batch(&fi_cap.methods, fi_cap.open_batch_event,
-                                        fi_cap.batch_first_rec, rec_count);
+                                         fi_cap.batch_first_rec, rec_count);
             }
         }
+        /* draw_end runs while PFIFO is dispatching SET_BEGIN_END(END), before
+         * capture_methods() appends that parameter. Skip it; subsequent state
+         * setup belongs to the next draw batch. */
+        fi_cap.batch_pending_first_rec = fi_cap.methods.num_recs + 1;
         fi_cap.open_batch_gen = FI_SURFGEN_INVALID;
         fi_cap.open_batch_zeta_gen = FI_SURFGEN_INVALID;
         fi_cap.open_batch_event = FI_EVENT_INVALID;
@@ -648,6 +871,25 @@ void xemu_frameinspect_capture_methods(uint32_t first_method, bool method_inc,
     qemu_mutex_unlock(&fi_lock);
 }
 
+uint32_t xemu_frameinspect_capture_command(const FICommandRec *rec)
+{
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING || !rec) {
+        return FI_COMMAND_INVALID;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        qemu_mutex_unlock(&fi_lock);
+        return FI_COMMAND_INVALID;
+    }
+    uint32_t id = fi_commandlog_append(&fi_cap.commands, &fi_cap.budget, rec);
+    if (id == FI_COMMAND_INVALID) {
+        fi_cap.truncated = true;
+    }
+    qemu_mutex_unlock(&fi_lock);
+    return id;
+}
+
 uint32_t xemu_frameinspect_capture_resource(uint32_t kind, const void *data,
                                             uint32_t len, uint64_t meta)
 {
@@ -750,11 +992,13 @@ char *xemu_frameinspect_capture_summary(void)
         return g_strdup("Frame inspector: no capture");
     }
     char *summary = g_strdup_printf(
-        "Captured frame: %u events, %u surfaces, %u methods, %u resources%s",
-        c->events.count, c->surfaces.num_gens, c->methods.num_recs,
-        c->resources.num_res,
+        "Captured frame: %u events, %u surfaces, %u commands, %u methods, "
+        "%u resources%s",
+        c->events.count, c->surfaces.num_gens, c->commands.num_recs,
+        c->methods.num_recs, c->resources.num_res,
         (c->truncated || c->events.truncated || c->surfaces.truncated ||
-         c->resources.truncated || c->methods.truncated) ? " [TRUNCATED]" : "");
+         c->resources.truncated || c->methods.truncated ||
+         c->commands.truncated) ? " [TRUNCATED]" : "");
     xemu_frameinspect_capture_release(c);
     return summary;
 }

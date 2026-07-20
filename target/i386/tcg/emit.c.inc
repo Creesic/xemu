@@ -1626,7 +1626,7 @@ static void gen_CALL(DisasContext *s, X86DecodedInsn *decode)
     if (xemu_frameinspect_armed) {
         gen_xemu_fi_call_direct(s, decode);
     }
-    gen_push_v(s, eip_next_tl(s));
+    gen_push_v(s, eip_next_tl(s), false);
     gen_JMP(s, decode);
 }
 
@@ -1638,7 +1638,7 @@ static void gen_CALL_m(DisasContext *s, X86DecodedInsn *decode)
     if (xemu_frameinspect_armed) {
         gen_xemu_fi_call(s, s->T0);
     }
-    gen_push_v(s, eip_next_tl(s));
+    gen_push_v(s, eip_next_tl(s), false);
     gen_JMP_m(s, decode);
 }
 
@@ -3309,7 +3309,7 @@ static void gen_PSLLDQ_i(DisasContext *s, X86DecodedInsn *decode)
 
 static void gen_PUSH(DisasContext *s, X86DecodedInsn *decode)
 {
-    gen_push_v(s, s->T0);
+    gen_push_v(s, s->T0, true);
 }
 
 static void gen_PUSHA(DisasContext *s, X86DecodedInsn *decode)
@@ -3321,7 +3321,7 @@ static void gen_PUSHF(DisasContext *s, X86DecodedInsn *decode)
 {
     gen_update_cc_op(s);
     gen_helper_read_eflags(s->T0, tcg_env);
-    gen_push_v(s, s->T0);
+    gen_push_v(s, s->T0, true);
 }
 
 static MemOp gen_shift_count(DisasContext *s, X86DecodedInsn *decode,

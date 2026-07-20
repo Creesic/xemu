@@ -21,6 +21,7 @@
 #include "viewport-manager.hh"
 #include "font-manager.hh"
 #include "widgets.hh"
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -28,6 +29,7 @@ extern "C" {
 #include "../../xemu-frameinspect-capture.h"
 #include "../../xemu-frameinspect.h"
 #include "../../xemu-frameinspect-symbols.h"
+#include "../../hw/xbox/nv2a/nv2a_regs.h"
 #include "../xemu-settings.h"
 }
 
@@ -137,6 +139,185 @@ static const char *fi_confidence_name(uint16_t confidence)
     case FI_ORIG_LOSTSYNC: return "lostsync";
     default: return "?";
     }
+}
+
+static const char *fi_command_kind_name(uint8_t kind)
+{
+    switch (kind) {
+    case FI_CMD_METHOD_HEADER: return "METHOD_HEADER";
+    case FI_CMD_METHOD_PARAM: return "METHOD_PARAM";
+    case FI_CMD_JUMP: return "JUMP";
+    case FI_CMD_OLD_JUMP: return "OLD_JUMP";
+    case FI_CMD_CALL: return "CALL";
+    case FI_CMD_RETURN: return "RETURN";
+    case FI_CMD_RESERVED: return "RESERVED";
+    default: return "?";
+    }
+}
+
+static void fi_format_command(const FICommandRec *rec, char *buf, size_t size)
+{
+    switch (rec->kind) {
+    case FI_CMD_METHOD_HEADER:
+        snprintf(buf, size, "method=0x%04x sub=%u count=%u %s",
+                 rec->data.header.method, rec->data.header.subchannel,
+                 rec->data.header.count,
+                 rec->data.header.method_type == FI_CMD_METHOD_INCREASING ?
+                     "increasing" : "non-increasing");
+        break;
+    case FI_CMD_METHOD_PARAM:
+        if (rec->data.parameter.packet == FI_COMMAND_INVALID) {
+            snprintf(buf, size,
+                     "packet=missing method=0x%04x sub=%u param[%u] %s",
+                     rec->data.parameter.method,
+                     rec->data.parameter.subchannel,
+                     rec->data.parameter.parameter_index,
+                     rec->data.parameter.method_type ==
+                             FI_CMD_METHOD_INCREASING ?
+                         "increasing" : "non-increasing");
+        } else {
+            snprintf(buf, size,
+                     "packet=#%u method=0x%04x sub=%u param[%u] %s",
+                     rec->data.parameter.packet, rec->data.parameter.method,
+                     rec->data.parameter.subchannel,
+                     rec->data.parameter.parameter_index,
+                     rec->data.parameter.method_type ==
+                             FI_CMD_METHOD_INCREASING ?
+                         "increasing" : "non-increasing");
+        }
+        break;
+    case FI_CMD_JUMP:
+    case FI_CMD_OLD_JUMP:
+    case FI_CMD_CALL:
+    case FI_CMD_RETURN:
+        snprintf(buf, size, "target=0x%08x", rec->data.control.target);
+        break;
+    default:
+        snprintf(buf, size, "-");
+        break;
+    }
+}
+
+static void fi_nv097_method_name(uint32_t method, char *buf, size_t size)
+{
+#define DEF_METHOD(gclass, name) \
+    if (method == gclass ## _ ## name) { \
+        snprintf(buf, size, #gclass "_" #name); \
+        return; \
+    }
+#define DEF_METHOD_RANGE(gclass, name, range) \
+    if (method >= gclass ## _ ## name && \
+        method < gclass ## _ ## name + 4 * (range)) { \
+        snprintf(buf, size, #gclass "_" #name "[%u]", \
+                 (method - gclass ## _ ## name) / 4); \
+        return; \
+    }
+#define DEF_METHOD_CASE_4_OFFSET(gclass, name, offset, stride) \
+    if (method >= gclass ## _ ## name + (offset) && \
+        method <= gclass ## _ ## name + (offset) + 3 * (stride) && \
+        (method - gclass ## _ ## name - (offset)) % (stride) == 0) { \
+        snprintf(buf, size, #gclass "_" #name "[%u]+0x%x", \
+                 (method - gclass ## _ ## name - (offset)) / (stride), \
+                 (unsigned int)(offset)); \
+        return; \
+    }
+#define DEF_METHOD_CASE_4(gclass, name, stride) \
+    DEF_METHOD_CASE_4_OFFSET(gclass, name, 0, stride)
+#include "../../hw/xbox/nv2a/pgraph/methods.h.inc"
+#undef DEF_METHOD
+#undef DEF_METHOD_RANGE
+#undef DEF_METHOD_CASE_4_OFFSET
+#undef DEF_METHOD_CASE_4
+    snprintf(buf, size, "NV097_METHOD_0x%04x", method);
+}
+
+static const char *fi_primitive_name(uint32_t primitive)
+{
+    switch (primitive) {
+    case NV097_SET_BEGIN_END_OP_END: return "END";
+    case NV097_SET_BEGIN_END_OP_POINTS: return "POINTS";
+    case NV097_SET_BEGIN_END_OP_LINES: return "LINES";
+    case NV097_SET_BEGIN_END_OP_LINE_LOOP: return "LINE_LOOP";
+    case NV097_SET_BEGIN_END_OP_LINE_STRIP: return "LINE_STRIP";
+    case NV097_SET_BEGIN_END_OP_TRIANGLES: return "TRIANGLES";
+    case NV097_SET_BEGIN_END_OP_TRIANGLE_STRIP: return "TRIANGLE_STRIP";
+    case NV097_SET_BEGIN_END_OP_TRIANGLE_FAN: return "TRIANGLE_FAN";
+    case NV097_SET_BEGIN_END_OP_QUADS: return "QUADS";
+    case NV097_SET_BEGIN_END_OP_QUAD_STRIP: return "QUAD_STRIP";
+    case NV097_SET_BEGIN_END_OP_POLYGON: return "POLYGON";
+    default: return "UNKNOWN";
+    }
+}
+
+static void fi_format_readable_command(const FICommandRec *rec, char *operation,
+                                       size_t operation_size, char *meaning,
+                                       size_t meaning_size)
+{
+    if (rec->kind != FI_CMD_METHOD_PARAM) {
+        snprintf(operation, operation_size, "%s",
+                 fi_command_kind_name(rec->kind));
+        if (rec->kind == FI_CMD_JUMP || rec->kind == FI_CMD_OLD_JUMP ||
+            rec->kind == FI_CMD_CALL || rec->kind == FI_CMD_RETURN) {
+            snprintf(meaning, meaning_size, "target=0x%08x",
+                     rec->data.control.target);
+        } else {
+            snprintf(meaning, meaning_size, "raw=0x%08x", rec->raw);
+        }
+        return;
+    }
+
+    uint32_t method = rec->data.parameter.method;
+    fi_nv097_method_name(method, operation, operation_size);
+    switch (method) {
+    case NV097_SET_BEGIN_END:
+        snprintf(meaning, meaning_size, "primitive=%s (0x%x)",
+                 fi_primitive_name(rec->raw), rec->raw);
+        break;
+    case NV097_DRAW_ARRAYS: {
+        uint32_t start = rec->raw & 0x00ffffff;
+        uint32_t count = ((rec->raw >> 24) & 0xff) + 1;
+        snprintf(meaning, meaning_size,
+                 "start=%u (0x%x), count=%u, last=%u", start, start, count,
+                 start + count - 1);
+        break;
+    }
+    case NV097_ARRAY_ELEMENT16:
+        snprintf(meaning, meaning_size, "indices=%u, %u", rec->raw & 0xffff,
+                 rec->raw >> 16);
+        break;
+    case NV097_ARRAY_ELEMENT32:
+        snprintf(meaning, meaning_size, "index=%u (0x%x)", rec->raw,
+                 rec->raw);
+        break;
+    case NV097_INLINE_ARRAY:
+        snprintf(meaning, meaning_size, "inline vertex dword=0x%08x",
+                 rec->raw);
+        break;
+    default:
+        snprintf(meaning, meaning_size, "value=0x%08x", rec->raw);
+        break;
+    }
+}
+
+static void fi_command_writer_symbol(const FICapture *cap,
+                                     const FICommandRec *rec, char *buf,
+                                     size_t size)
+{
+    if (rec->confidence != FI_ORIG_ATTRIBUTED &&
+        rec->confidence != FI_ORIG_PARTIAL) {
+        snprintf(buf, size, "%s", fi_confidence_name(rec->confidence));
+        return;
+    }
+    const FIOriginNode *node =
+        fi_origin_snapshot_node(&cap->origins, rec->writer_node);
+    if (!node) {
+        snprintf(buf, size, "node %u (origin unavailable)", rec->writer_node);
+        return;
+    }
+    char symbol[160];
+    fi_sym(node->callee, symbol, sizeof(symbol));
+    snprintf(buf, size, "%s%s", symbol,
+             rec->confidence == FI_ORIG_PARTIAL ? " (partial)" : "");
 }
 
 /* Mirrors xemu-frameinspect-tagmap.h's tag encoding (tag==0 => unattributed;
@@ -299,13 +480,9 @@ static void fi_methods_tab(FrameInspectorWindow *w, const FICapture *cap,
     ImGui::PopFont();
 }
 
-/* Walks a call chain from start_node up to the root, one row per frame
- * (innermost/writer first). Resolves each node via
- * xemu_frameinspect_node_info(), which reads the LIVE Plan-1 call tree --
- * valid only until the inspector's capture is re-armed. Shared by the
- * Origin tab (Task 4, walking a method record's writer_node) and the
- * Address Lookup panel (Task 6, walking a tag map hit's node). */
-static void fi_render_call_chain(uint32_t start_node, uint32_t generation)
+/* Walks a captured call chain from start_node up to the root, one row per
+ * frame (innermost/writer first). */
+static void fi_render_call_chain(const FICapture *cap, uint32_t start_node)
 {
     ImGui::PushFont(g_font_mgr.m_fixed_width_font);
     uint32_t node = start_node;
@@ -316,30 +493,36 @@ static void fi_render_call_chain(uint32_t start_node, uint32_t generation)
     int indents = 0;
     int depth = 0;
     while (node != FI_NODE_ROOT && node != FI_NODE_INVALID) {
-        FINodeInfo ni = xemu_frameinspect_node_info(node, generation);
-        if (!ni.valid) {
+        const FIOriginNode *ni = fi_origin_snapshot_node(&cap->origins, node);
+        if (!ni) {
             ImGui::TextColored(ImVec4(1, 0.6f, 0, 1),
-                              "origin unavailable (capture re-armed)");
+                              "origin unavailable (not captured or truncated)");
             break;
+        }
+        const uint32_t *args =
+            fi_origin_snapshot_argset(&cap->origins, ni, 0);
+        static const uint32_t no_args[6] = {};
+        if (!args) {
+            args = no_args;
         }
         ImGui::PushID(depth);
         char cs[128], ce[128];
-        ImGui::Text("%s -> %s", fi_sym(ni.call_site, cs, sizeof(cs)),
-                    fi_sym(ni.callee, ce, sizeof(ce)));
+        ImGui::Text("%s -> %s", fi_sym(ni->call_site, cs, sizeof(cs)),
+                    fi_sym(ni->callee, ce, sizeof(ce)));
         ImGui::Text("call_site=0x%08x callee=0x%08x  ecx/this=0x%08x  "
                     "args: %08x %08x %08x %08x %08x",
-                    ni.call_site, ni.callee, ni.args[0], ni.args[1], ni.args[2],
-                    ni.args[3], ni.args[4], ni.args[5]);
+                    ni->call_site, ni->callee, args[0], args[1], args[2],
+                    args[3], args[4], args[5]);
         ImGui::SameLine();
         if (ImGui::SmallButton("copy callee")) {
             char hex[16];
-            snprintf(hex, sizeof(hex), "0x%08x", ni.callee);
+            snprintf(hex, sizeof(hex), "0x%08x", ni->callee);
             ImGui::SetClipboardText(hex);
         }
         ImGui::PopID();
         ImGui::Indent();
         indents++;
-        node = ni.parent;
+        node = ni->parent;
         depth++;
     }
     for (int i = 0; i < indents; i++) {
@@ -441,10 +624,10 @@ static void fi_render_batch_writers(FrameInspectorWindow *w,
         /* Lead with the function this node represents (its callee) so the
          * writer reads as "GlyphBuilder - 448 methods" rather than a bare id. */
         char fn[128];
-        FINodeInfo ni =
-            xemu_frameinspect_node_info(writers[k].node, cap->origin_generation);
-        if (ni.valid) {
-            fi_sym(ni.callee, fn, sizeof(fn));
+        const FIOriginNode *ni =
+            fi_origin_snapshot_node(&cap->origins, writers[k].node);
+        if (ni) {
+            fi_sym(ni->callee, fn, sizeof(fn));
         } else {
             snprintf(fn, sizeof(fn), "node %u", writers[k].node);
         }
@@ -473,8 +656,8 @@ static void fi_origin_tab(FrameInspectorWindow *w, const FICapture *cap,
 {
     ImGui::TextUnformatted("Call-path origin");
     ImGui::SameLine();
-    HelpMarker("Origin resolves against the live call tree; only valid "
-              "before re-arming the inspector.");
+    HelpMarker("Origin is an immutable snapshot owned by this capture and "
+               "remains valid after re-arming or resuming.");
     ImGui::Separator();
 
     fi_render_batch_writers(w, cap, batch);
@@ -509,20 +692,26 @@ static void fi_origin_tab(FrameInspectorWindow *w, const FICapture *cap,
         uint32_t depth = 0;
         while (node != FI_NODE_ROOT && node != FI_NODE_INVALID &&
                depth < 256) {
-            FINodeInfo ni = xemu_frameinspect_node_info(
-                node, cap->origin_generation);
-            if (!ni.valid) {
-                text.append("origin unavailable (capture re-armed)\n");
+            const FIOriginNode *ni =
+                fi_origin_snapshot_node(&cap->origins, node);
+            if (!ni) {
+                text.append("origin unavailable (not captured or truncated)\n");
                 break;
+            }
+            const uint32_t *args =
+                fi_origin_snapshot_argset(&cap->origins, ni, 0);
+            static const uint32_t no_args[6] = {};
+            if (!args) {
+                args = no_args;
             }
             snprintf(
                 line, sizeof(line),
                 "[%u] node=%u call_site=0x%08x callee=0x%08x "
                 "ecx/this=0x%08x args=%08x %08x %08x %08x %08x\n",
-                depth, node, ni.call_site, ni.callee, ni.args[0], ni.args[1],
-                ni.args[2], ni.args[3], ni.args[4], ni.args[5]);
+                depth, node, ni->call_site, ni->callee, args[0], args[1],
+                args[2], args[3], args[4], args[5]);
             text.append(line);
-            node = ni.parent;
+            node = ni->parent;
             depth++;
         }
         if (node == FI_NODE_ROOT) {
@@ -535,7 +724,368 @@ static void fi_origin_tab(FrameInspectorWindow *w, const FICapture *cap,
     ImGui::SameLine();
     HelpMarker("Copies the selected method's writer call chain as plain text.");
 
-    fi_render_call_chain(rec->writer_node, cap->origin_generation);
+    fi_render_call_chain(cap, rec->writer_node);
+}
+
+static bool fi_command_matches_method(const FICommandRec *command,
+                                      const FIMethodRec *method)
+{
+    return command->kind == FI_CMD_METHOD_PARAM &&
+           command->data.parameter.method == method->method &&
+           command->data.parameter.subchannel == method->subchannel &&
+           command->raw == method->param &&
+           command->phys_addr == method->phys_addr &&
+           command->writer_node == method->writer_node &&
+           command->confidence == method->confidence;
+}
+
+static bool fi_batch_command_rows(const FICapture *cap,
+                                  const FIMethodBatch *batch,
+                                  std::vector<uint32_t> *rows,
+                                  uint32_t *raw_methods)
+{
+    rows->clear();
+    *raw_methods = 0;
+    if (!batch || batch->first_rec > cap->methods.num_recs ||
+        batch->rec_count > cap->methods.num_recs - batch->first_rec) {
+        return false;
+    }
+
+    uint32_t batch_end = batch->first_rec + batch->rec_count;
+    uint32_t method_idx = 0;
+    uint32_t first_param = FI_COMMAND_INVALID;
+    uint32_t last_param = FI_COMMAND_INVALID;
+    for (uint32_t i = 0; i < cap->commands.num_recs && method_idx < batch_end;
+         i++) {
+        const FICommandRec *command = &cap->commands.recs[i];
+        if (command->kind != FI_CMD_METHOD_PARAM) {
+            continue;
+        }
+        while (method_idx < batch_end &&
+               cap->methods.recs[method_idx].method == FI_METHOD_RAW_WORD) {
+            if (method_idx >= batch->first_rec) {
+                (*raw_methods)++;
+            }
+            method_idx++;
+        }
+        if (method_idx >= batch_end) {
+            break;
+        }
+        if (!fi_command_matches_method(command,
+                                       &cap->methods.recs[method_idx])) {
+            return false;
+        }
+        if (method_idx >= batch->first_rec) {
+            uint32_t packet = command->data.parameter.packet;
+            if (packet != FI_COMMAND_INVALID) {
+                if (packet >= i || packet >= cap->commands.num_recs ||
+                    cap->commands.recs[packet].kind !=
+                        FI_CMD_METHOD_HEADER) {
+                    return false;
+                }
+                rows->push_back(packet);
+            }
+            rows->push_back(i);
+            if (first_param == FI_COMMAND_INVALID) {
+                first_param = i;
+            }
+            last_param = i;
+        }
+        method_idx++;
+    }
+    while (method_idx < batch_end &&
+           cap->methods.recs[method_idx].method == FI_METHOD_RAW_WORD) {
+        if (method_idx >= batch->first_rec) {
+            (*raw_methods)++;
+        }
+        method_idx++;
+    }
+    if (method_idx != batch_end) {
+        return false;
+    }
+
+    if (first_param != FI_COMMAND_INVALID) {
+        for (uint32_t i = first_param; i <= last_param; i++) {
+            if (cap->commands.recs[i].kind != FI_CMD_METHOD_PARAM) {
+                rows->push_back(i);
+            }
+        }
+    }
+    std::sort(rows->begin(), rows->end());
+    rows->erase(std::unique(rows->begin(), rows->end()), rows->end());
+    return true;
+}
+
+static void fi_commands_tab(FrameInspectorWindow *w, const FICapture *cap,
+                            const FIMethodBatch *batch)
+{
+    if (!batch) {
+        ImGui::TextDisabled("No command records for this event.");
+        return;
+    }
+
+    std::vector<uint32_t> rows;
+    uint32_t raw_methods = 0;
+    if (!fi_batch_command_rows(cap, batch, &rows, &raw_methods)) {
+        ImGui::TextColored(
+            ImVec4(1, 0.6f, 0, 1),
+            "Command/method logs do not align; batch filtering is unavailable.");
+        return;
+    }
+
+    ImGui::Text("Batch event #%u: %u command records (%u frame-wide)%s",
+                batch->batch_event, (uint32_t)rows.size(),
+                cap->commands.num_recs,
+                cap->commands.truncated ? " [TRUNCATED]" : "");
+    ImGui::SameLine();
+    HelpMarker("Shows parameters in the selected batch, their method packet "
+               "headers, and control words executed between those parameters. "
+               "The join is validated against the method log before display.");
+    if (raw_methods) {
+        ImGui::TextDisabled("%u raw lookahead method record(s) have no typed "
+                            "command row.", raw_methods);
+    }
+
+    if (rows.empty()) {
+        ImGui::TextDisabled("No typed PFIFO commands matched this batch.");
+        return;
+    }
+    if (w->m_selected_command < 0 ||
+        !std::binary_search(rows.begin(), rows.end(),
+                            (uint32_t)w->m_selected_command)) {
+        w->m_selected_command = -1;
+    }
+
+    ImGui::PushFont(g_font_mgr.m_fixed_width_font);
+    ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                            ImGuiTableFlags_ScrollX |
+                            ImGuiTableFlags_ScrollY |
+                            ImGuiTableFlags_SizingFixedFit;
+    if (ImGui::BeginTable("fi_commands_tbl", 7, flags,
+                          ImVec2(0, 260.0f * g_viewport_mgr.m_scale))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Seq");
+        ImGui::TableSetupColumn("Kind");
+        ImGui::TableSetupColumn("DMA Instance:GET");
+        ImGui::TableSetupColumn("Phys Addr");
+        ImGui::TableSetupColumn("Raw");
+        ImGui::TableSetupColumn("Decoded", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Origin");
+        ImGui::TableHeadersRow();
+
+        ImGuiListClipper clipper;
+        clipper.Begin((int)rows.size());
+        while (clipper.Step()) {
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd;
+                 row++) {
+                uint32_t i = rows[row];
+                const FICommandRec *rec = &cap->commands.recs[i];
+                char seq[24];
+                char decoded[160];
+                snprintf(seq, sizeof(seq), "#%u", rec->seq);
+                fi_format_command(rec, decoded, sizeof(decoded));
+
+                ImGui::PushID((int)i);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                if (ImGui::Selectable(
+                        seq, (int)i == w->m_selected_command,
+                        ImGuiSelectableFlags_SpanAllColumns)) {
+                    w->m_selected_command = (int)i;
+                }
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(fi_command_kind_name(rec->kind));
+                ImGui::TableSetColumnIndex(2);
+                ImGui::Text("0x%08x:0x%08x", rec->dma_instance, rec->dma_get);
+                ImGui::TableSetColumnIndex(3);
+                ImGui::Text("0x%llx", (unsigned long long)rec->phys_addr);
+                ImGui::TableSetColumnIndex(4);
+                ImGui::Text("0x%08x", rec->raw);
+                ImGui::TableSetColumnIndex(5);
+                ImGui::TextUnformatted(decoded);
+                ImGui::TableSetColumnIndex(6);
+                ImGui::TextUnformatted(fi_confidence_name(rec->confidence));
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndTable();
+    }
+    ImGui::PopFont();
+
+    if (w->m_selected_command < 0) {
+        ImGui::TextDisabled("Select a command for provenance details.");
+        return;
+    }
+    const FICommandRec *rec = &cap->commands.recs[w->m_selected_command];
+    char decoded[160];
+    fi_format_command(rec, decoded, sizeof(decoded));
+    if (ImGui::Button("Copy command")) {
+        char text[512];
+        snprintf(text, sizeof(text),
+                 "command=#%u kind=%s dma_instance=0x%08x dma_get=0x%08x "
+                 "phys=0x%llx raw=0x%08x %s confidence=%s writer_node=%u",
+                 rec->seq, fi_command_kind_name(rec->kind), rec->dma_instance,
+                 rec->dma_get, (unsigned long long)rec->phys_addr, rec->raw,
+                 decoded, fi_confidence_name(rec->confidence),
+                 rec->writer_node);
+        ImGui::SetClipboardText(text);
+    }
+    if (rec->kind == FI_CMD_METHOD_PARAM &&
+        rec->data.parameter.packet != FI_COMMAND_INVALID) {
+        ImGui::SameLine();
+        uint32_t packet = rec->data.parameter.packet;
+        if (packet < cap->commands.num_recs &&
+            cap->commands.recs[packet].kind == FI_CMD_METHOD_HEADER) {
+            if (ImGui::Button("Select packet header")) {
+                w->m_selected_command = (int)packet;
+            }
+        } else {
+            ImGui::TextColored(ImVec4(1, 0.6f, 0, 1),
+                               "Invalid packet reference #%u", packet);
+        }
+    }
+    if (rec->confidence == FI_ORIG_ATTRIBUTED ||
+        rec->confidence == FI_ORIG_PARTIAL) {
+        ImGui::Separator();
+        ImGui::Text("Writer node %u (%s)", rec->writer_node,
+                    fi_confidence_name(rec->confidence));
+        fi_render_call_chain(cap, rec->writer_node);
+    } else {
+        ImGui::TextDisabled("Writer origin unavailable (%s).",
+                            fi_confidence_name(rec->confidence));
+    }
+}
+
+static void fi_readable_commands_tab(FrameInspectorWindow *w,
+                                     const FICapture *cap,
+                                     const FIMethodBatch *batch)
+{
+    if (!batch) {
+        ImGui::TextDisabled("No decoded operations for this event.");
+        return;
+    }
+
+    std::vector<uint32_t> rows;
+    uint32_t raw_methods = 0;
+    if (!fi_batch_command_rows(cap, batch, &rows, &raw_methods)) {
+        ImGui::TextColored(
+            ImVec4(1, 0.6f, 0, 1),
+            "Command/method logs do not align; decoding is unavailable.");
+        return;
+    }
+
+    std::vector<uint32_t> operations;
+    operations.reserve(rows.size());
+    for (uint32_t row : rows) {
+        if (cap->commands.recs[row].kind != FI_CMD_METHOD_HEADER) {
+            operations.push_back(row);
+        }
+    }
+
+    ImGui::Text("Batch event #%u: %u readable operations",
+                batch->batch_event, (uint32_t)operations.size());
+    ImGui::SameLine();
+    HelpMarker("One row represents one executed method parameter or PFIFO "
+               "control-flow operation. Packet headers are intentionally "
+               "hidden. Writer symbols use the loaded IDA map and the "
+               "capture's immutable guest call paths.");
+    if (raw_methods) {
+        ImGui::TextDisabled("%u raw lookahead record(s) could not be decoded.",
+                            raw_methods);
+    }
+    if (operations.empty()) {
+        ImGui::TextDisabled("No readable operations matched this batch.");
+        return;
+    }
+    if (w->m_selected_command < 0 ||
+        !std::binary_search(operations.begin(), operations.end(),
+                            (uint32_t)w->m_selected_command)) {
+        w->m_selected_command = -1;
+    }
+
+    ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                            ImGuiTableFlags_ScrollX |
+                            ImGuiTableFlags_ScrollY |
+                            ImGuiTableFlags_SizingFixedFit;
+    if (ImGui::BeginTable("fi_readable_commands_tbl", 5, flags,
+                          ImVec2(0, 280.0f * g_viewport_mgr.m_scale))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Seq");
+        ImGui::TableSetupColumn("Operation");
+        ImGui::TableSetupColumn("Meaning", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Writer Symbol");
+        ImGui::TableSetupColumn("Origin");
+        ImGui::TableHeadersRow();
+
+        ImGuiListClipper clipper;
+        clipper.Begin((int)operations.size());
+        while (clipper.Step()) {
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd;
+                 row++) {
+                uint32_t command_idx = operations[row];
+                const FICommandRec *rec = &cap->commands.recs[command_idx];
+                char seq[24];
+                char operation[160];
+                char meaning[192];
+                char writer[192];
+                snprintf(seq, sizeof(seq), "#%u", rec->seq);
+                fi_format_readable_command(rec, operation, sizeof(operation),
+                                           meaning, sizeof(meaning));
+                fi_command_writer_symbol(cap, rec, writer, sizeof(writer));
+
+                ImGui::PushID((int)command_idx);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                if (ImGui::Selectable(
+                        seq, (int)command_idx == w->m_selected_command,
+                        ImGuiSelectableFlags_SpanAllColumns)) {
+                    w->m_selected_command = (int)command_idx;
+                }
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(operation);
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted(meaning);
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextUnformatted(writer);
+                ImGui::TableSetColumnIndex(4);
+                ImGui::TextUnformatted(fi_confidence_name(rec->confidence));
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndTable();
+    }
+
+    if (w->m_selected_command < 0) {
+        ImGui::TextDisabled(
+            "Select an operation to inspect its guest writer call path.");
+        return;
+    }
+    const FICommandRec *rec = &cap->commands.recs[w->m_selected_command];
+    char operation[160];
+    char meaning[192];
+    char writer[192];
+    fi_format_readable_command(rec, operation, sizeof(operation), meaning,
+                               sizeof(meaning));
+    fi_command_writer_symbol(cap, rec, writer, sizeof(writer));
+    if (ImGui::Button("Copy decoded operation")) {
+        char text[768];
+        snprintf(text, sizeof(text),
+                 "command=#%u operation=%s %s writer=%s confidence=%s "
+                 "phys=0x%llx raw=0x%08x",
+                 rec->seq, operation, meaning, writer,
+                 fi_confidence_name(rec->confidence),
+                 (unsigned long long)rec->phys_addr, rec->raw);
+        ImGui::SetClipboardText(text);
+    }
+    if (rec->confidence == FI_ORIG_ATTRIBUTED ||
+        rec->confidence == FI_ORIG_PARTIAL) {
+        ImGui::Separator();
+        ImGui::Text("Guest writer: %s", writer);
+        fi_render_call_chain(cap, rec->writer_node);
+    } else {
+        ImGui::TextDisabled("Guest writer unavailable (%s).",
+                            fi_confidence_name(rec->confidence));
+    }
 }
 
 static void fi_state_tab(const FICapture *cap, int event_idx)
@@ -705,13 +1255,9 @@ static void fi_pixels_tab(const FICapture *cap, int pinned_gen,
     }
 }
 
-/* Task 6: manual "who wrote this guest physical address" lookup. Unlike the
- * rest of the window, this reads module globals directly
- * (xemu_frameinspect_lookup_tag() / xemu_frameinspect_node_info(), the live
- * tag map + call tree) rather than the acquired FICapture snapshot -- so it
- * is not gated on cap and not reset when a new capture publishes. Same
- * re-arm caveat as the Origin tab: valid only until the inspector is next
- * armed. */
+/* Task 6: manual "who wrote this guest physical address" lookup. The address
+ * tag still comes from the live tag map, so generation matching is required;
+ * the resulting node is resolved from this capture's immutable origins. */
 static void fi_address_lookup_panel(FrameInspectorWindow *w,
                                     const FICapture *cap)
 {
@@ -722,9 +1268,9 @@ static void fi_address_lookup_panel(FrameInspectorWindow *w,
     }
     ImGui::TextUnformatted("Who wrote a guest physical address");
     ImGui::SameLine();
-    HelpMarker("Resolves against the live tag map + call tree; valid only "
-              "before re-arming the inspector. Address is guest physical "
-              "(RAM-relative).");
+    HelpMarker("The tag lookup uses the live tag map and is valid only before "
+               "re-arming. Its call chain comes from this capture. Address is "
+               "guest physical (RAM-relative).");
 
     bool submit = ImGui::InputText(
         "Guest addr (hex)", w->m_lookup_addr, sizeof(w->m_lookup_addr),
@@ -760,7 +1306,7 @@ static void fi_address_lookup_panel(FrameInspectorWindow *w,
                                  ImVec4(0.3f, 0.9f, 0.3f, 1),
                        "%s (node %u)", partial ? "partial" : "attributed",
                        node_id);
-    fi_render_call_chain(node_id, cap->origin_generation);
+    fi_render_call_chain(cap, node_id);
 }
 
 static GLuint fi_upload_rgba_texture(const uint32_t *image, uint32_t width,
@@ -1250,16 +1796,15 @@ static void fi_timeline_scrubber(FrameInspectorWindow *w, const FICapture *cap)
                 global_ev, kind);
 }
 
-static void fi_draw_image_bounds(uint32_t width, uint32_t height,
-                                 uint32_t min_x, uint32_t min_y,
-                                 uint32_t max_x, uint32_t max_y, bool flip_y,
-                                 ImU32 color)
+static void fi_draw_image_bounds(ImVec2 origin, ImVec2 size,
+                                  uint32_t width, uint32_t height,
+                                  uint32_t min_x, uint32_t min_y,
+                                  uint32_t max_x, uint32_t max_y, bool flip_y,
+                                  ImU32 color)
 {
     if (!width || !height) {
         return;
     }
-    ImVec2 origin = ImGui::GetItemRectMin();
-    ImVec2 size = ImGui::GetItemRectSize();
     float x1 = origin.x + size.x * min_x / width;
     float x2 = origin.x + size.x * (max_x + 1) / width;
     float y1;
@@ -1312,6 +1857,7 @@ void FrameInspectorWindow::Draw()
         m_pinned_pixel = -1; /* stale index into a possibly-differently-sized image */
         m_pinned_gen = -1;
         m_selected_rec = -1; /* stale index into the old capture's methods log */
+        m_selected_command = -1;
         m_timeline_idx = -1;
         m_view_event = -1;
         m_isolate_batch = false;
@@ -1331,20 +1877,24 @@ void FrameInspectorWindow::Draw()
                              ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Frame Inspector", &m_is_open,
                       ImGuiWindowFlags_NoCollapse)) {
-        ImGui::Text("Captured frame: %u events, %u surfaces, %u methods, "
-                    "%u resources%s", cap->events.count,
-                    cap->surfaces.num_gens, cap->methods.num_recs,
-                    cap->resources.num_res,
+        ImGui::Text("Captured frame: %u events, %u surfaces, %u commands, "
+                    "%u methods, %u resources%s", cap->events.count,
+                    cap->surfaces.num_gens, cap->commands.num_recs,
+                    cap->methods.num_recs, cap->resources.num_res,
                     (cap->truncated || cap->events.truncated ||
                      cap->surfaces.truncated || cap->resources.truncated ||
-                     cap->methods.truncated) ? " [TRUNCATED]" : "");
+                     cap->methods.truncated || cap->commands.truncated) ?
+                        " [TRUNCATED]" : "");
         ImGui::Separator();
         ImGui::Text("Events: %u   Surfaces: %u   Resources: %u",
                     cap->events.count, cap->surfaces.num_gens,
                     cap->resources.num_res);
+        ImGui::Text("Origins: %u nodes, %u argument sets%s",
+                    cap->origins.num_nodes, cap->origins.num_argsets,
+                    cap->origins.truncation ? " [TRUNCATED]" : "");
         if (cap->truncated || cap->events.truncated ||
             cap->surfaces.truncated || cap->resources.truncated ||
-            cap->methods.truncated) {
+            cap->methods.truncated || cap->commands.truncated) {
             ImGui::TextColored(
                 ImVec4(1, 0.6f, 0, 1),
                 "[TRUNCATED] capture hit a cap/budget; some data is missing.");
@@ -1459,26 +2009,46 @@ void FrameInspectorWindow::Draw()
 
         if (view_tex && view_w > 0 && view_h > 0) {
             float avail_w = ImGui::GetContentRegionAvail().x;
-            float img_scale = avail_w / (float)view_w;
-            ImVec2 img_size(avail_w, view_h * img_scale);
-            ImGui::Image((ImTextureID)(intptr_t)view_tex, img_size,
-                         ImVec2(0, 1), ImVec2(1, 0));
+            float canvas_w = std::min(avail_w,
+                                      640.0f * g_viewport_mgr.m_scale);
+            ImVec2 canvas_size(canvas_w, canvas_w * 480.0f / 640.0f);
+            ImGui::InvisibleButton("fi_frame_canvas", canvas_size);
+            ImVec2 canvas_min = ImGui::GetItemRectMin();
+            ImVec2 canvas_max = ImGui::GetItemRectMax();
+            ImDrawList *draw = ImGui::GetWindowDrawList();
+            draw->AddRectFilled(canvas_min, canvas_max,
+                                IM_COL32(24, 24, 24, 255));
+            draw->AddRect(canvas_min, canvas_max,
+                          IM_COL32(80, 80, 80, 255));
+
+            float image_scale = std::min(canvas_size.x / view_w,
+                                         canvas_size.y / view_h);
+            ImVec2 image_size(view_w * image_scale, view_h * image_scale);
+            ImVec2 image_min(canvas_min.x + (canvas_size.x - image_size.x) * 0.5f,
+                             canvas_min.y + (canvas_size.y - image_size.y) * 0.5f);
+            ImVec2 image_max(image_min.x + image_size.x,
+                             image_min.y + image_size.y);
+            draw->AddImage((ImTextureID)(intptr_t)view_tex, image_min,
+                           image_max, ImVec2(0, 1), ImVec2(1, 0));
             if (have_target && m_target_bounds_valid && !isolate) {
                 fi_draw_image_bounds(
+                    image_min, image_size,
                     (uint32_t)m_target_w, (uint32_t)m_target_h,
                     m_target_min_x, m_target_min_y, m_target_max_x,
                     m_target_max_y, false, IM_COL32(255, 210, 40, 255));
             }
 
-            bool img_hovered = ImGui::IsItemHovered();
+            ImVec2 mp = ImGui::GetMousePos();
+            bool img_hovered = ImGui::IsItemHovered() &&
+                               mp.x >= image_min.x && mp.x < image_max.x &&
+                               mp.y >= image_min.y && mp.y < image_max.y;
             bool img_clicked = img_hovered && ImGui::IsItemClicked();
             if (img_hovered && view_gen >= 0 &&
                 (uint32_t)view_gen < cap->hist_count) {
-                ImVec2 mn = ImGui::GetItemRectMin();
-                ImVec2 sz = ImGui::GetItemRectSize();
-                ImVec2 mp = ImGui::GetMousePos();
-                float u = ImClamp((mp.x - mn.x) / sz.x, 0.0f, 0.9999f);
-                float v = ImClamp((mp.y - mn.y) / sz.y, 0.0f, 0.9999f);
+                float u = ImClamp((mp.x - image_min.x) / image_size.x,
+                                  0.0f, 0.9999f);
+                float v = ImClamp((mp.y - image_min.y) / image_size.y,
+                                  0.0f, 0.9999f);
                 const FIColorHist *ch = &cap->hist[view_gen];
                 bool can_attribute = ch->width && ch->height &&
                     view_w == (int)ch->width &&
@@ -1595,6 +2165,14 @@ void FrameInspectorWindow::Draw()
                 }
                 if (ImGui::BeginTabItem("Methods")) {
                     fi_methods_tab(this, cap, cur_batch);
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("Commands")) {
+                    fi_commands_tab(this, cap, cur_batch);
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("Readable")) {
+                    fi_readable_commands_tab(this, cap, cur_batch);
                     ImGui::EndTabItem();
                 }
                 if (ImGui::BeginTabItem("State")) {

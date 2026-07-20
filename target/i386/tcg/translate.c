@@ -2621,8 +2621,10 @@ static void gen_lea_ss_ofs(DisasContext *s, TCGv dest, TCGv src, target_ulong of
     gen_lea_v_seg_dest(s, mo_stacksize(s), dest, src, R_SS, -1);
 }
 
-/* Generate a push. It depends on ss32, addseg and dflag.  */
-static void gen_push_v(DisasContext *s, TCGv val)
+/* Generate a push. It depends on ss32, addseg and dflag. CALL's synthetic
+ * return-address write is not application data provenance: tracking it would
+ * materialize every lazy callee path before the callee performs a real store. */
+static void gen_push_v(DisasContext *s, TCGv val, bool fi_track_store)
 {
     MemOp d_ot = mo_pushpop(s, s->dflag);
     MemOp a_ot = mo_stacksize(s);
@@ -2633,7 +2635,11 @@ static void gen_push_v(DisasContext *s, TCGv val)
 
     /* Now reduce the value to the address size and apply SS base.  */
     gen_lea_ss_ofs(s, s->A0, new_esp, 0);
-    gen_op_st_v(s, d_ot, val, s->A0);
+    if (fi_track_store) {
+        gen_op_st_v(s, d_ot, val, s->A0);
+    } else {
+        tcg_gen_qemu_st_tl(val, s->A0, s->mem_index, d_ot | MO_LE);
+    }
     gen_op_mov_reg_v(s, a_ot, R_ESP, new_esp);
 }
 

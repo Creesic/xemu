@@ -37,6 +37,7 @@ public:
      * the current batch's first ATTRIBUTED record whenever it falls outside
      * that batch's record range (new event, new capture, or no batch). */
     int m_selected_rec = -1;
+    int m_selected_command = -1;
     ImGuiTextFilter m_method_filter;
 
     /* Frozen-frame GL texture: composed final frame or a reconstructed
@@ -69,10 +70,8 @@ public:
     int m_timeline_idx = -1;
 
     /* Address Lookup panel (Task 6): hex input buffer (digits only -- see
-     * ImGuiInputTextFlags_CharsHexadecimal) and the last lookup's result.
-     * m_lookup_tag/node_info() read module globals (the live tag map / call
-     * tree), not this capture's snapshot, so this state is not reset on a
-     * new capture the way the other per-capture fields above are. */
+     * ImGuiInputTextFlags_CharsHexadecimal) and the last live-tag lookup.
+     * Call-path resolution uses the capture-owned origin snapshot. */
     char m_lookup_addr[19] = "";
     uint64_t m_lookup_result_addr = 0;
     uint32_t m_lookup_tag = 0;

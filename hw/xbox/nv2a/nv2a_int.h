@@ -103,6 +103,8 @@ typedef struct NV2AState {
         QemuCond fifo_idle_cond;
         bool fifo_kick;
         bool halt;
+        uint32_t fi_command_packet;
+        bool fi_command_capture_active;
     } pfifo;
 
     struct {
