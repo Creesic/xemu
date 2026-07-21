@@ -352,29 +352,6 @@ static const FIMethodBatch *fi_find_method_batch(const FICapture *cap,
     return nullptr;
 }
 
-/* First resource of `kind` referenced by event_idx's batch (join via
- * cap->batch_res, keyed the same way as FIMethodBatch.batch_event). */
-static const FIResource *fi_find_batch_resource(const FICapture *cap,
-                                                int event_idx, uint32_t kind)
-{
-    if (event_idx < 0) {
-        return nullptr;
-    }
-    for (uint32_t i = 0; i < cap->num_batch_res; i++) {
-        const FIBatchResRef *ref = &cap->batch_res[i];
-        if (ref->event != (uint32_t)event_idx) {
-            continue;
-        }
-        if (ref->res_id >= cap->resources.num_res) {
-            continue;
-        }
-        if (cap->resources.res[ref->res_id].kind == kind) {
-            return &cap->resources.res[ref->res_id];
-        }
-    }
-    return nullptr;
-}
-
 static void fi_methods_tab(FrameInspectorWindow *w, const FICapture *cap,
                           const FIMethodBatch *batch)
 {
@@ -1089,16 +1066,24 @@ static void fi_readable_commands_tab(FrameInspectorWindow *w,
     }
 }
 
-static void fi_state_tab(const FICapture *cap, int event_idx)
+static void fi_raw_state_dump(const FICapture *cap, uint32_t resource_id)
 {
-    const FIResource *regs = fi_find_batch_resource(cap, event_idx, FI_RESK_REGS);
-    if (!regs) {
-        ImGui::TextDisabled("No register-file resource for this event.");
+    if (resource_id >= cap->resources.num_res) {
+        ImGui::TextDisabled("No immutable register-file resource.");
+        return;
+    }
+    const FIResource *regs = &cap->resources.res[resource_id];
+    if (regs->kind != FI_RESK_REGS ||
+        regs->off > cap->resources.blob_used ||
+        regs->len > cap->resources.blob_used - regs->off) {
+        ImGui::TextColored(ImVec4(1, 0.6f, 0, 1),
+                           "Register-file resource is invalid.");
         return;
     }
     ImGui::Text("Registers: %u bytes (raw dword dump; named-register "
-               "decoding is out of scope)", regs->len);
-    ImGui::BeginChild("fi_state_regs", ImVec2(0, 0), true);
+                "indices use the captured PGRAPH array layout)", regs->len);
+    ImGui::BeginChild("fi_state_regs",
+                      ImVec2(0, 300.0f * g_viewport_mgr.m_scale), true);
     ImGui::PushFont(g_font_mgr.m_fixed_width_font);
     const uint8_t *base = cap->resources.blob + regs->off;
     uint32_t nwords = regs->len / 4;
@@ -1109,7 +1094,7 @@ static void fi_state_tab(const FICapture *cap, int event_idx)
         for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
             uint32_t first = (uint32_t)row * 8;
             char line[128];
-            int p = snprintf(line, sizeof(line), "0x%04x:", first * 4);
+            int p = snprintf(line, sizeof(line), "0x%04x:", first);
             for (uint32_t k = 0; k < 8 && first + k < nwords; k++) {
                 uint32_t word;
                 memcpy(&word, base + (uint64_t)(first + k) * 4, 4);
@@ -1233,6 +1218,27 @@ static bool fi_draw_register(const FICapture *cap,
     }
     memcpy(value, cap->resources.blob + resource->off + offset,
            sizeof(*value));
+    return true;
+}
+
+static bool fi_draw_constant(const FICapture *cap,
+                             const FIDrawSubmission *draw, uint32_t index,
+                             uint32_t value[4])
+{
+    if (draw->constants_resource >= cap->resources.num_res) {
+        return false;
+    }
+    const FIResource *resource =
+        &cap->resources.res[draw->constants_resource];
+    uint64_t offset = (uint64_t)index * sizeof(uint32_t) * 4;
+    if (resource->kind != FI_RESK_VSH_CONSTANTS || offset > resource->len ||
+        sizeof(uint32_t) * 4 > resource->len - offset ||
+        resource->off > cap->resources.blob_used ||
+        resource->len > cap->resources.blob_used - resource->off) {
+        return false;
+    }
+    memcpy(value, cap->resources.blob + resource->off + offset,
+           sizeof(uint32_t) * 4);
     return true;
 }
 
@@ -1620,6 +1626,1225 @@ static void fi_geometry_tab(const FICapture *cap,
         }
         ImGui::PopID();
     }
+}
+
+static bool fi_draw_sources_valid(const FICapture *cap,
+                                  const FIDrawSubmission *draw)
+{
+    return draw->first_source <= cap->draws.num_sources &&
+        draw->num_sources <= cap->draws.num_sources - draw->first_source;
+}
+
+static const FIStateSource *fi_find_method_source(
+    const FICapture *cap, const FIDrawSubmission *draw, uint32_t method)
+{
+    if (!fi_draw_sources_valid(cap, draw)) {
+        return nullptr;
+    }
+    const FIStateSource *fallback = nullptr;
+    for (uint32_t i = 0; i < draw->num_sources; i++) {
+        const FIStateSource *source =
+            &cap->draws.sources[draw->first_source + i];
+        if (source->method != method) {
+            continue;
+        }
+        if (source->destination.kind == FI_SETTER_DEST_PGRAPH_REGISTER) {
+            return source;
+        }
+        if (!fallback) {
+            fallback = source;
+        }
+    }
+    return fallback;
+}
+
+static bool fi_source_is_inherited(const FICapture *cap,
+                                   const FIStateSource *source)
+{
+    return source->inherited ||
+        (source->command_id == FI_SETTER_COMMAND_INVALID &&
+         !cap->commands.truncated);
+}
+
+static void fi_state_source_widget(FrameInspectorWindow *w,
+                                   const FICapture *cap,
+                                   const FIStateSource *source)
+{
+    if (!source) {
+        ImGui::TextDisabled("source unavailable");
+        return;
+    }
+    bool inherited = fi_source_is_inherited(cap, source);
+    char label[160];
+    snprintf(label, sizeof(label), "%s%s method 0x%04x",
+             inherited ? "inherited, " : "",
+             fi_confidence_name(source->confidence), source->method);
+    if (!ImGui::TreeNode("state_source", "%s", label)) {
+        return;
+    }
+    ImGui::Text("parameter=0x%08x phys=0x%llx token=%llu", source->parameter,
+                (unsigned long long)source->phys_addr,
+                (unsigned long long)source->source_token);
+    if (inherited) {
+        ImGui::TextDisabled(
+            "Established before the captured frame; no frame command.");
+    } else if (source->command_id < cap->commands.num_recs) {
+        const FICommandRec *command = &cap->commands.recs[source->command_id];
+        char decoded[160];
+        fi_format_command(command, decoded, sizeof(decoded));
+        ImGui::Text("Command #%u: %s", command->seq, decoded);
+        if (ImGui::SmallButton("Select in Commands")) {
+            w->m_selected_command = (int)source->command_id;
+        }
+    } else if (source->command_id == FI_SETTER_COMMAND_INVALID) {
+        ImGui::TextDisabled("Frame command unavailable.");
+    } else {
+        ImGui::TextColored(ImVec4(1, 0.6f, 0, 1),
+                           "Captured command reference is invalid.");
+    }
+    if (source->confidence == FI_ORIG_ATTRIBUTED ||
+        source->confidence == FI_ORIG_PARTIAL) {
+        fi_render_call_chain(cap, source->writer_node);
+    } else {
+        ImGui::TextDisabled("No captured writer call path.");
+    }
+    ImGui::TreePop();
+}
+
+static const char *fi_compare_name(uint8_t value, bool valid)
+{
+    static const char *const names[] = {
+        "never", "less", "equal", "less-or-equal", "greater",
+        "not-equal", "greater-or-equal", "always",
+    };
+    return valid && value < sizeof(names) / sizeof(names[0]) ?
+        names[value] : "invalid";
+}
+
+static const char *fi_blend_factor_name(uint8_t value, bool valid)
+{
+    static const char *const names[] = {
+        "zero", "one", "source color", "one minus source color",
+        "source alpha", "one minus source alpha", "destination alpha",
+        "one minus destination alpha", "destination color",
+        "one minus destination color", "source alpha saturate", "reserved",
+        "constant color", "one minus constant color", "constant alpha",
+        "one minus constant alpha",
+    };
+    return valid && value < sizeof(names) / sizeof(names[0]) ?
+        names[value] : "invalid";
+}
+
+static const char *fi_blend_equation_name(uint8_t value, bool valid)
+{
+    static const char *const names[] = {
+        "subtract", "reverse subtract", "add", "minimum", "maximum",
+        "reverse subtract signed", "add signed",
+    };
+    return valid && value < sizeof(names) / sizeof(names[0]) ?
+        names[value] : "invalid";
+}
+
+static const char *fi_stencil_op_name(uint8_t value, bool valid)
+{
+    static const char *const names[] = {
+        "invalid", "keep", "zero", "replace", "increment saturate",
+        "decrement saturate", "invert", "increment wrap", "decrement wrap",
+    };
+    return valid && value < sizeof(names) / sizeof(names[0]) ?
+        names[value] : "invalid";
+}
+
+static const char *fi_fill_mode_name(uint8_t value, bool valid)
+{
+    static const char *const names[] = { "fill", "point", "line" };
+    return valid && value < sizeof(names) / sizeof(names[0]) ?
+        names[value] : "invalid";
+}
+
+static const char *fi_cull_face_name(uint8_t value, bool valid)
+{
+    static const char *const names[] = {
+        "invalid", "front", "back", "front and back",
+    };
+    return valid && value < sizeof(names) / sizeof(names[0]) ?
+        names[value] : "invalid";
+}
+
+static const char *fi_logic_op_name(uint8_t value)
+{
+    static const char *const names[] = {
+        "clear", "and", "and reverse", "copy", "and inverted", "noop",
+        "xor", "or", "nor", "equivalence", "invert", "or reverse",
+        "copy inverted", "or inverted", "nand", "set",
+    };
+    return value < sizeof(names) / sizeof(names[0]) ? names[value] : "invalid";
+}
+
+static void fi_pipeline_heading(const char *name)
+{
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::TextDisabled("%s", name);
+}
+
+static void fi_pipeline_row(FrameInspectorWindow *w, const FICapture *cap,
+                            const FIDrawSubmission *draw, const char *field,
+                            const char *decoded, bool raw_available,
+                            uint32_t raw_reg, uint32_t raw_value,
+                            uint32_t source_method)
+{
+    ImGui::PushID(field);
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::TextUnformatted(field);
+    ImGui::TableSetColumnIndex(1);
+    ImGui::TextUnformatted(decoded);
+    ImGui::TableSetColumnIndex(2);
+    if (raw_available) {
+        ImGui::Text("PGRAPH[0x%04x] = 0x%08x", raw_reg, raw_value);
+    } else {
+        ImGui::TextDisabled("-");
+    }
+    ImGui::TableSetColumnIndex(3);
+    fi_state_source_widget(
+        w, cap, fi_find_method_source(cap, draw, source_method));
+    ImGui::PopID();
+}
+
+static void fi_pipeline_tab(FrameInspectorWindow *w, const FICapture *cap,
+                            const FIDrawSubmission *draw)
+{
+    uint32_t control0, control1, control2, blend, setup_raster;
+    bool registers_available =
+        fi_draw_register(cap, draw, NV_PGRAPH_CONTROL_0, &control0) &&
+        fi_draw_register(cap, draw, NV_PGRAPH_CONTROL_1, &control1) &&
+        fi_draw_register(cap, draw, NV_PGRAPH_CONTROL_2, &control2) &&
+        fi_draw_register(cap, draw, NV_PGRAPH_BLEND, &blend) &&
+        fi_draw_register(cap, draw, NV_PGRAPH_SETUPRASTER, &setup_raster);
+    if (!registers_available) {
+        ImGui::TextDisabled("Immutable pipeline registers are unavailable.");
+        if (ImGui::CollapsingHeader("Raw PGRAPH register snapshot")) {
+            fi_raw_state_dump(cap, draw->regs_resource);
+        }
+        return;
+    }
+
+    FINV2APipelineState state;
+    fi_nv2a_decode_pipeline(control0, control1, control2, blend,
+                            setup_raster, &state);
+    ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+        ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_ScrollX;
+    if (ImGui::BeginTable("fi_pipeline", 4, flags)) {
+        ImGui::TableSetupColumn("Field");
+        ImGui::TableSetupColumn("Decoded value");
+        ImGui::TableSetupColumn("Raw register");
+        ImGui::TableSetupColumn("Captured source",
+                                ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+
+        char value[256];
+        fi_pipeline_heading("Render target");
+        if (draw->color_surface_gen < cap->surfaces.num_gens) {
+            const FISurfaceKey *key =
+                &cap->surfaces.gens[draw->color_surface_gen].key;
+            snprintf(value, sizeof(value),
+                     "gen %u, guest 0x%llx, 0x%llx bytes",
+                     draw->color_surface_gen, (unsigned long long)key->addr,
+                     (unsigned long long)key->size);
+        } else {
+            snprintf(value, sizeof(value), "disabled or untracked");
+        }
+        fi_pipeline_row(w, cap, draw, "Color target", value, false, 0, 0,
+                        NV097_SET_SURFACE_COLOR_OFFSET);
+        if (draw->zeta_surface_gen < cap->surfaces.num_gens) {
+            const FISurfaceKey *key =
+                &cap->surfaces.gens[draw->zeta_surface_gen].key;
+            snprintf(value, sizeof(value),
+                     "gen %u, guest 0x%llx, 0x%llx bytes",
+                     draw->zeta_surface_gen, (unsigned long long)key->addr,
+                     (unsigned long long)key->size);
+        } else {
+            snprintf(value, sizeof(value), "disabled or untracked");
+        }
+        fi_pipeline_row(w, cap, draw, "Zeta target", value, false, 0, 0,
+                        NV097_SET_SURFACE_ZETA_OFFSET);
+        const FISurfaceKey *shape =
+            draw->color_surface_gen < cap->surfaces.num_gens ?
+                &cap->surfaces.gens[draw->color_surface_gen].key :
+            draw->zeta_surface_gen < cap->surfaces.num_gens ?
+                &cap->surfaces.gens[draw->zeta_surface_gen].key : nullptr;
+        if (shape) {
+            snprintf(value, sizeof(value),
+                     "%ux%u, color format 0x%x, AA 0x%x%s",
+                     shape->width, shape->height, shape->format, shape->aa,
+                     shape->swizzle ? ", swizzled" : "");
+        } else {
+            snprintf(value, sizeof(value), "untracked");
+        }
+        fi_pipeline_row(w, cap, draw, "Surface shape / format", value,
+                        false, 0, 0, NV097_SET_SURFACE_FORMAT);
+        uint32_t color_pitch = 0, zeta_pitch = 0;
+        if (draw->color_surface_gen < cap->surfaces.num_gens) {
+            color_pitch =
+                cap->surfaces.gens[draw->color_surface_gen].key.pitch;
+        }
+        if (draw->zeta_surface_gen < cap->surfaces.num_gens) {
+            zeta_pitch =
+                cap->surfaces.gens[draw->zeta_surface_gen].key.pitch;
+        }
+        snprintf(value, sizeof(value), "color=%u zeta=%u", color_pitch,
+                 zeta_pitch);
+        fi_pipeline_row(w, cap, draw, "Surface pitch", value, false, 0, 0,
+                        NV097_SET_SURFACE_PITCH);
+
+        fi_pipeline_heading("Viewport / scissor");
+        uint32_t clip_x, clip_y;
+        if (fi_draw_register(cap, draw, NV_PGRAPH_WINDOWCLIPX0, &clip_x)) {
+            snprintf(value, sizeof(value), "%u through %u",
+                     clip_x & 0xfff, (clip_x >> 16) & 0xfff);
+            fi_pipeline_row(w, cap, draw, "Window clip X", value, true,
+                            NV_PGRAPH_WINDOWCLIPX0, clip_x,
+                            NV097_SET_WINDOW_CLIP_HORIZONTAL);
+        }
+        if (fi_draw_register(cap, draw, NV_PGRAPH_WINDOWCLIPY0, &clip_y)) {
+            snprintf(value, sizeof(value), "%u through %u",
+                     clip_y & 0xfff, (clip_y >> 16) & 0xfff);
+            fi_pipeline_row(w, cap, draw, "Window clip Y", value, true,
+                            NV_PGRAPH_WINDOWCLIPY0, clip_y,
+                            NV097_SET_WINDOW_CLIP_VERTICAL);
+        }
+        snprintf(value, sizeof(value), "%s",
+                 state.window_clip_exclusive ? "exclusive" : "inclusive");
+        fi_pipeline_row(w, cap, draw, "Window clip type", value, true,
+                        NV_PGRAPH_SETUPRASTER, setup_raster,
+                        NV097_SET_WINDOW_CLIP_TYPE);
+        uint32_t viewport[4];
+        if (fi_draw_constant(cap, draw, NV_IGRAPH_XF_XFCTX_VPSCL,
+                             viewport)) {
+            float decoded[4];
+            memcpy(decoded, viewport, sizeof(decoded));
+            snprintf(value, sizeof(value),
+                     "(%.5g, %.5g, %.5g, %.5g), raw=%08x %08x %08x %08x",
+                     decoded[0], decoded[1], decoded[2], decoded[3],
+                     viewport[0], viewport[1], viewport[2], viewport[3]);
+            fi_pipeline_row(w, cap, draw, "Viewport scale", value, false,
+                            0, 0, NV097_SET_VIEWPORT_SCALE);
+        }
+        if (fi_draw_constant(cap, draw, NV_IGRAPH_XF_XFCTX_VPOFF,
+                             viewport)) {
+            float decoded[4];
+            memcpy(decoded, viewport, sizeof(decoded));
+            snprintf(value, sizeof(value),
+                     "(%.5g, %.5g, %.5g, %.5g), raw=%08x %08x %08x %08x",
+                     decoded[0], decoded[1], decoded[2], decoded[3],
+                     viewport[0], viewport[1], viewport[2], viewport[3]);
+            fi_pipeline_row(w, cap, draw, "Viewport offset", value, false,
+                            0, 0, NV097_SET_VIEWPORT_OFFSET);
+        }
+
+        fi_pipeline_heading("Rasterization");
+        snprintf(value, sizeof(value), "%s",
+                 state.cull_enable ? "enabled" : "disabled");
+        fi_pipeline_row(w, cap, draw, "Face culling", value, true,
+                        NV_PGRAPH_SETUPRASTER, setup_raster,
+                        NV097_SET_CULL_FACE_ENABLE);
+        snprintf(value, sizeof(value), "%s",
+                 fi_cull_face_name(state.cull_face,
+                                   state.cull_face_valid));
+        fi_pipeline_row(w, cap, draw, "Cull face", value, true,
+                        NV_PGRAPH_SETUPRASTER, setup_raster,
+                        NV097_SET_CULL_FACE);
+        snprintf(value, sizeof(value), "%s",
+                 state.front_face_ccw ? "counter-clockwise" : "clockwise");
+        fi_pipeline_row(w, cap, draw, "Front face", value, true,
+                        NV_PGRAPH_SETUPRASTER, setup_raster,
+                        NV097_SET_FRONT_FACE);
+        snprintf(value, sizeof(value), "%s",
+                 fi_fill_mode_name(state.front_fill,
+                                   state.front_fill_valid));
+        fi_pipeline_row(w, cap, draw, "Front fill mode", value, true,
+                        NV_PGRAPH_SETUPRASTER, setup_raster,
+                        NV097_SET_FRONT_POLYGON_MODE);
+        snprintf(value, sizeof(value), "%s",
+                 fi_fill_mode_name(state.back_fill, state.back_fill_valid));
+        fi_pipeline_row(w, cap, draw, "Back fill mode", value, true,
+                        NV_PGRAPH_SETUPRASTER, setup_raster,
+                        NV097_SET_BACK_POLYGON_MODE);
+        snprintf(value, sizeof(value), "%s",
+                 state.point_smooth_enable ? "enabled" : "disabled");
+        fi_pipeline_row(w, cap, draw, "Point smoothing", value, true,
+                        NV_PGRAPH_SETUPRASTER, setup_raster,
+                        NV097_SET_POINT_SMOOTH_ENABLE);
+        snprintf(value, sizeof(value), "%s",
+                 state.line_smooth_enable ? "enabled" : "disabled");
+        fi_pipeline_row(w, cap, draw, "Line smoothing", value, true,
+                        NV_PGRAPH_SETUPRASTER, setup_raster,
+                        NV097_SET_LINE_SMOOTH_ENABLE);
+        snprintf(value, sizeof(value), "%s",
+                 state.polygon_smooth_enable ? "enabled" : "disabled");
+        fi_pipeline_row(w, cap, draw, "Polygon smoothing", value, true,
+                        NV_PGRAPH_SETUPRASTER, setup_raster,
+                        NV097_SET_POLY_SMOOTH_ENABLE);
+        uint32_t control3;
+        if (fi_draw_register(cap, draw, NV_PGRAPH_CONTROL_3, &control3)) {
+            snprintf(value, sizeof(value), "%s vertex",
+                     control3 & NV_PGRAPH_CONTROL_3_PROVOKING_VERTEX ?
+                         "first" : "last");
+            fi_pipeline_row(w, cap, draw, "Provoking vertex", value, true,
+                            NV_PGRAPH_CONTROL_3, control3,
+                            NV097_SET_PROVOKING_VERTEX);
+        }
+
+        fi_pipeline_heading("Depth");
+        snprintf(value, sizeof(value), "%s",
+                 state.depth_test_enable ? "enabled" : "disabled");
+        fi_pipeline_row(w, cap, draw, "Depth test", value, true,
+                        NV_PGRAPH_CONTROL_0, control0,
+                        NV097_SET_DEPTH_TEST_ENABLE);
+        snprintf(value, sizeof(value), "%s",
+                 state.depth_write_enable ? "enabled" : "disabled");
+        fi_pipeline_row(w, cap, draw, "Depth write", value, true,
+                        NV_PGRAPH_CONTROL_0, control0, NV097_SET_DEPTH_MASK);
+        snprintf(value, sizeof(value), "%s",
+                 fi_compare_name(state.depth_func,
+                                 state.depth_func_valid));
+        fi_pipeline_row(w, cap, draw, "Depth function", value, true,
+                        NV_PGRAPH_CONTROL_0, control0, NV097_SET_DEPTH_FUNC);
+        snprintf(value, sizeof(value), "%s perspective, %s zeta",
+                 state.depth_perspective_enable ? "with" : "without",
+                 state.zeta_float ? "float" : "fixed");
+        fi_pipeline_row(w, cap, draw, "Depth format", value, true,
+                        NV_PGRAPH_SETUPRASTER, setup_raster,
+                        NV097_SET_CONTROL0);
+
+        fi_pipeline_heading("Alpha test");
+        snprintf(value, sizeof(value), "%s",
+                 state.alpha_test_enable ? "enabled" : "disabled");
+        fi_pipeline_row(w, cap, draw, "Alpha test", value, true,
+                        NV_PGRAPH_CONTROL_0, control0,
+                        NV097_SET_ALPHA_TEST_ENABLE);
+        snprintf(value, sizeof(value), "%s",
+                 fi_compare_name(state.alpha_func,
+                                 state.alpha_func_valid));
+        fi_pipeline_row(w, cap, draw, "Alpha function", value, true,
+                        NV_PGRAPH_CONTROL_0, control0, NV097_SET_ALPHA_FUNC);
+        snprintf(value, sizeof(value), "%u (0x%02x)", state.alpha_ref,
+                 state.alpha_ref);
+        fi_pipeline_row(w, cap, draw, "Alpha reference", value, true,
+                        NV_PGRAPH_CONTROL_0, control0, NV097_SET_ALPHA_REF);
+
+        fi_pipeline_heading("Blending / logic operation");
+        snprintf(value, sizeof(value), "%s",
+                 state.blend_enable ? "enabled" : "disabled");
+        fi_pipeline_row(w, cap, draw, "Blending", value, true,
+                        NV_PGRAPH_BLEND, blend, NV097_SET_BLEND_ENABLE);
+        snprintf(value, sizeof(value), "%s",
+                 fi_blend_factor_name(state.blend_src_factor,
+                                      state.blend_src_factor_valid));
+        fi_pipeline_row(w, cap, draw, "Source factor", value, true,
+                        NV_PGRAPH_BLEND, blend,
+                        NV097_SET_BLEND_FUNC_SFACTOR);
+        snprintf(value, sizeof(value), "%s",
+                 fi_blend_factor_name(state.blend_dst_factor,
+                                      state.blend_dst_factor_valid));
+        fi_pipeline_row(w, cap, draw, "Destination factor", value, true,
+                        NV_PGRAPH_BLEND, blend,
+                        NV097_SET_BLEND_FUNC_DFACTOR);
+        snprintf(value, sizeof(value), "%s",
+                 fi_blend_equation_name(state.blend_equation,
+                                        state.blend_equation_valid));
+        fi_pipeline_row(w, cap, draw, "Blend equation", value, true,
+                        NV_PGRAPH_BLEND, blend, NV097_SET_BLEND_EQUATION);
+        uint32_t blend_color;
+        if (fi_draw_register(cap, draw, NV_PGRAPH_BLENDCOLOR,
+                             &blend_color)) {
+            snprintf(value, sizeof(value), "packed ARGB 0x%08x",
+                     blend_color);
+            fi_pipeline_row(w, cap, draw, "Blend constant", value, true,
+                            NV_PGRAPH_BLENDCOLOR, blend_color,
+                            NV097_SET_BLEND_COLOR);
+        }
+        snprintf(value, sizeof(value), "%s",
+                 state.logic_op_enable ? "enabled" : "disabled");
+        fi_pipeline_row(w, cap, draw, "Logic operation enable", value, true,
+                        NV_PGRAPH_BLEND, blend, NV097_SET_LOGIC_OP_ENABLE);
+        snprintf(value, sizeof(value), "%s",
+                 fi_logic_op_name(state.logic_op));
+        fi_pipeline_row(w, cap, draw, "Logic operation", value, true,
+                        NV_PGRAPH_BLEND, blend, NV097_SET_LOGIC_OP);
+
+        fi_pipeline_heading("Stencil");
+        snprintf(value, sizeof(value), "%s",
+                 state.stencil_test_enable ? "enabled" : "disabled");
+        fi_pipeline_row(w, cap, draw, "Stencil test", value, true,
+                        NV_PGRAPH_CONTROL_1, control1,
+                        NV097_SET_STENCIL_TEST_ENABLE);
+        snprintf(value, sizeof(value), "%s",
+                 fi_compare_name(state.stencil_func,
+                                 state.stencil_func_valid));
+        fi_pipeline_row(w, cap, draw, "Stencil function", value, true,
+                        NV_PGRAPH_CONTROL_1, control1,
+                        NV097_SET_STENCIL_FUNC);
+        snprintf(value, sizeof(value), "0x%02x", state.stencil_ref);
+        fi_pipeline_row(w, cap, draw, "Stencil reference", value, true,
+                        NV_PGRAPH_CONTROL_1, control1,
+                        NV097_SET_STENCIL_FUNC_REF);
+        snprintf(value, sizeof(value), "0x%02x", state.stencil_read_mask);
+        fi_pipeline_row(w, cap, draw, "Stencil read mask", value, true,
+                        NV_PGRAPH_CONTROL_1, control1,
+                        NV097_SET_STENCIL_FUNC_MASK);
+        snprintf(value, sizeof(value), "0x%02x", state.stencil_write_mask);
+        fi_pipeline_row(w, cap, draw, "Stencil write mask", value, true,
+                        NV_PGRAPH_CONTROL_1, control1,
+                        NV097_SET_STENCIL_MASK);
+        snprintf(value, sizeof(value), "%s",
+                 fi_stencil_op_name(state.stencil_fail,
+                                    state.stencil_ops_valid));
+        fi_pipeline_row(w, cap, draw, "Stencil fail operation", value, true,
+                        NV_PGRAPH_CONTROL_2, control2,
+                        NV097_SET_STENCIL_OP_FAIL);
+        snprintf(value, sizeof(value), "%s",
+                 fi_stencil_op_name(state.stencil_zfail,
+                                    state.stencil_ops_valid));
+        fi_pipeline_row(w, cap, draw, "Stencil depth-fail operation", value,
+                        true, NV_PGRAPH_CONTROL_2, control2,
+                        NV097_SET_STENCIL_OP_ZFAIL);
+        snprintf(value, sizeof(value), "%s",
+                 fi_stencil_op_name(state.stencil_zpass,
+                                    state.stencil_ops_valid));
+        fi_pipeline_row(w, cap, draw, "Stencil depth-pass operation", value,
+                        true, NV_PGRAPH_CONTROL_2, control2,
+                        NV097_SET_STENCIL_OP_ZPASS);
+
+        fi_pipeline_heading("Color output");
+        snprintf(value, sizeof(value), "A=%s R=%s G=%s B=%s",
+                 state.color_write_mask & 1 ? "on" : "off",
+                 state.color_write_mask & 2 ? "on" : "off",
+                 state.color_write_mask & 4 ? "on" : "off",
+                 state.color_write_mask & 8 ? "on" : "off");
+        fi_pipeline_row(w, cap, draw, "Write mask", value, true,
+                        NV_PGRAPH_CONTROL_0, control0, NV097_SET_COLOR_MASK);
+        snprintf(value, sizeof(value), "%s",
+                 state.dither_enable ? "enabled" : "disabled");
+        fi_pipeline_row(w, cap, draw, "Dithering", value, true,
+                        NV_PGRAPH_CONTROL_0, control0,
+                        NV097_SET_DITHER_ENABLE);
+        ImGui::EndTable();
+    }
+
+    if (ImGui::CollapsingHeader("Raw PGRAPH register snapshot")) {
+        fi_raw_state_dump(cap, draw->regs_resource);
+    }
+}
+
+static const char *fi_combiner_register_name(uint8_t reg)
+{
+    static const char *const names[16] = {
+        "zero/discard", "C0", "C1", "fog", "V0", "V1", "reserved6",
+        "reserved7", "T0", "T1", "T2", "T3", "R0", "R1",
+        "V1+R0", "E*F",
+    };
+    return names[reg & 0xf];
+}
+
+static const char *fi_combiner_input_mapping_name(uint8_t mapping)
+{
+    switch (mapping) {
+    case 0x00: return "unsigned identity";
+    case 0x20: return "unsigned invert";
+    case 0x40: return "expand normal";
+    case 0x60: return "expand negate";
+    case 0x80: return "half-bias normal";
+    case 0xa0: return "half-bias negate";
+    case 0xc0: return "signed identity";
+    case 0xe0: return "signed negate";
+    default: return "invalid";
+    }
+}
+
+static const char *fi_combiner_output_mapping_name(uint8_t mapping)
+{
+    switch (mapping) {
+    case 0x00: return "identity";
+    case 0x08: return "bias -0.5";
+    case 0x10: return "scale x2";
+    case 0x18: return "bias -0.5, scale x2";
+    case 0x20: return "scale x4";
+    case 0x30: return "scale /2";
+    default: return "invalid";
+    }
+}
+
+static const char *fi_texture_mode_name(uint8_t mode)
+{
+    static const char *const names[] = {
+        "none", "project 2D", "project 3D", "cube map", "pass-through",
+        "clip plane", "bump env map", "bump env map luminance", "BRDF",
+        "dot ST", "dot ZW", "dot reflect diffuse", "dot reflect specular",
+        "dot STR 3D", "dot STR cube", "dependent AR", "dependent GB",
+        "dot product", "dot reflect specular constant",
+    };
+    return mode < sizeof(names) / sizeof(names[0]) ? names[mode] : "reserved";
+}
+
+static void fi_format_combiner_input(const FINV2ACombinerInput *input,
+                                     char *buf, size_t size)
+{
+    snprintf(buf, size, "%s.%s, %s%s%s",
+             fi_combiner_register_name(input->reg),
+             input->alpha_channel ? "a" : "rgb",
+             fi_combiner_input_mapping_name(input->mapping),
+             input->register_valid ? "" : " [invalid register]",
+             input->final_mapping_valid ? "" : " [invalid final mapping]");
+}
+
+static void fi_format_combiner_inputs(const FINV2ACombinerInputs *inputs,
+                                      char *buf, size_t size)
+{
+    static const char names[] = { 'A', 'B', 'C', 'D' };
+    size_t pos = 0;
+    buf[0] = 0;
+    for (uint32_t i = 0; i < 4 && pos < size; i++) {
+        char input[128];
+        fi_format_combiner_input(&inputs->input[i], input, sizeof(input));
+        int written = snprintf(buf + pos, size - pos, "%s%c=%s",
+                               i ? "; " : "", names[i], input);
+        if (written < 0 || (size_t)written >= size - pos) {
+            buf[size - 1] = 0;
+            return;
+        }
+        pos += written;
+    }
+}
+
+static void fi_format_combiner_output(const FINV2ACombinerOutput *output,
+                                      char *buf, size_t size)
+{
+    snprintf(buf, size,
+             "AB(%s)->%s, CD(%s)->%s, %s->%s; map=%s%s%s%s",
+             output->ab_dot ? "dot" : "multiply",
+             fi_combiner_register_name(output->ab_dest),
+             output->cd_dot ? "dot" : "multiply",
+             fi_combiner_register_name(output->cd_dest),
+             output->mux ? "MUX(AB,CD)" : "AB+CD",
+             fi_combiner_register_name(output->mux_sum_dest),
+             fi_combiner_output_mapping_name(output->mapping),
+             output->ab_blue_to_alpha ? ", AB blue->alpha" : "",
+             output->cd_blue_to_alpha ? ", CD blue->alpha" : "",
+             output->mapping_valid ? "" : " [invalid mapping]");
+}
+
+static void fi_combiner_word_row(FrameInspectorWindow *w,
+                                 const FICapture *cap,
+                                 const FIDrawSubmission *draw,
+                                 const char *word, uint32_t raw,
+                                 const char *decoded, uint32_t method)
+{
+    ImGui::PushID(word);
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::TextUnformatted(word);
+    ImGui::TableSetColumnIndex(1);
+    ImGui::Text("0x%08x", raw);
+    ImGui::TableSetColumnIndex(2);
+    ImGui::TextUnformatted(decoded);
+    ImGui::TableSetColumnIndex(3);
+    fi_state_source_widget(w, cap, fi_find_method_source(cap, draw, method));
+    ImGui::PopID();
+}
+
+static void fi_combiner_table_header(void)
+{
+    ImGui::TableSetupColumn("Word");
+    ImGui::TableSetupColumn("Raw");
+    ImGui::TableSetupColumn("Decoded", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("Captured source",
+                            ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableHeadersRow();
+}
+
+static void fi_combiner_tab(FrameInspectorWindow *w, const FICapture *cap,
+                            const FIDrawSubmission *draw)
+{
+    uint32_t control;
+    uint32_t color_icw[FI_NV2A_COMBINER_STAGES];
+    uint32_t alpha_icw[FI_NV2A_COMBINER_STAGES];
+    uint32_t color_ocw[FI_NV2A_COMBINER_STAGES];
+    uint32_t alpha_ocw[FI_NV2A_COMBINER_STAGES];
+    uint32_t factor0[FI_NV2A_COMBINER_STAGES];
+    uint32_t factor1[FI_NV2A_COMBINER_STAGES];
+    uint32_t final0, final1, specfog0, specfog1, shader_program;
+    bool available = fi_draw_register(
+        cap, draw, NV_PGRAPH_COMBINECTL, &control);
+    for (uint32_t i = 0; i < FI_NV2A_COMBINER_STAGES; i++) {
+        available &= fi_draw_register(
+            cap, draw, NV_PGRAPH_COMBINECOLORI0 + i * 4, &color_icw[i]);
+        available &= fi_draw_register(
+            cap, draw, NV_PGRAPH_COMBINEALPHAI0 + i * 4, &alpha_icw[i]);
+        available &= fi_draw_register(
+            cap, draw, NV_PGRAPH_COMBINECOLORO0 + i * 4, &color_ocw[i]);
+        available &= fi_draw_register(
+            cap, draw, NV_PGRAPH_COMBINEALPHAO0 + i * 4, &alpha_ocw[i]);
+        available &= fi_draw_register(
+            cap, draw, NV_PGRAPH_COMBINEFACTOR0 + i * 4, &factor0[i]);
+        available &= fi_draw_register(
+            cap, draw, NV_PGRAPH_COMBINEFACTOR1 + i * 4, &factor1[i]);
+    }
+    available &= fi_draw_register(
+        cap, draw, NV_PGRAPH_COMBINESPECFOG0, &final0);
+    available &= fi_draw_register(
+        cap, draw, NV_PGRAPH_COMBINESPECFOG1, &final1);
+    available &= fi_draw_register(
+        cap, draw, NV_PGRAPH_SPECFOGFACTOR0, &specfog0);
+    available &= fi_draw_register(
+        cap, draw, NV_PGRAPH_SPECFOGFACTOR1, &specfog1);
+    available &= fi_draw_register(
+        cap, draw, NV_PGRAPH_SHADERPROG, &shader_program);
+    if (!available) {
+        ImGui::TextDisabled("Immutable combiner registers are unavailable.");
+        return;
+    }
+
+    FINV2ACombinerState state;
+    fi_nv2a_decode_combiner(
+        control, color_icw, alpha_icw, color_ocw, alpha_ocw, factor0,
+        factor1, final0, final1, specfog0, specfog1, shader_program, &state);
+    ImGui::Text("Stages: %u%s   MUX source: R0.a %s   C0: %s   C1: %s",
+                state.stage_count,
+                state.stage_count_valid ? "" : " [INVALID]",
+                state.mux_msb ? "MSB" : "LSB",
+                state.unique_c0 ? "per-stage" : "shared",
+                state.unique_c1 ? "per-stage" : "shared");
+
+    ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+        ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_ScrollX;
+    if (ImGui::BeginTable("fi_combiner_control", 4, flags)) {
+        fi_combiner_table_header();
+        char decoded[256];
+        snprintf(decoded, sizeof(decoded),
+                 "count=%u%s, MUX=%s, C0=%s, C1=%s", state.stage_count,
+                 state.stage_count_valid ? "" : " [invalid]",
+                 state.mux_msb ? "R0.a MSB" : "R0.a LSB",
+                 state.unique_c0 ? "unique" : "shared",
+                 state.unique_c1 ? "unique" : "shared");
+        fi_combiner_word_row(w, cap, draw, "COMBINECTL", control, decoded,
+                             NV097_SET_COMBINER_CONTROL);
+        ImGui::EndTable();
+    }
+
+    uint32_t stage_count = std::min(
+        (uint32_t)state.stage_count, (uint32_t)FI_NV2A_COMBINER_STAGES);
+    for (uint32_t i = 0; i < stage_count; i++) {
+        ImGui::PushID((int)i);
+        ImGuiTreeNodeFlags tree_flags = ImGuiTreeNodeFlags_SpanAvailWidth;
+        if (i == 0) {
+            tree_flags |= ImGuiTreeNodeFlags_DefaultOpen;
+        }
+        if (ImGui::TreeNodeEx("combiner_stage", tree_flags, "Stage %u", i)) {
+            if (ImGui::BeginTable("fi_combiner_stage_words", 4, flags)) {
+                fi_combiner_table_header();
+                char decoded[640];
+                fi_format_combiner_inputs(&state.stage[i].color_inputs,
+                                          decoded, sizeof(decoded));
+                fi_combiner_word_row(
+                    w, cap, draw, "Color ICW", color_icw[i], decoded,
+                    NV097_SET_COMBINER_COLOR_ICW + i * 4);
+                fi_format_combiner_inputs(&state.stage[i].alpha_inputs,
+                                          decoded, sizeof(decoded));
+                fi_combiner_word_row(
+                    w, cap, draw, "Alpha ICW", alpha_icw[i], decoded,
+                    NV097_SET_COMBINER_ALPHA_ICW + i * 4);
+                fi_format_combiner_output(&state.stage[i].color_output,
+                                          decoded, sizeof(decoded));
+                fi_combiner_word_row(
+                    w, cap, draw, "Color OCW", color_ocw[i], decoded,
+                    NV097_SET_COMBINER_COLOR_OCW + i * 4);
+                fi_format_combiner_output(&state.stage[i].alpha_output,
+                                          decoded, sizeof(decoded));
+                fi_combiner_word_row(
+                    w, cap, draw, "Alpha OCW", alpha_ocw[i], decoded,
+                    NV097_SET_COMBINER_ALPHA_OCW + i * 4);
+                snprintf(decoded, sizeof(decoded),
+                         "per-stage C0 packed ARGB");
+                fi_combiner_word_row(
+                    w, cap, draw, "Factor 0", factor0[i], decoded,
+                    NV097_SET_COMBINER_FACTOR0 + i * 4);
+                snprintf(decoded, sizeof(decoded),
+                         "per-stage C1 packed ARGB");
+                fi_combiner_word_row(
+                    w, cap, draw, "Factor 1", factor1[i], decoded,
+                    NV097_SET_COMBINER_FACTOR1 + i * 4);
+                ImGui::EndTable();
+            }
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Final combiner");
+    if (ImGui::BeginTable("fi_final_combiner", 4, flags)) {
+        fi_combiner_table_header();
+        char decoded[768];
+        FINV2ACombinerInputs final_abcd = { .raw = final0 };
+        for (uint32_t i = 0; i < 4; i++) {
+            final_abcd.input[i] = state.final.input[i];
+        }
+        fi_format_combiner_inputs(&final_abcd, decoded, sizeof(decoded));
+        fi_combiner_word_row(
+            w, cap, draw, "Final A/B/C/D", final0, decoded,
+            NV097_SET_COMBINER_SPECULAR_FOG_CW0);
+        char e[128], f[128], g[128];
+        fi_format_combiner_input(&state.final.input[4], e, sizeof(e));
+        fi_format_combiner_input(&state.final.input[5], f, sizeof(f));
+        fi_format_combiner_input(&state.final.input[6], g, sizeof(g));
+        snprintf(decoded, sizeof(decoded),
+                 "E=%s; F=%s; G=%s; flags=0x%02x CLAMP_SUM=%s "
+                 "COMPLEMENT_V1=%s COMPLEMENT_R0=%s", e, f, g,
+                 final1 & 0xff, state.final.clamp_sum ? "on" : "off",
+                 state.final.complement_v1 ? "on" : "off",
+                 state.final.complement_r0 ? "on" : "off");
+        fi_combiner_word_row(
+            w, cap, draw, "Final E/F/G + flags", final1, decoded,
+            NV097_SET_COMBINER_SPECULAR_FOG_CW1);
+        ImGui::EndTable();
+    }
+
+    ImGui::TextDisabled(
+        "Final spec/fog factors (separate from per-stage factors)");
+    if (ImGui::BeginTable("fi_final_factors", 4, flags)) {
+        fi_combiner_table_header();
+        fi_combiner_word_row(
+            w, cap, draw, "Final C0 / SPECFOGFACTOR0", specfog0,
+            "final-combiner C0 packed ARGB",
+            NV097_SET_SPECULAR_FOG_FACTOR);
+        fi_combiner_word_row(
+            w, cap, draw, "Final C1 / SPECFOGFACTOR1", specfog1,
+            "final-combiner C1 packed ARGB",
+            NV097_SET_SPECULAR_FOG_FACTOR + 4);
+        ImGui::EndTable();
+    }
+
+    ImGui::TextDisabled("Texture shader modes");
+    if (ImGui::BeginTable("fi_texture_shader_modes", 4, flags)) {
+        fi_combiner_table_header();
+        for (uint32_t i = 0; i < FI_NV2A_TEXTURE_STAGES; i++) {
+            char word[32], decoded[128];
+            snprintf(word, sizeof(word), "Texture stage %u", i);
+            snprintf(decoded, sizeof(decoded), "%s (0x%02x)%s",
+                     fi_texture_mode_name(state.texture_mode[i]),
+                     state.texture_mode[i],
+                     state.texture_mode_valid[i] ? "" : " [invalid]");
+            fi_combiner_word_row(w, cap, draw, word, shader_program, decoded,
+                                 NV097_SET_SHADER_STAGE_PROGRAM);
+        }
+        ImGui::EndTable();
+    }
+}
+
+typedef enum FICallPathGroup {
+    FI_CALL_GEOMETRY,
+    FI_CALL_TRANSFORM,
+    FI_CALL_COMBINER,
+    FI_CALL_TEXTURE_STATE,
+    FI_CALL_TARGET,
+    FI_CALL_RASTER,
+    FI_CALL_OTHER,
+} FICallPathGroup;
+
+static bool fi_method_range(uint32_t method, uint32_t base, uint32_t count)
+{
+    return method >= base && method - base < count * 4;
+}
+
+static bool fi_geometry_method(uint32_t method)
+{
+    return method == NV097_ARRAY_ELEMENT16 ||
+        method == NV097_ARRAY_ELEMENT32 || method == NV097_DRAW_ARRAYS ||
+        method == NV097_INLINE_ARRAY || method == NV097_SET_BEGIN_END ||
+        (method >= NV097_SET_VERTEX3F &&
+         method < NV097_SET_VERTEX_DATA_ARRAY_OFFSET) ||
+        fi_method_range(method, NV097_SET_VERTEX_DATA_ARRAY_OFFSET, 16) ||
+        fi_method_range(method, NV097_SET_VERTEX_DATA_ARRAY_FORMAT, 16) ||
+        (method >= NV097_SET_VERTEX_DATA2F_M &&
+         method < NV097_SET_TEXTURE_OFFSET);
+}
+
+static FICallPathGroup fi_classify_source(const FIStateSource *source)
+{
+    uint32_t method = source->method;
+    if (fi_geometry_method(method)) {
+        return FI_CALL_GEOMETRY;
+    }
+    if (fi_method_range(method, NV097_SET_COMBINER_ALPHA_ICW, 8) ||
+        method == NV097_SET_COMBINER_SPECULAR_FOG_CW0 ||
+        method == NV097_SET_COMBINER_SPECULAR_FOG_CW1 ||
+        fi_method_range(method, NV097_SET_COMBINER_FACTOR0, 8) ||
+        fi_method_range(method, NV097_SET_COMBINER_FACTOR1, 8) ||
+        fi_method_range(method, NV097_SET_COMBINER_ALPHA_OCW, 8) ||
+        fi_method_range(method, NV097_SET_COMBINER_COLOR_ICW, 8) ||
+        fi_method_range(method, NV097_SET_COMBINER_COLOR_OCW, 8) ||
+        fi_method_range(method, NV097_SET_SPECULAR_FOG_FACTOR, 2) ||
+        method == NV097_SET_COMBINER_CONTROL ||
+        method == NV097_SET_SHADER_STAGE_PROGRAM) {
+        return FI_CALL_COMBINER;
+    }
+    if (method >= NV097_SET_TEXTURE_OFFSET && method < 0x1c00) {
+        return FI_CALL_TEXTURE_STATE;
+    }
+    if (method == NV097_SET_SURFACE_FORMAT ||
+        method == NV097_SET_SURFACE_PITCH ||
+        method == NV097_SET_SURFACE_COLOR_OFFSET ||
+        method == NV097_SET_SURFACE_ZETA_OFFSET) {
+        return FI_CALL_TARGET;
+    }
+    if (method == NV097_SET_SURFACE_CLIP_HORIZONTAL ||
+        method == NV097_SET_SURFACE_CLIP_VERTICAL ||
+        method == NV097_SET_WINDOW_CLIP_TYPE ||
+        (method >= NV097_SET_WINDOW_CLIP_HORIZONTAL && method < 0x300) ||
+        (method >= NV097_SET_ALPHA_TEST_ENABLE &&
+         method <= NV097_SET_NORMALIZATION_ENABLE) ||
+        method == NV097_SET_VIEWPORT_OFFSET ||
+        method == NV097_SET_VIEWPORT_SCALE ||
+        method == NV097_SET_LOGIC_OP_ENABLE ||
+        method == NV097_SET_LOGIC_OP || method == NV097_SET_CONTROL0) {
+        return FI_CALL_RASTER;
+    }
+    if (source->destination.kind == FI_SETTER_DEST_VSH_PROGRAM ||
+        source->destination.kind == FI_SETTER_DEST_VSH_CONSTANT ||
+        fi_method_range(method, NV097_SET_TRANSFORM_PROGRAM, 32) ||
+        fi_method_range(method, NV097_SET_TRANSFORM_CONSTANT, 32) ||
+        (method >= NV097_SET_PROJECTION_MATRIX &&
+         method < NV097_SET_BACK_LIGHT_AMBIENT_COLOR) ||
+        (method >= NV097_SET_TRANSFORM_DATA &&
+         method <= NV097_SET_TRANSFORM_CONSTANT_LOAD)) {
+        return FI_CALL_TRANSFORM;
+    }
+    return FI_CALL_OTHER;
+}
+
+static void fi_render_geometry_command_writers(FrameInspectorWindow *w,
+                                               const FICapture *cap,
+                                               uint32_t batch_event)
+{
+    struct Writer {
+        uint32_t node;
+        uint16_t confidence;
+        uint32_t count;
+        uint32_t first_rec;
+    };
+    std::vector<Writer> writers;
+    const FIMethodBatch *batch =
+        fi_find_method_batch(cap, (int)batch_event);
+    if (batch && batch->first_rec <= cap->methods.num_recs &&
+        batch->rec_count <= cap->methods.num_recs - batch->first_rec) {
+        for (uint32_t i = batch->first_rec;
+             i < batch->first_rec + batch->rec_count; i++) {
+            const FIMethodRec *record = &cap->methods.recs[i];
+            if (!fi_geometry_method(record->method)) {
+                continue;
+            }
+            Writer *writer = nullptr;
+            for (Writer &candidate : writers) {
+                if (candidate.node == record->writer_node &&
+                    candidate.confidence == record->confidence) {
+                    writer = &candidate;
+                    break;
+                }
+            }
+            if (!writer) {
+                writers.push_back({ record->writer_node, record->confidence,
+                                    0, i });
+                writer = &writers.back();
+            }
+            writer->count++;
+        }
+    }
+
+    if (ImGui::TreeNodeEx("geometry_commands",
+                          ImGuiTreeNodeFlags_SpanAvailWidth,
+                          "Geometry commands (%u writer%s)",
+                          (uint32_t)writers.size(),
+                          writers.size() == 1 ? "" : "s")) {
+        if (writers.empty()) {
+            ImGui::TextDisabled("No geometry method records.");
+        }
+        for (uint32_t i = 0; i < writers.size(); i++) {
+            const Writer &writer = writers[i];
+            ImGui::PushID((int)i);
+            char function[128];
+            const FIOriginNode *node =
+                fi_origin_snapshot_node(&cap->origins, writer.node);
+            if ((writer.confidence == FI_ORIG_ATTRIBUTED ||
+                 writer.confidence == FI_ORIG_PARTIAL) && node) {
+                fi_sym(node->callee, function, sizeof(function));
+            } else {
+                snprintf(function, sizeof(function), "%s",
+                         fi_confidence_name(writer.confidence));
+            }
+            if (ImGui::TreeNode("writer", "%s: %u command method%s", function,
+                                writer.count, writer.count == 1 ? "" : "s")) {
+                if (ImGui::SmallButton("Select in Methods")) {
+                    w->m_selected_rec = (int)writer.first_rec;
+                }
+                if (writer.confidence == FI_ORIG_ATTRIBUTED ||
+                    writer.confidence == FI_ORIG_PARTIAL) {
+                    fi_render_call_chain(cap, writer.node);
+                } else {
+                    ImGui::TextDisabled("No captured writer call path.");
+                }
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+        }
+        ImGui::TreePop();
+    }
+}
+
+static void fi_collect_group_sources(const FICapture *cap,
+                                     const FIDrawSubmission *draw,
+                                     FICallPathGroup group,
+                                     std::vector<uint32_t> *indices)
+{
+    indices->clear();
+    if (!fi_draw_sources_valid(cap, draw)) {
+        return;
+    }
+    for (uint32_t i = 0; i < draw->num_sources; i++) {
+        uint32_t index = draw->first_source + i;
+        if (fi_classify_source(&cap->draws.sources[index]) == group) {
+            indices->push_back(index);
+        }
+    }
+}
+
+static void fi_collect_sample_sources(const FICapture *cap,
+                                      const FIDrawSubmission *draw,
+                                      std::vector<uint32_t> *indices)
+{
+    indices->clear();
+    if (!fi_draw_sources_valid(cap, draw) ||
+        draw->first_sample > cap->draws.num_samples ||
+        draw->num_samples > cap->draws.num_samples - draw->first_sample) {
+        return;
+    }
+    for (uint32_t i = 0; i < draw->num_samples; i++) {
+        const FIVertexSample *sample =
+            &cap->draws.samples[draw->first_sample + i];
+        for (uint32_t slot = 0; slot < FI_DRAW_ATTRIBUTE_COUNT; slot++) {
+            const FIVertexAttributeSample *attribute = &sample->attrs[slot];
+            if (!attribute->source_count ||
+                attribute->source_first == FI_DRAW_INVALID ||
+                attribute->source_first < draw->first_source ||
+                attribute->source_first > cap->draws.num_sources ||
+                attribute->source_count >
+                    cap->draws.num_sources - attribute->source_first ||
+                attribute->source_first - draw->first_source >
+                    draw->num_sources ||
+                attribute->source_count > draw->num_sources -
+                    (attribute->source_first - draw->first_source)) {
+                continue;
+            }
+            for (uint32_t j = 0; j < attribute->source_count; j++) {
+                indices->push_back(attribute->source_first + j);
+            }
+        }
+    }
+}
+
+static void fi_render_source_writers(FrameInspectorWindow *w,
+                                     const FICapture *cap, const char *title,
+                                     const std::vector<uint32_t> &indices)
+{
+    struct WriterGroup {
+        uint32_t node;
+        uint16_t confidence;
+        bool inherited;
+        std::vector<uint32_t> sources;
+    };
+    std::vector<uint64_t> seen_tokens;
+    std::vector<WriterGroup> writers;
+    for (uint32_t index : indices) {
+        if (index >= cap->draws.num_sources) {
+            continue;
+        }
+        const FIStateSource *source = &cap->draws.sources[index];
+        if (std::find(seen_tokens.begin(), seen_tokens.end(),
+                      source->source_token) != seen_tokens.end()) {
+            continue;
+        }
+        seen_tokens.push_back(source->source_token);
+        bool inherited = fi_source_is_inherited(cap, source);
+        WriterGroup *writer = nullptr;
+        for (WriterGroup &candidate : writers) {
+            if (candidate.node == source->writer_node &&
+                candidate.confidence == source->confidence &&
+                candidate.inherited == inherited) {
+                writer = &candidate;
+                break;
+            }
+        }
+        if (!writer) {
+            writers.push_back({ source->writer_node, source->confidence,
+                                inherited, {} });
+            writer = &writers.back();
+        }
+        writer->sources.push_back(index);
+    }
+
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_SpanAvailWidth;
+    if (ImGui::TreeNodeEx(title, flags, "%s (%u writer%s)", title,
+                          (uint32_t)writers.size(),
+                          writers.size() == 1 ? "" : "s")) {
+        if (writers.empty()) {
+            ImGui::TextDisabled("No captured source records.");
+        }
+        for (uint32_t i = 0; i < writers.size(); i++) {
+            const WriterGroup &writer = writers[i];
+            ImGui::PushID((int)i);
+            char function[128];
+            const FIOriginNode *node =
+                fi_origin_snapshot_node(&cap->origins, writer.node);
+            if (writer.confidence == FI_ORIG_ATTRIBUTED ||
+                writer.confidence == FI_ORIG_PARTIAL) {
+                if (node) {
+                    fi_sym(node->callee, function, sizeof(function));
+                } else if (writer.node == FI_NODE_ROOT) {
+                    snprintf(function, sizeof(function), "root frame");
+                } else {
+                    snprintf(function, sizeof(function), "node %u",
+                             writer.node);
+                }
+            } else {
+                snprintf(function, sizeof(function), "unattributed");
+            }
+            if (ImGui::TreeNode("writer", "%s: %u method%s, %s%s", function,
+                                (uint32_t)writer.sources.size(),
+                                writer.sources.size() == 1 ? "" : "s",
+                                fi_confidence_name(writer.confidence),
+                                writer.inherited ? ", inherited" : "")) {
+                for (uint32_t j = 0; j < writer.sources.size(); j++) {
+                    const FIStateSource *source =
+                        &cap->draws.sources[writer.sources[j]];
+                    ImGui::PushID((int)j);
+                    ImGui::Text("method=0x%04x parameter=0x%08x phys=0x%llx",
+                                source->method, source->parameter,
+                                (unsigned long long)source->phys_addr);
+                    if (fi_source_is_inherited(cap, source)) {
+                        ImGui::TextDisabled("inherited; no frame command");
+                    } else if (source->command_id < cap->commands.num_recs) {
+                        const FICommandRec *command =
+                            &cap->commands.recs[source->command_id];
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("select command")) {
+                            w->m_selected_command = (int)source->command_id;
+                        }
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("command #%u", command->seq);
+                    } else {
+                        ImGui::TextDisabled("frame command unavailable");
+                    }
+                    ImGui::PopID();
+                }
+                if (writer.confidence == FI_ORIG_ATTRIBUTED ||
+                    writer.confidence == FI_ORIG_PARTIAL) {
+                    fi_render_call_chain(cap, writer.node);
+                } else {
+                    ImGui::TextDisabled("No captured writer call path.");
+                }
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+        }
+        ImGui::TreePop();
+    }
+}
+
+static void fi_render_texture_content_writers(const FICapture *cap,
+                                              const FIDrawSubmission *draw)
+{
+    bool any = false;
+    if (ImGui::TreeNodeEx("texture_content", ImGuiTreeNodeFlags_SpanAvailWidth,
+                          "Texture content writers")) {
+        for (uint32_t stage = 0; stage < FI_DRAW_TEXTURE_COUNT; stage++) {
+            uint32_t set_id = draw->textures[stage].writer_set;
+            if (set_id == FI_DRAW_INVALID ||
+                set_id >= cap->draws.num_writer_sets) {
+                continue;
+            }
+            const FIResourceWriterSet *set =
+                &cap->draws.writer_sets[set_id];
+            if (set->first_writer > cap->draws.num_writers ||
+                set->num_writers >
+                    cap->draws.num_writers - set->first_writer) {
+                continue;
+            }
+            any = true;
+            ImGui::PushID((int)stage);
+            if (ImGui::TreeNode("stage", "Stage %u: %llu bytes", stage,
+                                (unsigned long long)set->coverage.total_bytes)) {
+                ImGui::Text(
+                    "attributed=%llu partial=%llu unattributed=%llu "
+                    "omitted=%llu truncated=%llu",
+                    (unsigned long long)set->coverage.attributed_bytes,
+                    (unsigned long long)set->coverage.partial_bytes,
+                    (unsigned long long)set->coverage.unattributed_bytes,
+                    (unsigned long long)set->coverage.omitted_bytes,
+                    (unsigned long long)set->coverage.truncated_bytes);
+                for (uint32_t i = 0; i < set->num_writers; i++) {
+                    const FIResourceWriter *writer =
+                        &cap->draws.writers[set->first_writer + i];
+                    ImGui::PushID((int)i);
+                    if (ImGui::TreeNode(
+                            "resource_writer", "node %u: %llu bytes, %s",
+                            writer->writer_node,
+                            (unsigned long long)writer->bytes,
+                            fi_confidence_name(writer->confidence))) {
+                        if (writer->confidence == FI_ORIG_ATTRIBUTED ||
+                            writer->confidence == FI_ORIG_PARTIAL) {
+                            fi_render_call_chain(cap, writer->writer_node);
+                        } else {
+                            ImGui::TextDisabled(
+                                "No captured writer call path.");
+                        }
+                        ImGui::TreePop();
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+        }
+        if (!any) {
+            ImGui::TextDisabled(
+                "No texture-content writer coverage was captured.");
+        }
+        ImGui::TreePop();
+    }
+}
+
+static void fi_call_paths_tab(FrameInspectorWindow *w, const FICapture *cap,
+                              const FIDrawSubmission *draw)
+{
+    ImGui::TextDisabled(
+        "Writers are classified by captured contribution. Inherited state "
+        "is never assigned to the draw command writer.");
+    std::vector<uint32_t> indices;
+    fi_render_geometry_command_writers(w, cap, draw->batch_event);
+    fi_collect_sample_sources(cap, draw, &indices);
+    fi_render_source_writers(w, cap, "Sampled vertex bytes", indices);
+    fi_collect_group_sources(cap, draw, FI_CALL_TRANSFORM, &indices);
+    fi_render_source_writers(w, cap, "Transform state", indices);
+    fi_collect_group_sources(cap, draw, FI_CALL_COMBINER, &indices);
+    fi_render_source_writers(w, cap, "Combiner state", indices);
+    fi_collect_group_sources(cap, draw, FI_CALL_TEXTURE_STATE, &indices);
+    fi_render_source_writers(w, cap, "Texture state", indices);
+    fi_render_texture_content_writers(cap, draw);
+    fi_collect_group_sources(cap, draw, FI_CALL_TARGET, &indices);
+    fi_render_source_writers(w, cap, "Target state", indices);
+    fi_collect_group_sources(cap, draw, FI_CALL_RASTER, &indices);
+    fi_render_source_writers(w, cap, "Raster / viewport state", indices);
 }
 
 static void fi_resources_tab(const FICapture *cap, int event_idx)
@@ -2687,6 +3912,18 @@ void FrameInspectorWindow::Draw()
                     fi_geometry_tab(cap, submission);
                     ImGui::EndTabItem();
                 }
+                if (submission && ImGui::BeginTabItem("Pipeline")) {
+                    fi_pipeline_tab(this, cap, submission);
+                    ImGui::EndTabItem();
+                }
+                if (submission && ImGui::BeginTabItem("Combiner")) {
+                    fi_combiner_tab(this, cap, submission);
+                    ImGui::EndTabItem();
+                }
+                if (submission && ImGui::BeginTabItem("Call Paths")) {
+                    fi_call_paths_tab(this, cap, submission);
+                    ImGui::EndTabItem();
+                }
                 if (ImGui::BeginTabItem("Origin")) {
                     fi_origin_tab(this, cap, cur_batch);
                     ImGui::EndTabItem();
@@ -2701,10 +3938,6 @@ void FrameInspectorWindow::Draw()
                 }
                 if (ImGui::BeginTabItem("Readable")) {
                     fi_readable_commands_tab(this, cap, cur_batch);
-                    ImGui::EndTabItem();
-                }
-                if (ImGui::BeginTabItem("State")) {
-                    fi_state_tab(cap, m_selected_event);
                     ImGui::EndTabItem();
                 }
                 if (ImGui::BeginTabItem("Resources")) {

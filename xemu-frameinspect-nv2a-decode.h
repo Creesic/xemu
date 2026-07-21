@@ -366,9 +366,9 @@ static inline FINV2ACombinerInput fi_nv2a_decode_combiner_input(uint8_t raw,
 {
     FINV2ACombinerInput input = {
         .raw = raw,
-        .reg = raw & 0xf,
-        .mapping = raw & 0xe0,
-        .alpha_channel = raw & 0x10,
+        .reg = (uint8_t)(raw & 0xf),
+        .mapping = (uint8_t)(raw & 0xe0),
+        .alpha_channel = (raw & 0x10) != 0,
     };
     input.register_valid = fi_nv2a_combiner_register_valid(input.reg);
     input.final_mapping_valid = !final || input.mapping == 0 ||
@@ -392,15 +392,15 @@ static inline FINV2ACombinerOutput fi_nv2a_decode_combiner_output(uint32_t raw)
     uint32_t flags = raw >> 12;
     FINV2ACombinerOutput output = {
         .raw = raw,
-        .cd_dest = raw & 0xf,
-        .ab_dest = (raw >> 4) & 0xf,
-        .mux_sum_dest = (raw >> 8) & 0xf,
-        .mapping = flags & 0x38,
-        .cd_dot = flags & 1,
-        .ab_dot = flags & 2,
-        .mux = flags & 4,
-        .ab_blue_to_alpha = flags & 0x80,
-        .cd_blue_to_alpha = flags & 0x40,
+        .cd_dest = (uint8_t)(raw & 0xf),
+        .ab_dest = (uint8_t)((raw >> 4) & 0xf),
+        .mux_sum_dest = (uint8_t)((raw >> 8) & 0xf),
+        .mapping = (uint8_t)(flags & 0x38),
+        .cd_dot = (flags & 1) != 0,
+        .ab_dot = (flags & 2) != 0,
+        .mux = (flags & 4) != 0,
+        .ab_blue_to_alpha = (flags & 0x80) != 0,
+        .cd_blue_to_alpha = (flags & 0x40) != 0,
     };
     output.mapping_valid = output.mapping == 0 || output.mapping == 0x08 ||
         output.mapping == 0x10 || output.mapping == 0x18 ||
