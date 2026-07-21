@@ -33,6 +33,13 @@ static FICapture *fi_published;          /* immutable, protected by fi_lock */
 static QemuMutex fi_lock;
 static int fi_lock_state;
 static uint64_t fi_next_capture_id;
+static FISetterLog fi_armed_setters;
+static FIBudget fi_armed_setter_budget;
+static struct {
+    uint64_t tokens[FI_SETTER_DISPATCH_MAX];
+    uint32_t count;
+    bool active;
+} fi_setter_dispatch;
 
 static void fi_capture_sync_init(void)
 {
@@ -47,6 +54,55 @@ static void fi_capture_sync_init(void)
     while (qatomic_load_acquire(&fi_lock_state) != 2) {
         cpu_relax();
     }
+}
+
+static bool fi_setter_state_active(FICaptureState state)
+{
+    return state == FI_CAP_ARMING || state == FI_CAP_ARMED ||
+           state == FI_CAP_LEAD_IN || state == FI_CAP_LEAD_IN_2 ||
+           state == FI_CAP_CAPTURING;
+}
+
+static FISetterLog *fi_active_setters_locked(void)
+{
+    FICaptureState state = qatomic_read(&fi_state);
+    if (state == FI_CAP_CAPTURING) {
+        return &fi_cap.setters;
+    }
+    return fi_setter_state_active(state) ? &fi_armed_setters : NULL;
+}
+
+static FIBudget *fi_active_setter_budget_locked(void)
+{
+    return qatomic_read(&fi_state) == FI_CAP_CAPTURING ?
+        &fi_cap.budget : &fi_armed_setter_budget;
+}
+
+static void fi_setter_dispatch_clear_locked(void)
+{
+    fi_setter_dispatch.count = 0;
+    fi_setter_dispatch.active = false;
+}
+
+static void fi_armed_setters_reset_locked(void)
+{
+    fi_setterlog_free(&fi_armed_setters, &fi_armed_setter_budget);
+    memset(&fi_armed_setter_budget, 0, sizeof(fi_armed_setter_budget));
+    fi_setter_dispatch_clear_locked();
+}
+
+static bool fi_capture_take_armed_setters_locked(FICapture *capture)
+{
+    uint64_t bytes = fi_armed_setter_budget.used;
+    if (!fi_budget_try(&capture->budget, bytes)) {
+        return false;
+    }
+    capture->setters = fi_armed_setters;
+    memset(&fi_armed_setters, 0, sizeof(fi_armed_setters));
+    fi_armed_setters.next_token = 1;
+    fi_armed_setter_budget.used = 0;
+    fi_setter_dispatch_clear_locked();
+    return true;
 }
 
 static void fi_capture_reset(FICapture *c)
@@ -72,6 +128,8 @@ static void fi_capture_reset(FICapture *c)
     }
     fi_methodlog_free(&c->methods);
     fi_commandlog_free(&c->commands, &c->budget);
+    fi_drawlog_free(&c->draws, &c->budget);
+    fi_setterlog_free(&c->setters, &c->budget);
     if (c->batch_res_bytes) {
         fi_budget_release(&c->budget, c->batch_res_bytes);
     }
@@ -109,6 +167,7 @@ static bool fi_capture_alloc(FICapture *c)
         !fi_resources_init(&c->resources, &c->budget) ||
         !fi_eventlog_init(&c->events, &c->budget) ||
         !fi_commandlog_init(&c->commands, &c->budget) ||
+        !fi_drawlog_init(&c->draws, &c->budget) ||
         !fi_budget_try(&c->budget, methods_bytes)) {
         fi_capture_reset(c);
         return false;
@@ -235,6 +294,74 @@ static void fi_capture_command_diag(const FICapture *c)
             malformed, unresolved_origins, c->commands.truncated);
 }
 
+static void fi_capture_draw_diag(const FICapture *c)
+{
+    uint32_t routes[FI_DRAW_ROUTE_INLINE_ARRAY + 1] = {};
+    uint32_t invalid_routes = 0;
+    uint32_t incomplete = c->incomplete_submissions;
+    uint32_t multi_submission = 0;
+    for (uint32_t i = 0; i < c->draws.num_submissions; i++) {
+        const FIDrawSubmission *draw = &c->draws.submissions[i];
+        if (draw->route <= FI_DRAW_ROUTE_INLINE_ARRAY) {
+            routes[draw->route]++;
+        } else {
+            invalid_routes++;
+        }
+        if (!(draw->flags & FI_DRAW_COMPLETE)) {
+            incomplete++;
+        }
+        if (draw->submit_index > 0) {
+            multi_submission++;
+        }
+    }
+    fprintf(stderr,
+            "FI_DRAW_DIAG submissions=%u arrays=%u indexed=%u "
+            "inline_buffer=%u inline_array=%u segments=%u indices=%u "
+            "samples=%u sources=%u writer_sets=%u writers=%u "
+            "invalid_routes=%u incomplete=%u multi_submission=%u "
+            "truncated=%u\n",
+            c->draws.num_submissions, routes[FI_DRAW_ROUTE_ARRAYS],
+            routes[FI_DRAW_ROUTE_INDEXED],
+            routes[FI_DRAW_ROUTE_INLINE_BUFFER],
+            routes[FI_DRAW_ROUTE_INLINE_ARRAY], c->draws.num_segments,
+            c->draws.num_indices, c->draws.num_samples, c->draws.num_sources,
+            c->draws.num_writer_sets, c->draws.num_writers, invalid_routes,
+            incomplete, multi_submission, c->draws.truncated);
+}
+
+static void fi_capture_setter_diag(const FICapture *c)
+{
+    uint32_t linked = 0;
+    uint32_t unlinked = 0;
+    uint32_t direct = 0;
+    uint32_t indexed = 0;
+    for (uint32_t i = 0; i < c->setters.num_sources; i++) {
+        if (c->setters.sources[i].command_id == FI_SETTER_COMMAND_INVALID) {
+            unlinked++;
+        } else {
+            linked++;
+        }
+    }
+    for (uint32_t i = 0; i < c->setters.cap_destinations; i++) {
+        const FISetterDestinationEntry *entry = &c->setters.destinations[i];
+        if (!entry->source_ref) {
+            continue;
+        }
+        if (entry->destination.kind == FI_SETTER_DEST_PGRAPH_REGISTER) {
+            direct++;
+        } else {
+            indexed++;
+        }
+    }
+    fprintf(stderr,
+            "FI_SETTER_DIAG sources=%u destinations=%u linked=%u "
+            "unlinked=%u direct=%u indexed=%u submission_sources=%u "
+            "truncated=%u\n",
+            c->setters.num_sources, c->setters.num_destinations, linked,
+            unlinked, direct, indexed, c->draws.num_sources,
+            c->setters.truncated);
+}
+
 static void fi_capture_batch_origin_diag(const FICapture *c)
 {
     for (uint32_t i = 0; i < c->methods.num_batches; i++) {
@@ -288,6 +415,14 @@ bool xemu_frameinspect_capture_arm(uint64_t ram_size)
         return false;
     }
     qatomic_set(&fi_state, FI_CAP_ARMING);
+    fi_armed_setters_reset_locked();
+    fi_armed_setter_budget.limit = FI_CAP_BUDGET_DEFAULT;
+    if (!fi_setterlog_init(&fi_armed_setters,
+                           &fi_armed_setter_budget)) {
+        qatomic_set(&fi_state, FI_CAP_IDLE);
+        qemu_mutex_unlock(&fi_lock);
+        return false;
+    }
     /* Lead-in: enable guest instrumentation now so writes during the frame
      * before the captured frame are tagged. */
     xemu_frameinspect_arm(ram_size);
@@ -299,6 +434,7 @@ bool xemu_frameinspect_capture_arm(uint64_t ram_size)
         return true;
     }
     qatomic_set(&fi_state, FI_CAP_IDLE);
+    fi_armed_setters_reset_locked();
     if (armed) {
         xemu_frameinspect_disarm();
     }
@@ -317,6 +453,8 @@ FICaptureFlipResult xemu_frameinspect_capture_on_flip(bool opengl_active)
          qatomic_read(&fi_state) == FI_CAP_CAPTURING)) {
         if (qatomic_read(&fi_state) == FI_CAP_CAPTURING) {
             fi_capture_reset(&fi_cap);
+        } else {
+            fi_armed_setters_reset_locked();
         }
         qatomic_set(&fi_state, FI_CAP_IDLE);
         xemu_frameinspect_disarm();
@@ -336,7 +474,10 @@ FICaptureFlipResult xemu_frameinspect_capture_on_flip(bool opengl_active)
         return FI_CAP_FLIP_NONE;
     case FI_CAP_LEAD_IN_2:
         /* Two complete instrumented frames elapsed; capture the next frame. */
-        if (!fi_capture_alloc(&fi_cap)) {
+        if (!fi_capture_alloc(&fi_cap) ||
+            !fi_capture_take_armed_setters_locked(&fi_cap)) {
+            fi_capture_reset(&fi_cap);
+            fi_armed_setters_reset_locked();
             qatomic_set(&fi_state, FI_CAP_IDLE);
             xemu_frameinspect_disarm();
             qemu_mutex_unlock(&fi_lock);
@@ -405,6 +546,8 @@ FICaptureFlipResult xemu_frameinspect_capture_on_flip(bool opengl_active)
         g_free(origin_status);
         fi_capture_batch_origin_diag(done);
         fi_capture_command_diag(done);
+        fi_capture_draw_diag(done);
+        fi_capture_setter_diag(done);
         FICapture *old = fi_published;
         fi_published = done;
         bool destroy_old = old && --old->refcount == 0;
@@ -445,8 +588,14 @@ bool xemu_frameinspect_capture_cancel(void)
                   qatomic_read(&fi_state) == FI_CAP_PAUSE_PENDING;
     if (qatomic_read(&fi_state) == FI_CAP_CAPTURING) {
         fi_capture_reset(&fi_cap);
+    } else if (qatomic_read(&fi_state) == FI_CAP_ARMING ||
+               qatomic_read(&fi_state) == FI_CAP_ARMED ||
+               qatomic_read(&fi_state) == FI_CAP_LEAD_IN ||
+               qatomic_read(&fi_state) == FI_CAP_LEAD_IN_2) {
+        fi_armed_setters_reset_locked();
     }
     if (active) {
+        fi_setter_dispatch_clear_locked();
         qatomic_set(&fi_state, FI_CAP_IDLE);
         xemu_frameinspect_disarm();
     }
@@ -526,6 +675,11 @@ void xemu_frameinspect_capture_end_batch(void)
     fi_capture_sync_init();
     qemu_mutex_lock(&fi_lock);
     if (qatomic_read(&fi_state) == FI_CAP_CAPTURING) {
+        if (fi_cap.draws.open_submission != FI_DRAW_INVALID) {
+            fi_cap.incomplete_submissions++;
+            fi_drawlog_abort(&fi_cap.draws,
+                             fi_cap.draws.open_submission);
+        }
         if (fi_cap.batch_open && fi_cap.open_batch_event != FI_EVENT_INVALID) {
             uint32_t rec_count = fi_cap.methods.num_recs - fi_cap.batch_first_rec;
             if (rec_count > 0) {
@@ -768,6 +922,368 @@ void xemu_frameinspect_capture_attach_pixels(uint32_t surface_gen,
     qemu_mutex_unlock(&fi_lock);
 }
 
+bool xemu_frameinspect_capture_setter_dispatch_begin(
+    const FISetterDispatchSource *sources, uint32_t count)
+{
+    FICaptureState state = qatomic_read(&fi_state);
+    if (!fi_setter_state_active(state) || (!sources && count) ||
+        count > FI_SETTER_DISPATCH_MAX) {
+        return false;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    FISetterLog *setters = fi_active_setters_locked();
+    FIBudget *budget = fi_active_setter_budget_locked();
+    if (!setters || fi_setter_dispatch.active) {
+        qemu_mutex_unlock(&fi_lock);
+        return false;
+    }
+    uint32_t old_num_sources = setters->num_sources;
+    uint64_t old_next_token = setters->next_token;
+    bool success = true;
+    for (uint32_t i = 0; i < count; i++) {
+        const FISetterDispatchSource *source = &sources[i];
+        uint64_t token = fi_setterlog_begin_source(
+            setters, budget, source->method, source->subchannel,
+            source->parameter, source->phys_addr, source->writer_node,
+            source->confidence);
+        if (token == FI_SETTER_TOKEN_INVALID) {
+            success = false;
+            break;
+        }
+        fi_setter_dispatch.tokens[i] = token;
+    }
+    if (!success) {
+        setters->num_sources = old_num_sources;
+        setters->next_token = old_next_token;
+        qemu_mutex_unlock(&fi_lock);
+        return false;
+    }
+    fi_setter_dispatch.count = count;
+    fi_setter_dispatch.active = true;
+    qemu_mutex_unlock(&fi_lock);
+    return true;
+}
+
+bool xemu_frameinspect_capture_setter_destination(
+    uint32_t parameter_index, const FISetterDestination *destination)
+{
+    if (!fi_setter_state_active(qatomic_read(&fi_state)) || !destination) {
+        return false;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    FISetterLog *setters = fi_active_setters_locked();
+    bool recorded = setters && fi_setter_dispatch.active &&
+        parameter_index < fi_setter_dispatch.count &&
+        fi_setterlog_record_destination(
+            setters, fi_active_setter_budget_locked(),
+            fi_setter_dispatch.tokens[parameter_index], destination);
+    qemu_mutex_unlock(&fi_lock);
+    return recorded;
+}
+
+bool xemu_frameinspect_capture_setter_bind_command(uint32_t parameter_index,
+                                                   uint32_t command_id)
+{
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        return false;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    bool bound = qatomic_read(&fi_state) == FI_CAP_CAPTURING &&
+        fi_setter_dispatch.active &&
+        parameter_index < fi_setter_dispatch.count &&
+        fi_setterlog_bind_command(
+            &fi_cap.setters, fi_setter_dispatch.tokens[parameter_index],
+            command_id);
+    qemu_mutex_unlock(&fi_lock);
+    return bound;
+}
+
+void xemu_frameinspect_capture_setter_dispatch_end(void)
+{
+    if (!fi_setter_state_active(qatomic_read(&fi_state))) {
+        return;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    fi_setter_dispatch_clear_locked();
+    qemu_mutex_unlock(&fi_lock);
+}
+
+uint32_t xemu_frameinspect_capture_submission_begin(uint16_t route,
+                                                    uint32_t topology,
+                                                    uint32_t vertex_count,
+                                                    uint32_t index_count)
+{
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        return FI_DRAW_INVALID;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING ||
+        !fi_cap.batch_open || fi_cap.open_batch_event == FI_EVENT_INVALID) {
+        qemu_mutex_unlock(&fi_lock);
+        return FI_DRAW_INVALID;
+    }
+    uint32_t submit_index = 0;
+    for (uint32_t i = 0; i < fi_cap.draws.num_submissions; i++) {
+        if (fi_cap.draws.submissions[i].batch_event ==
+            fi_cap.open_batch_event) {
+            submit_index++;
+        }
+    }
+    uint32_t id = fi_drawlog_begin(
+        &fi_cap.draws, &fi_cap.budget, fi_cap.open_batch_event, submit_index,
+        route, topology);
+    if (id != FI_DRAW_INVALID) {
+        FIDrawSubmission *draw = &fi_cap.draws.submissions[id];
+        draw->vertex_count = vertex_count;
+        draw->index_count = index_count;
+        draw->color_surface_gen = fi_cap.open_batch_gen;
+        draw->zeta_surface_gen = fi_cap.open_batch_zeta_gen;
+    } else if (fi_cap.draws.truncated) {
+        fi_cap.truncated = true;
+    }
+    qemu_mutex_unlock(&fi_lock);
+    return id;
+}
+
+bool xemu_frameinspect_capture_submission_segments(
+    uint32_t draw_id, const FIDrawSegment *segments, uint32_t count)
+{
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        return false;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    bool added = qatomic_read(&fi_state) == FI_CAP_CAPTURING &&
+        fi_drawlog_append_segments(&fi_cap.draws, &fi_cap.budget, draw_id,
+                                   segments, count);
+    fi_cap.truncated |= fi_cap.draws.truncated;
+    qemu_mutex_unlock(&fi_lock);
+    return added;
+}
+
+bool xemu_frameinspect_capture_submission_indices(uint32_t draw_id,
+                                                  const uint32_t *indices,
+                                                  uint32_t count)
+{
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        return false;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    bool added = qatomic_read(&fi_state) == FI_CAP_CAPTURING &&
+        fi_drawlog_append_indices(&fi_cap.draws, &fi_cap.budget, draw_id,
+                                  indices, count);
+    fi_cap.truncated |= fi_cap.draws.truncated;
+    qemu_mutex_unlock(&fi_lock);
+    return added;
+}
+
+bool xemu_frameinspect_capture_submission_attribute(
+    uint32_t draw_id, uint32_t slot, const FIAttributeDesc *attribute)
+{
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING || !attribute ||
+        slot >= FI_DRAW_ATTRIBUTE_COUNT) {
+        return false;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    bool updated = qatomic_read(&fi_state) == FI_CAP_CAPTURING &&
+        fi_drawlog_open_matches(&fi_cap.draws, draw_id);
+    if (updated) {
+        fi_cap.draws.submissions[draw_id].attrs[slot] = *attribute;
+        fi_cap.draws.submissions[draw_id].attrs[slot].slot = slot;
+    }
+    qemu_mutex_unlock(&fi_lock);
+    return updated;
+}
+
+uint32_t xemu_frameinspect_capture_submission_sample(
+    uint32_t draw_id, const FIVertexSample *sample)
+{
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING || !sample) {
+        return FI_DRAW_INVALID;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    uint32_t id = qatomic_read(&fi_state) == FI_CAP_CAPTURING ?
+        fi_drawlog_append_sample(&fi_cap.draws, &fi_cap.budget, draw_id,
+                                 sample) : FI_DRAW_INVALID;
+    fi_cap.truncated |= fi_cap.draws.truncated;
+    qemu_mutex_unlock(&fi_lock);
+    return id;
+}
+
+uint32_t xemu_frameinspect_capture_submission_source(
+    uint32_t draw_id, const FIStateSource *source)
+{
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING || !source) {
+        return FI_DRAW_INVALID;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    uint32_t id = qatomic_read(&fi_state) == FI_CAP_CAPTURING ?
+        fi_drawlog_append_source(&fi_cap.draws, &fi_cap.budget, draw_id,
+                                 source) : FI_DRAW_INVALID;
+    fi_cap.truncated |= fi_cap.draws.truncated;
+    qemu_mutex_unlock(&fi_lock);
+    return id;
+}
+
+uint32_t xemu_frameinspect_capture_submission_writer_set(
+    uint32_t draw_id, const FIWriterSpan *spans, uint32_t count)
+{
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        return FI_DRAW_INVALID;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    uint32_t id = qatomic_read(&fi_state) == FI_CAP_CAPTURING ?
+        fi_drawlog_append_writer_set(&fi_cap.draws, &fi_cap.budget, draw_id,
+                                     spans, count) : FI_DRAW_INVALID;
+    fi_cap.truncated |= fi_cap.draws.truncated;
+    qemu_mutex_unlock(&fi_lock);
+    return id;
+}
+
+bool xemu_frameinspect_capture_submission_geometry(
+    uint32_t draw_id, uint64_t geometry_hash,
+    const FIColorSummary *color0, const FIColorSummary *color1)
+{
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        return false;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    bool updated = qatomic_read(&fi_state) == FI_CAP_CAPTURING &&
+        fi_drawlog_open_matches(&fi_cap.draws, draw_id);
+    if (updated) {
+        FIDrawSubmission *draw = &fi_cap.draws.submissions[draw_id];
+        draw->geometry_hash = geometry_hash;
+        if (color0) {
+            draw->color0 = *color0;
+        }
+        if (color1) {
+            draw->color1 = *color1;
+        }
+    }
+    qemu_mutex_unlock(&fi_lock);
+    return updated;
+}
+
+bool xemu_frameinspect_capture_submission_resources(
+    uint32_t draw_id, uint32_t color_surface_gen,
+    uint32_t zeta_surface_gen, uint32_t regs_resource,
+    uint32_t program_resource, uint32_t constants_resource)
+{
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        return false;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    bool updated = qatomic_read(&fi_state) == FI_CAP_CAPTURING &&
+        fi_drawlog_open_matches(&fi_cap.draws, draw_id);
+    if (updated) {
+        FIDrawSubmission *draw = &fi_cap.draws.submissions[draw_id];
+        draw->color_surface_gen = color_surface_gen;
+        draw->zeta_surface_gen = zeta_surface_gen;
+        draw->regs_resource = regs_resource;
+        draw->program_resource = program_resource;
+        draw->constants_resource = constants_resource;
+    }
+    qemu_mutex_unlock(&fi_lock);
+    return updated;
+}
+
+bool xemu_frameinspect_capture_submission_texture(
+    uint32_t draw_id, uint32_t stage, const FITextureStage *texture)
+{
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING || !texture ||
+        stage >= FI_DRAW_TEXTURE_COUNT) {
+        return false;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    bool updated = qatomic_read(&fi_state) == FI_CAP_CAPTURING &&
+        fi_drawlog_open_matches(&fi_cap.draws, draw_id);
+    if (updated) {
+        fi_cap.draws.submissions[draw_id].textures[stage] = *texture;
+        fi_cap.draws.submissions[draw_id].textures[stage].stage = stage;
+    }
+    qemu_mutex_unlock(&fi_lock);
+    return updated;
+}
+
+/* Caller holds fi_lock and the submission is still open. Copy one source per
+ * tracked logical destination; shared setter tokens remain visible through
+ * their token field without retaining mutable journal pointers. */
+static void fi_capture_snapshot_submission_setters(uint32_t draw_id)
+{
+    for (uint32_t i = 0; i < fi_cap.setters.cap_destinations; i++) {
+        const FISetterDestinationEntry *entry =
+            &fi_cap.setters.destinations[i];
+        if (!entry->source_ref ||
+            entry->source_ref > fi_cap.setters.num_sources) {
+            continue;
+        }
+        const FISetterSource *source =
+            &fi_cap.setters.sources[entry->source_ref - 1];
+        FIStateSource captured = {
+            .destination = entry->destination,
+            .source_token = source->token,
+            .phys_addr = source->phys_addr,
+            .command_id = source->command_id,
+            .method = source->method,
+            .parameter = source->parameter,
+            .writer_node = source->writer_node,
+            .subchannel = source->subchannel,
+            .confidence = source->confidence,
+        };
+        if (fi_drawlog_append_source(&fi_cap.draws, &fi_cap.budget, draw_id,
+                                     &captured) == FI_DRAW_INVALID) {
+            fi_cap.truncated = true;
+            break;
+        }
+    }
+    if (fi_cap.setters.truncated) {
+        fi_cap.truncated = true;
+    }
+}
+
+bool xemu_frameinspect_capture_submission_complete(uint32_t draw_id)
+{
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        return false;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    bool completed = qatomic_read(&fi_state) == FI_CAP_CAPTURING &&
+        fi_drawlog_open_matches(&fi_cap.draws, draw_id);
+    if (completed) {
+        fi_capture_snapshot_submission_setters(draw_id);
+        completed = fi_drawlog_complete(&fi_cap.draws, draw_id);
+    }
+    qemu_mutex_unlock(&fi_lock);
+    return completed;
+}
+
+bool xemu_frameinspect_capture_submission_abort(uint32_t draw_id)
+{
+    if (qatomic_read(&fi_state) != FI_CAP_CAPTURING) {
+        return false;
+    }
+    fi_capture_sync_init();
+    qemu_mutex_lock(&fi_lock);
+    bool aborted = qatomic_read(&fi_state) == FI_CAP_CAPTURING &&
+        fi_drawlog_abort(&fi_cap.draws, draw_id);
+    qemu_mutex_unlock(&fi_lock);
+    return aborted;
+}
+
 void xemu_frameinspect_capture_scanout(uint32_t surface_gen,
                                        uint32_t pcrtc_start,
                                        uint32_t line_offset, uint32_t flags,
@@ -992,13 +1508,14 @@ char *xemu_frameinspect_capture_summary(void)
         return g_strdup("Frame inspector: no capture");
     }
     char *summary = g_strdup_printf(
-        "Captured frame: %u events, %u surfaces, %u commands, %u methods, "
-        "%u resources%s",
-        c->events.count, c->surfaces.num_gens, c->commands.num_recs,
-        c->methods.num_recs, c->resources.num_res,
+        "Captured frame: %u events, %u surfaces, %u submissions, %u commands, "
+        "%u methods, %u resources%s",
+        c->events.count, c->surfaces.num_gens, c->draws.num_submissions,
+        c->commands.num_recs, c->methods.num_recs, c->resources.num_res,
         (c->truncated || c->events.truncated || c->surfaces.truncated ||
          c->resources.truncated || c->methods.truncated ||
-         c->commands.truncated) ? " [TRUNCATED]" : "");
+         c->commands.truncated || c->draws.truncated ||
+         c->setters.truncated) ? " [TRUNCATED]" : "");
     xemu_frameinspect_capture_release(c);
     return summary;
 }

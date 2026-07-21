@@ -621,6 +621,143 @@ static void pgraph_method_non_inc(MethodFunc handler, METHOD_HANDLER_ARG_DECL)
     }                                                             \
     DEF_METHOD_INT(gclass, name)
 
+static bool pgraph_fi_method_in_range(uint32_t method, uint32_t base,
+                                      uint32_t count)
+{
+    return method >= base && method - base < count * 4;
+}
+
+static void pgraph_fi_record_vsh_destination(uint32_t parameter_index,
+                                             uint32_t method,
+                                             uint32_t *program_load,
+                                             uint32_t *constant_load)
+{
+    FISetterDestination destination = { 0 };
+    bool valid = true;
+    uint32_t slot;
+
+    if (pgraph_fi_method_in_range(
+            method, NV097_SET_TRANSFORM_PROGRAM, 32)) {
+        slot = (method - NV097_SET_TRANSFORM_PROGRAM) / 4;
+        destination.kind = FI_SETTER_DEST_VSH_PROGRAM;
+        destination.index = *program_load;
+        destination.component = slot % 4;
+        if (slot % 4 == 3) {
+            (*program_load)++;
+        }
+    } else if (pgraph_fi_method_in_range(
+                   method, NV097_SET_TRANSFORM_CONSTANT, 32)) {
+        slot = (method - NV097_SET_TRANSFORM_CONSTANT) / 4;
+        destination.kind = FI_SETTER_DEST_VSH_CONSTANT;
+        destination.index = *constant_load;
+        destination.component = slot % 4;
+        if (slot % 4 == 3) {
+            (*constant_load)++;
+        }
+    } else if (pgraph_fi_method_in_range(
+                   method, NV097_SET_PROJECTION_MATRIX, 16)) {
+        slot = (method - NV097_SET_PROJECTION_MATRIX) / 4;
+        destination.kind = FI_SETTER_DEST_VSH_CONSTANT;
+        destination.index = NV_IGRAPH_XF_XFCTX_PMAT0 + slot / 4;
+        destination.component = slot % 4;
+    } else if (pgraph_fi_method_in_range(
+                   method, NV097_SET_MODEL_VIEW_MATRIX, 16 * 4)) {
+        slot = (method - NV097_SET_MODEL_VIEW_MATRIX) / 4;
+        uint32_t matrix = slot / 16;
+        uint32_t entry = slot % 16;
+        destination.kind = FI_SETTER_DEST_VSH_CONSTANT;
+        destination.index =
+            NV_IGRAPH_XF_XFCTX_MMAT0 + matrix * 8 + entry / 4;
+        destination.component = entry % 4;
+    } else if (pgraph_fi_method_in_range(
+                   method, NV097_SET_INVERSE_MODEL_VIEW_MATRIX, 16 * 4)) {
+        slot = (method - NV097_SET_INVERSE_MODEL_VIEW_MATRIX) / 4;
+        uint32_t matrix = slot / 16;
+        uint32_t entry = slot % 16;
+        destination.kind = FI_SETTER_DEST_VSH_CONSTANT;
+        destination.index =
+            NV_IGRAPH_XF_XFCTX_IMMAT0 + matrix * 8 + entry / 4;
+        destination.component = entry % 4;
+    } else if (pgraph_fi_method_in_range(
+                   method, NV097_SET_COMPOSITE_MATRIX, 16)) {
+        slot = (method - NV097_SET_COMPOSITE_MATRIX) / 4;
+        destination.kind = FI_SETTER_DEST_VSH_CONSTANT;
+        destination.index = NV_IGRAPH_XF_XFCTX_CMAT0 + slot / 4;
+        destination.component = slot % 4;
+    } else if (pgraph_fi_method_in_range(
+                   method, NV097_SET_TEXTURE_MATRIX, 16 * 4)) {
+        slot = (method - NV097_SET_TEXTURE_MATRIX) / 4;
+        uint32_t texture = slot / 16;
+        uint32_t entry = slot % 16;
+        destination.kind = FI_SETTER_DEST_VSH_CONSTANT;
+        destination.index =
+            NV_IGRAPH_XF_XFCTX_T0MAT + texture * 8 + entry / 4;
+        destination.component = entry % 4;
+    } else if (pgraph_fi_method_in_range(
+                   method, NV097_SET_TEXGEN_PLANE_S, 4 * 4 * 4)) {
+        slot = (method - NV097_SET_TEXGEN_PLANE_S) / 4;
+        uint32_t texture = slot / 16;
+        uint32_t entry = slot % 16;
+        destination.kind = FI_SETTER_DEST_VSH_CONSTANT;
+        destination.index =
+            NV_IGRAPH_XF_XFCTX_TG0MAT + texture * 8 + entry / 4;
+        destination.component = entry % 4;
+    } else if (pgraph_fi_method_in_range(
+                   method, NV097_SET_FOG_PLANE, 4)) {
+        slot = (method - NV097_SET_FOG_PLANE) / 4;
+        destination.kind = FI_SETTER_DEST_VSH_CONSTANT;
+        destination.index = NV_IGRAPH_XF_XFCTX_FOG;
+        destination.component = slot;
+    } else if (pgraph_fi_method_in_range(
+                   method, NV097_SET_VIEWPORT_OFFSET, 4)) {
+        slot = (method - NV097_SET_VIEWPORT_OFFSET) / 4;
+        destination.kind = FI_SETTER_DEST_VSH_CONSTANT;
+        destination.index = NV_IGRAPH_XF_XFCTX_VPOFF;
+        destination.component = slot;
+    } else if (pgraph_fi_method_in_range(
+                   method, NV097_SET_EYE_POSITION, 4)) {
+        slot = (method - NV097_SET_EYE_POSITION) / 4;
+        destination.kind = FI_SETTER_DEST_VSH_CONSTANT;
+        destination.index = NV_IGRAPH_XF_XFCTX_EYEP;
+        destination.component = slot;
+    } else if (pgraph_fi_method_in_range(
+                   method, NV097_SET_VIEWPORT_SCALE, 4)) {
+        slot = (method - NV097_SET_VIEWPORT_SCALE) / 4;
+        destination.kind = FI_SETTER_DEST_VSH_CONSTANT;
+        destination.index = NV_IGRAPH_XF_XFCTX_VPSCL;
+        destination.component = slot;
+    } else {
+        valid = false;
+    }
+
+    if (valid) {
+        xemu_frameinspect_capture_setter_destination(parameter_index,
+                                                     &destination);
+    }
+}
+
+static void pgraph_fi_record_setter_destinations(
+    uint32_t graphics_class, uint32_t method, bool inc, uint32_t count,
+    uint32_t program_load, uint32_t constant_load)
+{
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t dispatched_method = inc ? method + i * 4 : method;
+        /* Direct keys represent stable guest method-state slots. Methods that
+         * resolve through load pointers also receive a storage destination. */
+        FISetterDestination direct = {
+            .kind = FI_SETTER_DEST_PGRAPH_REGISTER,
+            .index = dispatched_method / 4,
+            .component = 0,
+            .reserved = graphics_class,
+        };
+        xemu_frameinspect_capture_setter_destination(i, &direct);
+        if (graphics_class == NV_KELVIN_PRIMITIVE) {
+            pgraph_fi_record_vsh_destination(
+                i, dispatched_method, &program_load, &constant_load);
+        }
+    }
+}
+
 int pgraph_method(NV2AState *d, unsigned int subchannel,
                    unsigned int method, uint32_t parameter,
                    uint32_t *parameters, size_t num_words_available,
@@ -629,6 +766,10 @@ int pgraph_method(NV2AState *d, unsigned int subchannel,
     int num_processed = 1;
 
     PGRAPHState *pg = &d->pgraph;
+    uint32_t fi_program_load = PG_GET_MASK(
+        NV_PGRAPH_CHEOPS_OFFSET, NV_PGRAPH_CHEOPS_OFFSET_PROG_LD_PTR);
+    uint32_t fi_constant_load = PG_GET_MASK(
+        NV_PGRAPH_CHEOPS_OFFSET, NV_PGRAPH_CHEOPS_OFFSET_CONST_LD_PTR);
 
     bool channel_valid =
         PG_GET_MASK(NV_PGRAPH_CTX_CONTROL, NV_PGRAPH_CTX_CONTROL_CHID);
@@ -812,6 +953,10 @@ int pgraph_method(NV2AState *d, unsigned int subchannel,
         goto unhandled;
     }
 
+    pgraph_fi_record_setter_destinations(
+        graphics_class, method, inc,
+        MIN((uint32_t)num_processed, (uint32_t)num_words_available),
+        fi_program_load, fi_constant_load);
     return num_processed;
 
 unhandled:

@@ -25,6 +25,216 @@
 #include "renderer.h"
 #include "xemu-frameinspect-capture.h"
 
+void pgraph_gl_fi_vertex_capture_begin(
+    uint32_t draw_id, uint16_t route, uint32_t topology,
+    const FIDrawSegment *segments, uint32_t num_segments,
+    const uint32_t *indices, uint32_t num_indices, uint32_t vertex_count);
+bool pgraph_gl_fi_vertex_capture_result(uint32_t draw_id, uint64_t *hash,
+                                        FIColorSummary *color0,
+                                        FIColorSummary *color1);
+unsigned int pgraph_gl_fi_inline_array_vertex_count(PGRAPHState *pg);
+
+static void pgraph_gl_fi_hash_bytes(uint64_t *hash, const void *data,
+                                    size_t len)
+{
+    const uint8_t *bytes = data;
+    for (size_t i = 0; i < len; i++) {
+        *hash ^= bytes[i];
+        *hash *= 1099511628211ull;
+    }
+}
+
+static void pgraph_gl_fi_hash_u32(uint64_t *hash, uint32_t value)
+{
+    uint8_t bytes[4] = {
+        value, value >> 8, value >> 16, value >> 24,
+    };
+    pgraph_gl_fi_hash_bytes(hash, bytes, sizeof(bytes));
+}
+
+static void pgraph_gl_fi_color_add(FIColorSummary *summary,
+                                   const float decoded[4])
+{
+    if (!summary->available) {
+        summary->available = true;
+        memcpy(summary->min, decoded, sizeof(summary->min));
+        memcpy(summary->max, decoded, sizeof(summary->max));
+        return;
+    }
+    for (uint32_t i = 0; i < 4; i++) {
+        summary->min[i] = MIN(summary->min[i], decoded[i]);
+        summary->max[i] = MAX(summary->max[i], decoded[i]);
+    }
+}
+
+static bool pgraph_gl_fi_finish_vertex_submission(uint32_t draw_id)
+{
+    if (draw_id == FI_DRAW_INVALID) {
+        return false;
+    }
+    uint64_t hash;
+    FIColorSummary color0, color1;
+    if (!pgraph_gl_fi_vertex_capture_result(draw_id, &hash, &color0,
+                                             &color1) ||
+        !xemu_frameinspect_capture_submission_geometry(
+            draw_id, hash, &color0, &color1) ||
+        !xemu_frameinspect_capture_submission_complete(draw_id)) {
+        xemu_frameinspect_capture_submission_abort(draw_id);
+        return false;
+    }
+    return true;
+}
+
+static uint32_t pgraph_gl_fi_attach_submission_state(NV2AState *d,
+                                                     uint32_t draw_id)
+{
+    if (draw_id == FI_DRAW_INVALID) {
+        return FI_DRAW_INVALID;
+    }
+    PGRAPHState *pg = &d->pgraph;
+    uint32_t regs_resource = xemu_frameinspect_capture_resource(
+        FI_RESK_REGS, pg->regs_, sizeof(pg->regs_), 0);
+    uint32_t program_resource = xemu_frameinspect_capture_resource(
+        FI_RESK_VSH_PROGRAM, pg->program_data, sizeof(pg->program_data), 0);
+    uint32_t constants_resource = xemu_frameinspect_capture_resource(
+        FI_RESK_VSH_CONSTANTS, pg->vsh_constants,
+        sizeof(pg->vsh_constants), 0);
+    uint32_t color_gen = pgraph_color_write_enabled(pg) ?
+        pgraph_gl_fi_intern_current_color(d) : FI_SURFGEN_INVALID;
+    uint32_t zeta_gen = pgraph_zeta_write_enabled(pg) ?
+        pgraph_gl_fi_intern_current_zeta(d) : FI_SURFGEN_INVALID;
+
+    if (regs_resource == FI_RES_INVALID ||
+        program_resource == FI_RES_INVALID ||
+        constants_resource == FI_RES_INVALID ||
+        !xemu_frameinspect_capture_submission_resources(
+            draw_id, color_gen, zeta_gen, regs_resource, program_resource,
+            constants_resource)) {
+        xemu_frameinspect_capture_submission_abort(draw_id);
+        return FI_DRAW_INVALID;
+    }
+    return draw_id;
+}
+
+static bool pgraph_gl_fi_capture_inline_buffer(NV2AState *d,
+                                               uint32_t draw_id)
+{
+    PGRAPHState *pg = &d->pgraph;
+    if (draw_id == FI_DRAW_INVALID) {
+        return false;
+    }
+    uint32_t sample_count = MIN(pg->inline_buffer_length,
+                                FI_DRAW_SAMPLE_LIMIT);
+    FIVertexSample samples[FI_DRAW_SAMPLE_LIMIT] = {};
+    for (uint32_t i = 0; i < sample_count; i++) {
+        samples[i].ordinal = i;
+        samples[i].source_index = i;
+        for (uint32_t slot = 0; slot < FI_DRAW_ATTRIBUTE_COUNT; slot++) {
+            samples[i].attrs[slot].source_first = FI_DRAW_INVALID;
+            samples[i].attrs[slot].status = FI_VALUE_UNAVAILABLE;
+        }
+    }
+
+    uint64_t hash = 14695981039346656037ull;
+    pgraph_gl_fi_hash_u32(&hash, FI_DRAW_ROUTE_INLINE_BUFFER);
+    pgraph_gl_fi_hash_u32(&hash, pg->primitive_mode);
+    pgraph_gl_fi_hash_u32(&hash, pg->inline_buffer_length);
+    pgraph_gl_fi_hash_u32(&hash, 1);
+    pgraph_gl_fi_hash_u32(&hash, 0);
+    pgraph_gl_fi_hash_u32(&hash, pg->inline_buffer_length);
+    pgraph_gl_fi_hash_u32(&hash, 0);
+
+    FIColorSummary color0 = {}, color1 = {};
+    bool valid = true;
+    for (uint32_t slot = 0; slot < NV2A_VERTEXSHADER_ATTRIBUTES; slot++) {
+        VertexAttribute *attr = &pg->vertex_attributes[slot];
+        bool populated = attr->inline_buffer_populated;
+        FIAttributeDesc desc = {
+            .dma_object = FI_DRAW_INVALID,
+            .guest_offset = 0,
+            .phys_addr = UINT64_MAX,
+            .format = NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F,
+            .stride = populated ? sizeof(float) * 4 : 0,
+            .slot = slot,
+            .status = populated ? FI_VALUE_PRESENT : FI_VALUE_CONSTANT,
+            .components = 4,
+            .element_size = sizeof(float),
+            .dma_select = 3,
+            .source_first = FI_DRAW_INVALID,
+        };
+        valid &= xemu_frameinspect_capture_submission_attribute(
+            draw_id, slot, &desc);
+        pgraph_gl_fi_hash_u32(&hash, slot);
+        pgraph_gl_fi_hash_u32(&hash, desc.status);
+        pgraph_gl_fi_hash_u32(&hash, desc.format);
+        pgraph_gl_fi_hash_u32(&hash, desc.components);
+        pgraph_gl_fi_hash_u32(&hash, desc.element_size);
+        pgraph_gl_fi_hash_u32(&hash, desc.stride);
+        pgraph_gl_fi_hash_u32(&hash, desc.dma_select);
+
+        if (populated) {
+            for (uint32_t i = 0; i < pg->inline_buffer_length; i++) {
+                const float *value = attr->inline_buffer + i * 4;
+                for (uint32_t component = 0; component < 4; component++) {
+                    uint32_t bits;
+                    memcpy(&bits, &value[component], sizeof(bits));
+                    pgraph_gl_fi_hash_u32(&hash, bits);
+                }
+                if (slot == NV2A_VERTEX_ATTR_DIFFUSE ||
+                    slot == NV2A_VERTEX_ATTR_SPECULAR) {
+                    pgraph_gl_fi_color_add(
+                        slot == NV2A_VERTEX_ATTR_DIFFUSE ? &color0 : &color1,
+                        value);
+                }
+            }
+            for (uint32_t i = 0; i < sample_count; i++) {
+                FIVertexAttributeSample *sample = &samples[i].attrs[slot];
+                const float *value = attr->inline_buffer + i * 4;
+                sample->status = FI_VALUE_PRESENT;
+                sample->raw_len = sizeof(float) * 4;
+                for (uint32_t component = 0; component < 4; component++) {
+                    uint32_t bits;
+                    memcpy(&bits, &value[component], sizeof(bits));
+                    stl_le_p(sample->raw + component * sizeof(bits), bits);
+                }
+                memcpy(sample->decoded, value, sizeof(sample->decoded));
+            }
+        } else {
+            for (uint32_t i = 0; i < 4; i++) {
+                uint32_t bits;
+                memcpy(&bits, &attr->inline_value[i], sizeof(bits));
+                pgraph_gl_fi_hash_u32(&hash, bits);
+            }
+            if (slot == NV2A_VERTEX_ATTR_DIFFUSE ||
+                slot == NV2A_VERTEX_ATTR_SPECULAR) {
+                pgraph_gl_fi_color_add(
+                    slot == NV2A_VERTEX_ATTR_DIFFUSE ? &color0 : &color1,
+                    attr->inline_value);
+            }
+            for (uint32_t i = 0; i < sample_count; i++) {
+                FIVertexAttributeSample *sample = &samples[i].attrs[slot];
+                sample->status = FI_VALUE_CONSTANT;
+                memcpy(sample->decoded, attr->inline_value,
+                       sizeof(sample->decoded));
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < sample_count; i++) {
+        if (xemu_frameinspect_capture_submission_sample(
+                draw_id, &samples[i]) == FI_DRAW_INVALID) {
+            valid = false;
+        }
+    }
+    valid &= xemu_frameinspect_capture_submission_geometry(
+        draw_id, hash, &color0, &color1);
+    valid &= xemu_frameinspect_capture_submission_complete(draw_id);
+    if (!valid) {
+        xemu_frameinspect_capture_submission_abort(draw_id);
+    }
+    return valid;
+}
+
 static void pgraph_gl_fi_seed_color_baseline(NV2AState *d,
                                               uint32_t surface_gen)
 {
@@ -506,10 +716,34 @@ void pgraph_gl_flush_draw(NV2AState *d)
         assert(pg->inline_buffer_length == 0);
         assert(pg->inline_array_length == 0);
 
+        FIDrawSegment segments[ARRAY_SIZE(pg->draw_arrays_start)];
+        uint64_t submitted = 0;
+        for (uint32_t i = 0; i < pg->draw_arrays_length; i++) {
+            segments[i].first = pg->draw_arrays_start[i];
+            segments[i].count = pg->draw_arrays_count[i];
+            submitted += segments[i].count;
+        }
+        uint32_t draw_id = submitted <= UINT32_MAX ?
+            xemu_frameinspect_capture_submission_begin(
+                FI_DRAW_ROUTE_ARRAYS, pg->primitive_mode,
+                (uint32_t)submitted, 0) :
+            FI_DRAW_INVALID;
+        if (draw_id != FI_DRAW_INVALID &&
+            !xemu_frameinspect_capture_submission_segments(
+                draw_id, segments, pg->draw_arrays_length)) {
+            xemu_frameinspect_capture_submission_abort(draw_id);
+            draw_id = FI_DRAW_INVALID;
+        }
+        draw_id = pgraph_gl_fi_attach_submission_state(d, draw_id);
+        pgraph_gl_fi_vertex_capture_begin(
+            draw_id, FI_DRAW_ROUTE_ARRAYS, pg->primitive_mode, segments,
+            pg->draw_arrays_length, NULL, 0, (uint32_t)submitted);
+
         pgraph_gl_bind_vertex_attributes(d, pg->draw_arrays_min_start,
-                                      pg->draw_arrays_max_count - 1,
-                                      false, 0,
-                                      pg->draw_arrays_max_count - 1);
+                                       pg->draw_arrays_max_count - 1,
+                                       false, 0,
+                                       pg->draw_arrays_max_count - 1);
+        pgraph_gl_fi_finish_vertex_submission(draw_id);
         glMultiDrawArrays(r->shader_binding->gl_primitive_mode,
                           pg->draw_arrays_start,
                           pg->draw_arrays_count,
@@ -526,6 +760,21 @@ void pgraph_gl_flush_draw(NV2AState *d)
             max_element = MAX(pg->inline_elements[i], max_element);
             min_element = MIN(pg->inline_elements[i], min_element);
         }
+
+        uint32_t draw_id = xemu_frameinspect_capture_submission_begin(
+            FI_DRAW_ROUTE_INDEXED, pg->primitive_mode,
+            max_element - min_element + 1, pg->inline_elements_length);
+        if (draw_id != FI_DRAW_INVALID &&
+            !xemu_frameinspect_capture_submission_indices(
+                draw_id, pg->inline_elements, pg->inline_elements_length)) {
+            xemu_frameinspect_capture_submission_abort(draw_id);
+            draw_id = FI_DRAW_INVALID;
+        }
+        draw_id = pgraph_gl_fi_attach_submission_state(d, draw_id);
+        pgraph_gl_fi_vertex_capture_begin(
+            draw_id, FI_DRAW_ROUTE_INDEXED, pg->primitive_mode, NULL, 0,
+            pg->inline_elements, pg->inline_elements_length,
+            pg->inline_elements_length);
 
         pgraph_gl_bind_vertex_attributes(
                 d, min_element, max_element, false, 0,
@@ -552,6 +801,7 @@ void pgraph_gl_flush_draw(NV2AState *d)
         } else {
             nv2a_profile_inc_counter(NV2A_PROF_GEOM_BUFFER_UPDATE_4_NOTDIRTY);
         }
+        pgraph_gl_fi_finish_vertex_submission(draw_id);
         glDrawElements(r->shader_binding->gl_primitive_mode,
                        pg->inline_elements_length, GL_UNSIGNED_INT,
                        (void *)0);
@@ -564,6 +814,22 @@ void pgraph_gl_flush_draw(NV2AState *d)
             pg->compressed_attrs = 0;
             pgraph_gl_bind_shaders(pg);
         }
+
+        FIDrawSegment segment = {
+            .first = 0,
+            .count = pg->inline_buffer_length,
+        };
+        uint32_t draw_id = xemu_frameinspect_capture_submission_begin(
+            FI_DRAW_ROUTE_INLINE_BUFFER, pg->primitive_mode,
+            pg->inline_buffer_length, 0);
+        if (draw_id != FI_DRAW_INVALID &&
+            !xemu_frameinspect_capture_submission_segments(
+                draw_id, &segment, 1)) {
+            xemu_frameinspect_capture_submission_abort(draw_id);
+            draw_id = FI_DRAW_INVALID;
+        }
+        draw_id = pgraph_gl_fi_attach_submission_state(d, draw_id);
+        pgraph_gl_fi_capture_inline_buffer(d, draw_id);
 
         for (int i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
             VertexAttribute *attr = &pg->vertex_attributes[i];
@@ -591,7 +857,27 @@ void pgraph_gl_flush_draw(NV2AState *d)
         NV2A_GL_DPRINTF(false, "Inline Array");
         nv2a_profile_inc_counter(NV2A_PROF_INLINE_ARRAYS);
 
+        uint32_t vertex_count =
+            pgraph_gl_fi_inline_array_vertex_count(pg);
+        FIDrawSegment segment = {
+            .first = 0,
+            .count = vertex_count,
+        };
+        uint32_t draw_id = xemu_frameinspect_capture_submission_begin(
+            FI_DRAW_ROUTE_INLINE_ARRAY, pg->primitive_mode, vertex_count, 0);
+        if (draw_id != FI_DRAW_INVALID &&
+            !xemu_frameinspect_capture_submission_segments(
+                draw_id, &segment, 1)) {
+            xemu_frameinspect_capture_submission_abort(draw_id);
+            draw_id = FI_DRAW_INVALID;
+        }
+        draw_id = pgraph_gl_fi_attach_submission_state(d, draw_id);
+        pgraph_gl_fi_vertex_capture_begin(
+            draw_id, FI_DRAW_ROUTE_INLINE_ARRAY, pg->primitive_mode, &segment,
+            1, NULL, 0, vertex_count);
         unsigned int index_count = pgraph_gl_bind_inline_array(d);
+        assert(index_count == vertex_count);
+        pgraph_gl_fi_finish_vertex_submission(draw_id);
         glDrawArrays(r->shader_binding->gl_primitive_mode,
                      0, index_count);
     } else {

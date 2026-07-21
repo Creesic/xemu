@@ -38,6 +38,9 @@ public:
      * that batch's record range (new event, new capture, or no batch). */
     int m_selected_rec = -1;
     int m_selected_command = -1;
+    /* Global index into cap->draws.submissions. Draw() keeps it within the
+     * selected batch and resets it when a new capture publishes. */
+    int m_selected_submission = -1;
     ImGuiTextFilter m_method_filter;
 
     /* Frozen-frame GL texture: composed final frame or a reconstructed

@@ -28,6 +28,8 @@
 #include "xemu-frameinspect-eventlog.h"
 #include "xemu-frameinspect-methodlog.h"
 #include "xemu-frameinspect-commandlog.h"
+#include "xemu-frameinspect-drawlog.h"
+#include "xemu-frameinspect-setterlog.h"
 #include "xemu-frameinspect-origin.h"
 
 #ifdef __cplusplus
@@ -35,6 +37,7 @@ extern "C" {
 #endif
 
 #define FI_CAP_BUDGET_DEFAULT (1ull << 30)
+#define FI_SETTER_DISPATCH_MAX 2048u
 
 typedef enum {
     FI_CAP_IDLE,
@@ -63,6 +66,8 @@ enum {
     FI_RESK_PALETTE,
     FI_RESK_TEXTURE_RTREF,
     FI_RESK_SCANOUT_RGBA,
+    FI_RESK_VSH_PROGRAM,
+    FI_RESK_VSH_CONSTANTS,
 };
 
 /* One batch->resource reference: `event` is the FI_EV_BATCH event index the
@@ -78,6 +83,8 @@ typedef struct FICapture {
     FIEventLog events;
     FIMethodLog methods;
     FICommandLog commands;
+    FIDrawLog draws;
+    FISetterLog setters;
     FIBudget budget;
     uint64_t methods_bytes;  /* total budget charged for `methods`, released
                               * in full on reset (init alloc + per-call
@@ -109,6 +116,7 @@ typedef struct FICapture {
     uint32_t origin_generation; /* source generation retained for diagnostics */
     uint32_t refcount;        /* protected by the capture-module lock */
     uint64_t capture_id;      /* monotonically increasing publication identity */
+    uint32_t incomplete_submissions; /* open submissions aborted at batch end */
     bool batch_open;
     bool truncated;
 } FICapture;
@@ -180,6 +188,54 @@ bool xemu_frameinspect_capture_readback_allowed(uint32_t width,
 void xemu_frameinspect_capture_attach_pixels(uint32_t surface_gen,
                                              const uint32_t *rgba,
                                              uint32_t width, uint32_t height);
+typedef struct FISetterDispatchSource {
+    uint64_t phys_addr;
+    uint32_t method;
+    uint32_t parameter;
+    uint32_t writer_node;
+    uint16_t subchannel;
+    uint16_t confidence;
+} FISetterDispatchSource;
+/* PFIFO dispatch is synchronous with PGRAPH. Begin installs one source token
+ * per method parameter; PGRAPH records resolved logical destinations by
+ * parameter index; PFIFO then binds frame command IDs before ending dispatch. */
+bool xemu_frameinspect_capture_setter_dispatch_begin(
+    const FISetterDispatchSource *sources, uint32_t count);
+bool xemu_frameinspect_capture_setter_destination(
+    uint32_t parameter_index, const FISetterDestination *destination);
+bool xemu_frameinspect_capture_setter_bind_command(uint32_t parameter_index,
+                                                   uint32_t command_id);
+void xemu_frameinspect_capture_setter_dispatch_end(void);
+/* Build one immutable renderer submission beneath the currently open batch.
+ * Calls are no-ops unless capturing. Only one submission may be open. */
+uint32_t xemu_frameinspect_capture_submission_begin(uint16_t route,
+                                                    uint32_t topology,
+                                                    uint32_t vertex_count,
+                                                    uint32_t index_count);
+bool xemu_frameinspect_capture_submission_segments(
+    uint32_t draw_id, const FIDrawSegment *segments, uint32_t count);
+bool xemu_frameinspect_capture_submission_indices(uint32_t draw_id,
+                                                  const uint32_t *indices,
+                                                  uint32_t count);
+bool xemu_frameinspect_capture_submission_attribute(
+    uint32_t draw_id, uint32_t slot, const FIAttributeDesc *attribute);
+uint32_t xemu_frameinspect_capture_submission_sample(
+    uint32_t draw_id, const FIVertexSample *sample);
+uint32_t xemu_frameinspect_capture_submission_source(
+    uint32_t draw_id, const FIStateSource *source);
+uint32_t xemu_frameinspect_capture_submission_writer_set(
+    uint32_t draw_id, const FIWriterSpan *spans, uint32_t count);
+bool xemu_frameinspect_capture_submission_geometry(
+    uint32_t draw_id, uint64_t geometry_hash,
+    const FIColorSummary *color0, const FIColorSummary *color1);
+bool xemu_frameinspect_capture_submission_resources(
+    uint32_t draw_id, uint32_t color_surface_gen,
+    uint32_t zeta_surface_gen, uint32_t regs_resource,
+    uint32_t program_resource, uint32_t constants_resource);
+bool xemu_frameinspect_capture_submission_texture(
+    uint32_t draw_id, uint32_t stage, const FITextureStage *texture);
+bool xemu_frameinspect_capture_submission_complete(uint32_t draw_id);
+bool xemu_frameinspect_capture_submission_abort(uint32_t draw_id);
 /* Log a burst of pushbuffer method words dispatched by the PFIFO pusher in
  * one pfifo_run_puller() call, with each word's guest-code origin looked up
  * from the Plan-1 RAM-wide tag map. `first_method` is the method of word 0;

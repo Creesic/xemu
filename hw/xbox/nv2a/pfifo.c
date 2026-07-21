@@ -315,6 +315,7 @@ static void pfifo_run_pusher(NV2AState *d)
 
     uint32_t fi_words[FI_PFIFO_SNAPSHOT_MAX];
     uint32_t fi_tags[FI_PFIFO_SNAPSHOT_MAX];
+    FISetterDispatchSource fi_setter_sources[FI_SETTER_DISPATCH_MAX];
 
     while (!pfifo_pusher_should_stall(d)) {
         uint32_t dma_get_v = *dma_get;
@@ -337,8 +338,15 @@ static void pfifo_run_pusher(NV2AState *d)
         uint64_t word_phys = (uint64_t)((uint8_t *)word_ptr - d->vram_ptr);
         dma_get_v += 4;
 
-        bool fi_capturing =
-            xemu_frameinspect_capture_state() == FI_CAP_CAPTURING;
+        FICaptureState fi_capture_state =
+            xemu_frameinspect_capture_state();
+        bool fi_capturing = fi_capture_state == FI_CAP_CAPTURING;
+        bool fi_setter_tracking =
+            fi_capture_state == FI_CAP_ARMING ||
+            fi_capture_state == FI_CAP_ARMED ||
+            fi_capture_state == FI_CAP_LEAD_IN ||
+            fi_capture_state == FI_CAP_LEAD_IN_2 ||
+            fi_capture_state == FI_CAP_CAPTURING;
         if (!fi_capturing) {
             d->pfifo.fi_command_capture_active = false;
             d->pfifo.fi_command_packet = FI_COMMAND_INVALID;
@@ -386,11 +394,41 @@ static void pfifo_run_pusher(NV2AState *d)
             }
 
             uint32_t *dispatch_words = fi_count ? fi_words : word_ptr;
+            uint32_t fi_setter_count = fi_setter_tracking ?
+                MIN((uint32_t)MIN(method_count, num_words_available),
+                    (uint32_t)FI_SETTER_DISPATCH_MAX) : 0;
+            for (uint32_t i = 0; i < fi_setter_count; i++) {
+                uint64_t phys_addr = word_phys + 4ull * i;
+                uint32_t value = fi_count ? fi_words[i] :
+                                           ldl_le_p(word_ptr + i);
+                uint32_t tag = fi_count ? fi_tags[i] :
+                                          xemu_frameinspect_lookup_tag(
+                                              phys_addr);
+                fi_setter_sources[i] = (FISetterDispatchSource) {
+                    .phys_addr = phys_addr,
+                    .method = method_type ==
+                                  NV_PFIFO_CACHE1_DMA_STATE_METHOD_TYPE_INC ?
+                              method + 4 * i : method,
+                    .parameter = value,
+                    .writer_node = tag ? FI_TAG_NODE(tag) : 0,
+                    .subchannel = method_subchannel,
+                    .confidence = tag == 0 ? FI_ORIG_UNATTRIBUTED :
+                                      (tag & FI_TAG_PARTIAL) ?
+                                          FI_ORIG_PARTIAL :
+                                          FI_ORIG_ATTRIBUTED,
+                };
+            }
+            bool fi_setter_dispatch_active = fi_setter_count &&
+                xemu_frameinspect_capture_setter_dispatch_begin(
+                    fi_setter_sources, fi_setter_count);
             ssize_t num_words_processed =
                 pfifo_run_puller(d, method_entry, word, dispatch_words,
                                  MIN(method_count, num_words_available),
                                  num_words_available);
             if (num_words_processed < 0) {
+                if (fi_setter_dispatch_active) {
+                    xemu_frameinspect_capture_setter_dispatch_end();
+                }
                 break;
             }
 
@@ -434,8 +472,17 @@ static void pfifo_run_pusher(NV2AState *d)
                             NV_PFIFO_CACHE1_DMA_STATE_METHOD_TYPE_INC ?
                         FI_CMD_METHOD_INCREASING :
                         FI_CMD_METHOD_NON_INCREASING;
-                    xemu_frameinspect_capture_command(&rec);
+                    uint32_t command_id =
+                        xemu_frameinspect_capture_command(&rec);
+                    if (fi_setter_dispatch_active &&
+                        command_id != FI_COMMAND_INVALID) {
+                        xemu_frameinspect_capture_setter_bind_command(
+                            i, command_id);
+                    }
                 }
+            }
+            if (fi_setter_dispatch_active) {
+                xemu_frameinspect_capture_setter_dispatch_end();
             }
 
             dma_get_v += (num_words_processed-1)*4;

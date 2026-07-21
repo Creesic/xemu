@@ -27,6 +27,7 @@
 #include <vector>
 extern "C" {
 #include "../../xemu-frameinspect-capture.h"
+#include "../../xemu-frameinspect-nv2a-decode.h"
 #include "../../xemu-frameinspect.h"
 #include "../../xemu-frameinspect-symbols.h"
 #include "../../hw/xbox/nv2a/nv2a_regs.h"
@@ -1121,6 +1122,506 @@ static void fi_state_tab(const FICapture *cap, int event_idx)
     ImGui::EndChild();
 }
 
+static const char *fi_draw_route_name(uint16_t route)
+{
+    switch (route) {
+    case FI_DRAW_ROUTE_ARRAYS: return "arrays";
+    case FI_DRAW_ROUTE_INDEXED: return "indexed";
+    case FI_DRAW_ROUTE_INLINE_BUFFER: return "inline buffer";
+    case FI_DRAW_ROUTE_INLINE_ARRAY: return "inline array";
+    default: return "unknown";
+    }
+}
+
+static const char *fi_attribute_name(uint32_t slot)
+{
+    static const char *const names[FI_DRAW_ATTRIBUTE_COUNT] = {
+        "POSITION", "WEIGHT", "NORMAL", "COLOR0", "COLOR1", "FOG",
+        "POINT_SIZE", "BACK_COLOR0", "BACK_COLOR1", "UV0", "UV1",
+        "UV2", "UV3", "RESERVED13", "RESERVED14", "RESERVED15",
+    };
+    return slot < FI_DRAW_ATTRIBUTE_COUNT ? names[slot] : "?";
+}
+
+static const char *fi_value_status_name(uint8_t status)
+{
+    switch (status) {
+    case FI_VALUE_UNAVAILABLE: return "unavailable";
+    case FI_VALUE_PRESENT: return "enabled";
+    case FI_VALUE_CONSTANT: return "constant";
+    default: return "unknown";
+    }
+}
+
+static const FIDrawSubmission *fi_submission_selector(
+    FrameInspectorWindow *w, const FICapture *cap, uint32_t batch_event,
+    uint32_t *submission_count)
+{
+    uint32_t first = FI_DRAW_INVALID;
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < cap->draws.num_submissions; i++) {
+        if (cap->draws.submissions[i].batch_event == batch_event) {
+            if (first == FI_DRAW_INVALID) {
+                first = i;
+            }
+            count++;
+        }
+    }
+    *submission_count = count;
+
+    bool selected_matches =
+        w->m_selected_submission >= 0 &&
+        (uint32_t)w->m_selected_submission < cap->draws.num_submissions &&
+        cap->draws.submissions[w->m_selected_submission].batch_event ==
+            batch_event;
+    if (!selected_matches) {
+        w->m_selected_submission = first == FI_DRAW_INVALID ? -1 : (int)first;
+    }
+    if (w->m_selected_submission < 0) {
+        return nullptr;
+    }
+
+    const FIDrawSubmission *selected =
+        &cap->draws.submissions[w->m_selected_submission];
+    if (count == 1) {
+        ImGui::Text("Submission: #%u (%s)", selected->submit_index,
+                    fi_draw_route_name(selected->route));
+        return selected;
+    }
+
+    char preview[96];
+    snprintf(preview, sizeof(preview), "#%u (%s)", selected->submit_index,
+             fi_draw_route_name(selected->route));
+    ImGui::SetNextItemWidth(260.0f * g_viewport_mgr.m_scale);
+    if (ImGui::BeginCombo("Submission", preview)) {
+        for (uint32_t i = 0; i < cap->draws.num_submissions; i++) {
+            const FIDrawSubmission *draw = &cap->draws.submissions[i];
+            if (draw->batch_event != batch_event) {
+                continue;
+            }
+            char label[96];
+            snprintf(label, sizeof(label), "#%u (%s)", draw->submit_index,
+                     fi_draw_route_name(draw->route));
+            bool is_selected = (int)i == w->m_selected_submission;
+            if (ImGui::Selectable(label, is_selected)) {
+                w->m_selected_submission = (int)i;
+            }
+            if (is_selected) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    return &cap->draws.submissions[w->m_selected_submission];
+}
+
+static bool fi_draw_register(const FICapture *cap,
+                             const FIDrawSubmission *draw, uint32_t reg,
+                             uint32_t *value)
+{
+    if (draw->regs_resource >= cap->resources.num_res) {
+        return false;
+    }
+    const FIResource *resource =
+        &cap->resources.res[draw->regs_resource];
+    uint64_t offset = (uint64_t)reg * sizeof(uint32_t);
+    if (resource->kind != FI_RESK_REGS || offset > resource->len ||
+        sizeof(uint32_t) > resource->len - offset ||
+        resource->off > cap->resources.blob_used ||
+        resource->len > cap->resources.blob_used - resource->off) {
+        return false;
+    }
+    memcpy(value, cap->resources.blob + resource->off + offset,
+           sizeof(*value));
+    return true;
+}
+
+static void fi_overview_surface(const FICapture *cap, const char *name,
+                                uint32_t gen)
+{
+    if (gen == FI_DRAW_INVALID || gen >= cap->surfaces.num_gens) {
+        ImGui::TextDisabled("%s: unavailable (disabled or untracked)", name);
+        return;
+    }
+    const FISurfaceKey *key = &cap->surfaces.gens[gen].key;
+    ImGui::Text("%s: gen %u, guest 0x%llx, size 0x%llx", name, gen,
+                (unsigned long long)key->addr,
+                (unsigned long long)key->size);
+    ImGui::Text("  %ux%u, pitch %u, format 0x%x, AA 0x%x%s", key->width,
+                key->height, key->pitch, key->format, key->aa,
+                key->swizzle ? ", swizzled" : "");
+}
+
+static void fi_overview_color(const char *name,
+                              const FIColorSummary *summary)
+{
+    if (!summary->available) {
+        ImGui::TextDisabled("%s: unavailable", name);
+        return;
+    }
+    ImGui::Text("%s first raw=0x%08x", name, summary->packed_first);
+    ImGui::Text("  min=(%.5g, %.5g, %.5g, %.5g)", summary->min[0],
+                summary->min[1], summary->min[2], summary->min[3]);
+    ImGui::Text("  max=(%.5g, %.5g, %.5g, %.5g)", summary->max[0],
+                summary->max[1], summary->max[2], summary->max[3]);
+}
+
+static void fi_overview_tab(FrameInspectorWindow *w, const FICapture *cap,
+                            const FIDrawSubmission *draw,
+                            uint32_t submission_count)
+{
+    const char *topology = fi_nv2a_topology_name(draw->topology);
+    uint32_t enabled = 0;
+    uint32_t constants = 0;
+    for (uint32_t i = 0; i < FI_DRAW_ATTRIBUTE_COUNT; i++) {
+        enabled += draw->attrs[i].status == FI_VALUE_PRESENT;
+        constants += draw->attrs[i].status == FI_VALUE_CONSTANT;
+    }
+
+    ImGui::TextDisabled("Identity");
+    ImGui::Text("Event/batch #%u, submission #%u, capture record #%d",
+                draw->batch_event, draw->submit_index,
+                w->m_selected_submission);
+    ImGui::Text("Route: %s   Topology: %s (0x%x)",
+                fi_draw_route_name(draw->route), topology ? topology : "unknown",
+                draw->topology);
+    ImGui::Text("Status: %s%s%s%s", (draw->flags & FI_DRAW_COMPLETE) ?
+                    "complete" : "incomplete",
+                (draw->flags & FI_DRAW_SAMPLE_TRUNCATED) ?
+                    ", samples truncated" : "",
+                (draw->flags & FI_DRAW_INDEX_TRUNCATED) ?
+                    ", indices truncated" : "",
+                (draw->flags & FI_DRAW_SOURCE_TRUNCATED) ?
+                    ", sources truncated" : "");
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Geometry");
+    ImGui::Text("Vertices: %u   Indices: %u   Segments: %u",
+                draw->vertex_count, draw->index_count, draw->num_segments);
+    ImGui::Text("Attributes: %u enabled, %u constant   Samples: %u",
+                enabled, constants, draw->num_samples);
+    ImGui::Text("Geometry digest: 0x%016llx",
+                (unsigned long long)draw->geometry_hash);
+    if (draw->num_segments &&
+        draw->first_segment <= cap->draws.num_segments &&
+        draw->num_segments <= cap->draws.num_segments - draw->first_segment) {
+        for (uint32_t i = 0; i < draw->num_segments; i++) {
+            const FIDrawSegment *segment =
+                &cap->draws.segments[draw->first_segment + i];
+            ImGui::Text("  segment %u: first %u, count %u", i,
+                        segment->first, segment->count);
+        }
+    } else if (draw->num_segments) {
+        ImGui::TextColored(ImVec4(1, 0.6f, 0, 1),
+                           "Segment range is unavailable.");
+    }
+    ImGui::TextDisabled("Screen-space bounds were not captured.");
+    fi_overview_color("COLOR0", &draw->color0);
+    fi_overview_color("COLOR1", &draw->color1);
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Targets");
+    fi_overview_surface(cap, "Color", draw->color_surface_gen);
+    fi_overview_surface(cap, "Zeta", draw->zeta_surface_gen);
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Effect");
+    if (submission_count > 1) {
+        ImGui::TextColored(
+            ImVec4(1, 0.75f, 0.25f, 1),
+            "Pixel attribution is batch-level: %u submissions share this "
+            "checkpoint.", submission_count);
+    }
+    if (w->m_view_event == (int)draw->batch_event && w->m_target_gen >= 0) {
+        ImGui::Text("Changed color pixels: %llu",
+                    (unsigned long long)w->m_target_changed_pixels);
+        if (w->m_target_bounds_valid) {
+            ImGui::Text("Changed bounds: (%u, %u)-(%u, %u)",
+                        w->m_target_min_x, w->m_target_min_y,
+                        w->m_target_max_x, w->m_target_max_y);
+        } else {
+            ImGui::TextDisabled("No color change was recorded.");
+        }
+    } else {
+        ImGui::TextDisabled(
+            "Color history cannot prove a write for this submission.");
+    }
+
+    ImGui::Separator();
+    ImGui::TextDisabled("Shading");
+    uint32_t csv0_d, combine_ctl, shader_prog;
+    if (fi_draw_register(cap, draw, NV_PGRAPH_CSV0_D, &csv0_d) &&
+        fi_draw_register(cap, draw, NV_PGRAPH_COMBINECTL, &combine_ctl) &&
+        fi_draw_register(cap, draw, NV_PGRAPH_SHADERPROG, &shader_prog)) {
+        uint32_t vertex_mode = csv0_d >> 30;
+        const char *vertex_mode_name = vertex_mode == 0 ? "fixed-function" :
+            vertex_mode == 2 ? "programmable" : "unknown";
+        ImGui::Text("Vertex mode: %s (CSV0_D=0x%08x)", vertex_mode_name,
+                    csv0_d);
+        ImGui::Text("Combiner stages: %u (COMBINECTL=0x%08x)",
+                    combine_ctl & 0xff, combine_ctl);
+        ImGui::Text("Texture modes: 0x%02x 0x%02x 0x%02x 0x%02x "
+                    "(SHADERPROG=0x%08x)",
+                    (shader_prog >> 0) & 0x1f,
+                    (shader_prog >> 5) & 0x1f,
+                    (shader_prog >> 10) & 0x1f,
+                    (shader_prog >> 15) & 0x1f, shader_prog);
+    } else {
+        ImGui::TextDisabled("Immutable register snapshot is unavailable.");
+    }
+}
+
+static void fi_format_raw_bytes(const FIVertexAttributeSample *sample,
+                                char *buf, size_t size)
+{
+    if (!size) {
+        return;
+    }
+    buf[0] = 0;
+    size_t pos = 0;
+    for (uint32_t i = 0; i < sample->raw_len && i < sizeof(sample->raw); i++) {
+        int written = snprintf(buf + pos, size - pos, "%s%02x",
+                               i ? " " : "", sample->raw[i]);
+        if (written < 0 || (size_t)written >= size - pos) {
+            buf[size - 1] = 0;
+            return;
+        }
+        pos += written;
+    }
+    if (!sample->raw_len) {
+        snprintf(buf, size, "-");
+    }
+}
+
+static void fi_format_sample_value(const FIVertexAttributeSample *sample,
+                                   bool packed_color, char *buf, size_t size)
+{
+    if (sample->status == FI_VALUE_UNAVAILABLE) {
+        snprintf(buf, size, "unavailable");
+        return;
+    }
+    if (packed_color && sample->raw_len >= 4) {
+        snprintf(buf, size, "0x%08x  (%.4g, %.4g, %.4g, %.4g)",
+                 fi_nv2a_read_le32(sample->raw), sample->decoded[0],
+                 sample->decoded[1], sample->decoded[2], sample->decoded[3]);
+        return;
+    }
+    snprintf(buf, size, "(%.5g, %.5g, %.5g, %.5g)", sample->decoded[0],
+             sample->decoded[1], sample->decoded[2], sample->decoded[3]);
+}
+
+static void fi_sample_sources(const FICapture *cap,
+                              const FIDrawSubmission *draw,
+                              const FIVertexAttributeSample *sample)
+{
+    if (!sample->source_count || sample->source_first == FI_DRAW_INVALID) {
+        ImGui::TextDisabled("-");
+        return;
+    }
+    bool valid = sample->source_first >= draw->first_source &&
+        sample->source_first <= cap->draws.num_sources &&
+        sample->source_count <=
+            cap->draws.num_sources - sample->source_first &&
+        sample->source_first - draw->first_source <= draw->num_sources &&
+        sample->source_count <= draw->num_sources -
+            (sample->source_first - draw->first_source);
+    if (!valid) {
+        ImGui::TextColored(ImVec4(1, 0.6f, 0, 1), "invalid range");
+        return;
+    }
+    if (ImGui::TreeNode("sample_sources", "%u source%s",
+                        sample->source_count,
+                        sample->source_count == 1 ? "" : "s")) {
+        for (uint32_t i = 0; i < sample->source_count; i++) {
+            const FIStateSource *source =
+                &cap->draws.sources[sample->source_first + i];
+            ImGui::PushID((int)i);
+            ImGui::Text("phys=0x%llx, %s%s",
+                        (unsigned long long)source->phys_addr,
+                        fi_confidence_name(source->confidence),
+                        source->inherited ? ", inherited" : "");
+            if (source->confidence == FI_ORIG_ATTRIBUTED ||
+                source->confidence == FI_ORIG_PARTIAL) {
+                fi_render_call_chain(cap, source->writer_node);
+            }
+            ImGui::PopID();
+        }
+        ImGui::TreePop();
+    }
+}
+
+static void fi_geometry_tab(const FICapture *cap,
+                            const FIDrawSubmission *draw)
+{
+    ImGui::Text("Descriptors (all %u NV2A slots)", FI_DRAW_ATTRIBUTE_COUNT);
+    ImGuiTableFlags table_flags = ImGuiTableFlags_Borders |
+        ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX |
+        ImGuiTableFlags_SizingFixedFit;
+    if (ImGui::BeginTable("fi_attribute_desc", 9, table_flags,
+                          ImVec2(0, 250.0f * g_viewport_mgr.m_scale))) {
+        ImGui::TableSetupScrollFreeze(2, 1);
+        ImGui::TableSetupColumn("Slot");
+        ImGui::TableSetupColumn("State");
+        ImGui::TableSetupColumn("Guest type");
+        ImGui::TableSetupColumn("Components");
+        ImGui::TableSetupColumn("Stride");
+        ImGui::TableSetupColumn("DMA");
+        ImGui::TableSetupColumn("Object");
+        ImGui::TableSetupColumn("Guest offset");
+        ImGui::TableSetupColumn("Physical source");
+        ImGui::TableHeadersRow();
+        for (uint32_t slot = 0; slot < FI_DRAW_ATTRIBUTE_COUNT; slot++) {
+            const FIAttributeDesc *attr = &draw->attrs[slot];
+            const char *format = fi_nv2a_vertex_format_name(attr->format);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("%u %s", slot, fi_attribute_name(slot));
+            ImGui::TableSetColumnIndex(1);
+            if (attr->status == FI_VALUE_UNAVAILABLE) {
+                ImGui::TextDisabled("unavailable");
+            } else {
+                ImGui::TextUnformatted(fi_value_status_name(attr->status));
+            }
+            ImGui::TableSetColumnIndex(2);
+            ImGui::Text("%s (0x%x)", format ? format : "unknown",
+                        attr->format);
+            ImGui::TableSetColumnIndex(3);
+            ImGui::Text("%u x %u B", attr->components, attr->element_size);
+            ImGui::TableSetColumnIndex(4);
+            ImGui::Text("%u", attr->stride);
+            ImGui::TableSetColumnIndex(5);
+            if (attr->dma_select == 0 || attr->dma_select == 1) {
+                ImGui::Text("DMA %c", 'A' + attr->dma_select);
+            } else if (attr->dma_select == 2) {
+                ImGui::TextUnformatted("inline array");
+            } else if (attr->dma_select == 3) {
+                ImGui::TextUnformatted("inline buffer");
+            } else {
+                ImGui::TextDisabled("-");
+            }
+            ImGui::TableSetColumnIndex(6);
+            if (attr->dma_object == FI_DRAW_INVALID) {
+                ImGui::TextDisabled("-");
+            } else {
+                ImGui::Text("0x%08x", attr->dma_object);
+            }
+            ImGui::TableSetColumnIndex(7);
+            ImGui::Text("0x%08x", attr->guest_offset);
+            ImGui::TableSetColumnIndex(8);
+            if (attr->phys_addr == UINT64_MAX) {
+                ImGui::TextDisabled("-");
+            } else {
+                ImGui::Text("0x%llx", (unsigned long long)attr->phys_addr);
+            }
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::Separator();
+    ImGui::Text("Retained samples: %u / %u submitted vertices%s",
+                draw->num_samples, draw->vertex_count,
+                (draw->flags & FI_DRAW_SAMPLE_TRUNCATED) ? " [TRUNCATED]" : "");
+    if (draw->first_sample > cap->draws.num_samples ||
+        draw->num_samples > cap->draws.num_samples - draw->first_sample) {
+        ImGui::TextColored(ImVec4(1, 0.6f, 0, 1),
+                           "Sample range is unavailable.");
+        return;
+    }
+    if (!draw->num_samples) {
+        ImGui::TextDisabled("No vertex samples were retained.");
+        return;
+    }
+
+    if (ImGui::BeginTable("fi_sample_focus", 9, table_flags,
+                          ImVec2(0, 190.0f * g_viewport_mgr.m_scale))) {
+        ImGui::TableSetupScrollFreeze(2, 1);
+        ImGui::TableSetupColumn("Ordinal");
+        ImGui::TableSetupColumn("Source index");
+        ImGui::TableSetupColumn("Position / RHW");
+        ImGui::TableSetupColumn("COLOR0");
+        ImGui::TableSetupColumn("COLOR1");
+        ImGui::TableSetupColumn("UV0");
+        ImGui::TableSetupColumn("UV1");
+        ImGui::TableSetupColumn("UV2");
+        ImGui::TableSetupColumn("UV3");
+        ImGui::TableHeadersRow();
+        static const uint8_t slots[7] = { 0, 3, 4, 9, 10, 11, 12 };
+        for (uint32_t i = 0; i < draw->num_samples; i++) {
+            const FIVertexSample *sample =
+                &cap->draws.samples[draw->first_sample + i];
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("%u", sample->ordinal);
+            ImGui::TableSetColumnIndex(1);
+            ImGui::Text("%u", sample->source_index);
+            for (uint32_t column = 0; column < 7; column++) {
+                char value[160];
+                uint8_t slot = slots[column];
+                fi_format_sample_value(&sample->attrs[slot],
+                                       slot == 3 || slot == 4,
+                                       value, sizeof(value));
+                ImGui::TableSetColumnIndex((int)column + 2);
+                if (sample->attrs[slot].status == FI_VALUE_UNAVAILABLE) {
+                    ImGui::TextDisabled("%s", value);
+                } else {
+                    ImGui::TextUnformatted(value);
+                }
+            }
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::TextDisabled(
+        "Expand a sample for raw bytes, every attribute, and writer paths.");
+    for (uint32_t i = 0; i < draw->num_samples; i++) {
+        const FIVertexSample *sample =
+            &cap->draws.samples[draw->first_sample + i];
+        ImGui::PushID((int)i);
+        if (ImGui::TreeNode("sample_detail", "Sample %u (source index %u)",
+                            sample->ordinal, sample->source_index)) {
+            if (ImGui::BeginTable("fi_sample_attributes", 5, table_flags)) {
+                ImGui::TableSetupColumn("Attribute");
+                ImGui::TableSetupColumn("Status");
+                ImGui::TableSetupColumn("Raw little-endian bytes");
+                ImGui::TableSetupColumn("Decoded XYZW");
+                ImGui::TableSetupColumn("Writer path");
+                ImGui::TableHeadersRow();
+                for (uint32_t slot = 0; slot < FI_DRAW_ATTRIBUTE_COUNT;
+                     slot++) {
+                    const FIVertexAttributeSample *attribute =
+                        &sample->attrs[slot];
+                    char raw[FI_DRAW_RAW_ATTRIBUTE_MAX * 3 + 1];
+                    char decoded[128];
+                    fi_format_raw_bytes(attribute, raw, sizeof(raw));
+                    fi_format_sample_value(attribute, false, decoded,
+                                           sizeof(decoded));
+                    ImGui::PushID((int)slot);
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::Text("%u %s", slot, fi_attribute_name(slot));
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextUnformatted(
+                        fi_value_status_name(attribute->status));
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::TextUnformatted(raw);
+                    ImGui::TableSetColumnIndex(3);
+                    if (attribute->status == FI_VALUE_UNAVAILABLE) {
+                        ImGui::TextDisabled("unavailable");
+                    } else {
+                        ImGui::TextUnformatted(decoded);
+                    }
+                    ImGui::TableSetColumnIndex(4);
+                    fi_sample_sources(cap, draw, attribute);
+                    ImGui::PopID();
+                }
+                ImGui::EndTable();
+            }
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+}
+
 static void fi_resources_tab(const FICapture *cap, int event_idx)
 {
     ImGui::TextDisabled(
@@ -1850,6 +2351,7 @@ void FrameInspectorWindow::Draw()
     /* A new/smaller capture may have fewer events than the prior selection. */
     if (m_selected_event >= (int)cap->events.count) {
         m_selected_event = -1;
+        m_selected_submission = -1;
     }
 
     if (new_capture) {
@@ -1858,6 +2360,7 @@ void FrameInspectorWindow::Draw()
         m_pinned_gen = -1;
         m_selected_rec = -1; /* stale index into the old capture's methods log */
         m_selected_command = -1;
+        m_selected_submission = -1;
         m_timeline_idx = -1;
         m_view_event = -1;
         m_isolate_batch = false;
@@ -1877,13 +2380,15 @@ void FrameInspectorWindow::Draw()
                              ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Frame Inspector", &m_is_open,
                       ImGuiWindowFlags_NoCollapse)) {
-        ImGui::Text("Captured frame: %u events, %u surfaces, %u commands, "
-                    "%u methods, %u resources%s", cap->events.count,
+        ImGui::Text("Captured frame: %u events, %u submissions, %u surfaces, "
+                    "%u commands, %u methods, %u resources%s", cap->events.count,
+                    cap->draws.num_submissions,
                     cap->surfaces.num_gens, cap->commands.num_recs,
                     cap->methods.num_recs, cap->resources.num_res,
                     (cap->truncated || cap->events.truncated ||
                      cap->surfaces.truncated || cap->resources.truncated ||
-                     cap->methods.truncated || cap->commands.truncated) ?
+                     cap->methods.truncated || cap->commands.truncated ||
+                     cap->draws.truncated || cap->setters.truncated) ?
                         " [TRUNCATED]" : "");
         ImGui::Separator();
         ImGui::Text("Events: %u   Surfaces: %u   Resources: %u",
@@ -1894,7 +2399,8 @@ void FrameInspectorWindow::Draw()
                     cap->origins.truncation ? " [TRUNCATED]" : "");
         if (cap->truncated || cap->events.truncated ||
             cap->surfaces.truncated || cap->resources.truncated ||
-            cap->methods.truncated || cap->commands.truncated) {
+            cap->methods.truncated || cap->commands.truncated ||
+            cap->draws.truncated || cap->setters.truncated) {
             ImGui::TextColored(
                 ImVec4(1, 0.6f, 0, 1),
                 "[TRUNCATED] capture hit a cap/budget; some data is missing.");
@@ -2158,7 +2664,29 @@ void FrameInspectorWindow::Draw()
                 }
             }
 
+            uint32_t submission_count = 0;
+            const FIDrawSubmission *submission = nullptr;
+            if (selected->kind == FI_EV_BATCH) {
+                submission = fi_submission_selector(
+                    this, cap, (uint32_t)m_selected_event,
+                    &submission_count);
+                if (!submission) {
+                    ImGui::TextDisabled(
+                        "No immutable submission record for this batch.");
+                }
+            } else {
+                m_selected_submission = -1;
+            }
+
             if (ImGui::BeginTabBar("fi_tabs")) {
+                if (submission && ImGui::BeginTabItem("Overview")) {
+                    fi_overview_tab(this, cap, submission, submission_count);
+                    ImGui::EndTabItem();
+                }
+                if (submission && ImGui::BeginTabItem("Geometry")) {
+                    fi_geometry_tab(cap, submission);
+                    ImGui::EndTabItem();
+                }
                 if (ImGui::BeginTabItem("Origin")) {
                     fi_origin_tab(this, cap, cur_batch);
                     ImGui::EndTabItem();
@@ -2191,6 +2719,7 @@ void FrameInspectorWindow::Draw()
                 ImGui::EndTabBar();
             }
         } else {
+            m_selected_submission = -1;
             ImGui::TextDisabled("Select an event");
         }
         ImGui::EndChild();
