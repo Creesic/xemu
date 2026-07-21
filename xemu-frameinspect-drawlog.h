@@ -59,6 +59,30 @@ typedef enum FIValueStatus {
     FI_VALUE_CONSTANT,
 } FIValueStatus;
 
+typedef enum FITextureLayout {
+    FI_TEXTURE_LAYOUT_SWIZZLED,
+    FI_TEXTURE_LAYOUT_LINEAR,
+    FI_TEXTURE_LAYOUT_CUBEMAP,
+} FITextureLayout;
+
+enum {
+    FI_TEXTURE_FLAG_RT_BACKED = 1u << 0,
+    FI_TEXTURE_FLAG_RANGE_INVALID = 1u << 1,
+    FI_TEXTURE_FLAG_RESOURCE_UNAVAILABLE = 1u << 2,
+    FI_TEXTURE_FLAG_WRITERS_TRUNCATED = 1u << 3,
+    FI_TEXTURE_FLAG_PALETTE_RANGE_INVALID = 1u << 4,
+    FI_TEXTURE_FLAG_PALETTE_RESOURCE_UNAVAILABLE = 1u << 5,
+    FI_TEXTURE_FLAG_PALETTE_WRITERS_TRUNCATED = 1u << 6,
+    FI_TEXTURE_FLAG_CUBEMAP = 1u << 7,
+    FI_TEXTURE_FLAG_BORDER = 1u << 8,
+    FI_TEXTURE_FLAG_SIGNED_A = 1u << 9,
+    FI_TEXTURE_FLAG_SIGNED_R = 1u << 10,
+    FI_TEXTURE_FLAG_SIGNED_G = 1u << 11,
+    FI_TEXTURE_FLAG_SIGNED_B = 1u << 12,
+    FI_TEXTURE_FLAG_PRODUCER_EVENT_UNAVAILABLE = 1u << 13,
+    FI_TEXTURE_FLAG_PRODUCER_SURFACE_UNAVAILABLE = 1u << 14,
+};
+
 enum {
     FI_DRAW_COMPLETE = 1u << 0,
     FI_DRAW_SAMPLE_TRUNCATED = 1u << 1,
@@ -156,24 +180,46 @@ typedef struct FIResourceWriterSet {
 
 typedef struct FITextureStage {
     uint64_t guest_addr;
+    uint64_t palette_addr;
     uint64_t content_hash;
+    uint64_t palette_hash;
     uint32_t dma_object;
+    uint32_t palette_dma_object;
+    uint32_t guest_offset;
+    uint32_t palette_offset;
     uint32_t resource_id;
     uint32_t palette_id;
     uint32_t producer_surface_gen;
     uint32_t producer_event;
     uint32_t writer_set;
+    uint32_t palette_writer_set;
+    uint32_t content_length;
+    uint32_t palette_length;
     uint32_t width;
     uint32_t height;
     uint32_t depth;
     uint32_t pitch;
+    uint32_t address_raw;
+    uint32_t filter_raw;
+    uint32_t control0_raw;
+    uint32_t control1_raw;
+    uint32_t palette_raw;
     uint16_t format;
+    uint16_t flags;
     uint8_t stage;
     uint8_t status;
     uint8_t dimensionality;
     uint8_t mip_count;
     uint8_t layout;
     uint8_t dma_select;
+    uint8_t palette_dma_select;
+    uint8_t address_u;
+    uint8_t address_v;
+    uint8_t address_p;
+    uint8_t min_filter;
+    uint8_t mag_filter;
+    uint8_t min_mip_level;
+    uint8_t max_mip_level;
 } FITextureStage;
 
 typedef struct FIColorSummary {
@@ -407,6 +453,7 @@ static inline uint32_t fi_drawlog_begin(FIDrawLog *l, FIBudget *budget,
         d->textures[i].producer_surface_gen = FI_DRAW_INVALID;
         d->textures[i].producer_event = FI_DRAW_INVALID;
         d->textures[i].writer_set = FI_DRAW_INVALID;
+        d->textures[i].palette_writer_set = FI_DRAW_INVALID;
     }
     l->open_submission = id;
     return id;

@@ -23,6 +23,8 @@
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "debug.h"
 #include "renderer.h"
+#include "xemu-frameinspect.h"
+#include "xemu-frameinspect-tagmap.h"
 #include "xemu-frameinspect-capture.h"
 
 void pgraph_gl_fi_vertex_capture_begin(
@@ -65,6 +67,301 @@ static void pgraph_gl_fi_color_add(FIColorSummary *summary,
         summary->min[i] = MIN(summary->min[i], decoded[i]);
         summary->max[i] = MAX(summary->max[i], decoded[i]);
     }
+}
+
+#define FI_GL_WRITER_SPAN_CAP (FI_DRAW_WRITER_CANDIDATE_LIMIT + 1u)
+
+typedef struct FIGLTextureCapture {
+    FITextureStage texture;
+    FIWriterSpan texture_writers[FI_GL_WRITER_SPAN_CAP];
+    FIWriterSpan palette_writers[FI_GL_WRITER_SPAN_CAP];
+    uint32_t num_texture_writers;
+    uint32_t num_palette_writers;
+} FIGLTextureCapture;
+
+static FIGLTextureCapture fi_texture_capture[FI_DRAW_TEXTURE_COUNT];
+
+static void pgraph_gl_fi_texture_capture_reset(void)
+{
+    memset(fi_texture_capture, 0, sizeof(fi_texture_capture));
+    for (uint32_t i = 0; i < FI_DRAW_TEXTURE_COUNT; i++) {
+        FITextureStage *texture = &fi_texture_capture[i].texture;
+        texture->stage = i;
+        texture->status = FI_VALUE_UNAVAILABLE;
+        texture->resource_id = FI_DRAW_INVALID;
+        texture->palette_id = FI_DRAW_INVALID;
+        texture->producer_surface_gen = FI_DRAW_INVALID;
+        texture->producer_event = FI_DRAW_INVALID;
+        texture->writer_set = FI_DRAW_INVALID;
+        texture->palette_writer_set = FI_DRAW_INVALID;
+    }
+}
+
+static uint32_t pgraph_gl_fi_collect_writer_spans(
+    uint64_t addr, uint32_t length,
+    FIWriterSpan spans[FI_GL_WRITER_SPAN_CAP], bool *truncated)
+{
+    enum { HASH_CAP = FI_DRAW_WRITER_CANDIDATE_LIMIT * 2 };
+    uint16_t hash_slots[HASH_CAP];
+    memset(hash_slots, 0xff, sizeof(hash_slots));
+    uint32_t count = 0;
+    uint64_t overflow_bytes = 0;
+    uint64_t end = addr + length;
+    for (uint64_t dword = addr & ~3ull; dword < end; dword += 4) {
+        uint64_t first = MAX(dword, addr);
+        uint64_t last = MIN(dword + 4, end);
+        uint64_t bytes = last - first;
+        uint32_t tag = xemu_frameinspect_lookup_tag(dword);
+        uint32_t writer_node = tag ? FI_TAG_NODE(tag) : FI_NODE_INVALID;
+        uint16_t confidence = tag == 0 ? FI_ORIG_UNATTRIBUTED :
+            (tag & FI_TAG_PARTIAL) ? FI_ORIG_PARTIAL : FI_ORIG_ATTRIBUTED;
+        uint32_t slot = (writer_node * 2654435761u + confidence) &
+                        (HASH_CAP - 1);
+        while (hash_slots[slot] != UINT16_MAX) {
+            uint32_t index = hash_slots[slot];
+            if (spans[index].writer_node == writer_node &&
+                spans[index].confidence == confidence) {
+                spans[index].bytes += bytes;
+                break;
+            }
+            slot = (slot + 1) & (HASH_CAP - 1);
+        }
+        if (hash_slots[slot] != UINT16_MAX) {
+            continue;
+        }
+        if (count < FI_DRAW_WRITER_CANDIDATE_LIMIT) {
+            hash_slots[slot] = count;
+            spans[count++] = (FIWriterSpan) {
+                .writer_node = writer_node,
+                .confidence = confidence,
+                .bytes = bytes,
+            };
+        } else {
+            overflow_bytes += bytes;
+        }
+    }
+    if (overflow_bytes) {
+        spans[count++] = (FIWriterSpan) {
+            .writer_node = FI_NODE_INVALID - 1,
+            .confidence = FI_ORIG_UNATTRIBUTED,
+            .bytes = overflow_bytes,
+        };
+        *truncated = true;
+    }
+    return count;
+}
+
+static uint64_t pgraph_gl_fi_content_hash(const void *data, uint32_t length)
+{
+    uint64_t hash = 14695981039346656037ull;
+    pgraph_gl_fi_hash_bytes(&hash, data, length);
+    return hash;
+}
+
+static void pgraph_gl_fi_prepare_textures(NV2AState *d)
+{
+    PGRAPHState *pg = &d->pgraph;
+    pgraph_gl_fi_texture_capture_reset();
+    if (xemu_frameinspect_capture_state() != FI_CAP_CAPTURING) {
+        return;
+    }
+
+    uint64_t vram_size = memory_region_size(d->vram);
+    for (uint32_t i = 0; i < FI_DRAW_TEXTURE_COUNT; i++) {
+        if (!pgraph_is_texture_enabled(pg, i)) {
+            continue;
+        }
+        FIGLTextureCapture *capture = &fi_texture_capture[i];
+        FITextureStage *texture = &capture->texture;
+        TextureShape shape = pgraph_get_texture_shape(pg, i);
+        uint32_t format = pgraph_reg_r(pg, NV_PGRAPH_TEXFMT0 + i * 4);
+        uint32_t filter = pgraph_reg_r(pg, NV_PGRAPH_TEXFILTER0 + i * 4);
+        uint32_t address = pgraph_reg_r(pg, NV_PGRAPH_TEXADDRESS0 + i * 4);
+        uint32_t control0 = pgraph_reg_r(pg, NV_PGRAPH_TEXCTL0_0 + i * 4);
+        uint32_t control1 = pgraph_reg_r(pg, NV_PGRAPH_TEXCTL1_0 + i * 4);
+        uint32_t palette = pgraph_reg_r(pg, NV_PGRAPH_TEXPALETTE0 + i * 4);
+        uint32_t guest_offset =
+            pgraph_reg_r(pg, NV_PGRAPH_TEXOFFSET0 + i * 4);
+        uint8_t dma_select = GET_MASK(format,
+                                      NV_PGRAPH_TEXFMT0_CONTEXT_DMA);
+        uint8_t palette_dma_select = GET_MASK(
+            palette, NV_PGRAPH_TEXPALETTE0_CONTEXT_DMA);
+        size_t palette_length = 0;
+        size_t content_length = pgraph_get_texture_length(pg, &shape);
+        uint64_t texture_addr = pgraph_get_texture_phys_addr(pg, i);
+        uint64_t palette_addr = pgraph_get_texture_palette_phys_addr_length(
+            pg, i, &palette_length);
+        const BasicColorFormatInfo *format_info =
+            &kelvin_color_format_info_map[shape.color_format];
+
+        texture->status = FI_VALUE_PRESENT;
+        texture->guest_addr = texture_addr;
+        texture->palette_addr = palette_addr;
+        texture->dma_select = dma_select;
+        texture->palette_dma_select = palette_dma_select;
+        texture->dma_object = dma_select ? pg->dma_b : pg->dma_a;
+        texture->palette_dma_object =
+            palette_dma_select ? pg->dma_b : pg->dma_a;
+        texture->guest_offset = guest_offset;
+        texture->palette_offset =
+            palette & NV_PGRAPH_TEXPALETTE0_OFFSET;
+        texture->width = shape.width;
+        texture->height = shape.height;
+        texture->depth = shape.depth;
+        texture->pitch = shape.pitch;
+        texture->format = shape.color_format;
+        texture->dimensionality = shape.dimensionality;
+        texture->mip_count = shape.levels;
+        texture->min_mip_level = shape.min_mipmap_level;
+        texture->max_mip_level = shape.max_mipmap_level;
+        texture->layout = shape.cubemap ? FI_TEXTURE_LAYOUT_CUBEMAP :
+            format_info->linear ? FI_TEXTURE_LAYOUT_LINEAR :
+                                  FI_TEXTURE_LAYOUT_SWIZZLED;
+        texture->address_raw = address;
+        texture->filter_raw = filter;
+        texture->control0_raw = control0;
+        texture->control1_raw = control1;
+        texture->palette_raw = palette;
+        texture->address_u = GET_MASK(address, NV_PGRAPH_TEXADDRESS0_ADDRU);
+        texture->address_v = GET_MASK(address, NV_PGRAPH_TEXADDRESS0_ADDRV);
+        texture->address_p = GET_MASK(address, NV_PGRAPH_TEXADDRESS0_ADDRP);
+        texture->min_filter = GET_MASK(filter, NV_PGRAPH_TEXFILTER0_MIN);
+        texture->mag_filter = GET_MASK(filter, NV_PGRAPH_TEXFILTER0_MAG);
+        if (shape.cubemap) texture->flags |= FI_TEXTURE_FLAG_CUBEMAP;
+        if (shape.border) texture->flags |= FI_TEXTURE_FLAG_BORDER;
+        if (filter & NV_PGRAPH_TEXFILTER0_ASIGNED) {
+            texture->flags |= FI_TEXTURE_FLAG_SIGNED_A;
+        }
+        if (filter & NV_PGRAPH_TEXFILTER0_RSIGNED) {
+            texture->flags |= FI_TEXTURE_FLAG_SIGNED_R;
+        }
+        if (filter & NV_PGRAPH_TEXFILTER0_GSIGNED) {
+            texture->flags |= FI_TEXTURE_FLAG_SIGNED_G;
+        }
+        if (filter & NV_PGRAPH_TEXFILTER0_BSIGNED) {
+            texture->flags |= FI_TEXTURE_FLAG_SIGNED_B;
+        }
+
+        if (!content_length || content_length > (16u << 20) ||
+            texture_addr > vram_size ||
+            content_length > vram_size - texture_addr ||
+            content_length > UINT32_MAX) {
+            texture->flags |= FI_TEXTURE_FLAG_RANGE_INVALID;
+            continue;
+        }
+        texture->content_length = content_length;
+
+        SurfaceBinding *surface = pgraph_gl_surface_get(d, texture_addr);
+        bool rt_backed = surface &&
+            pgraph_gl_check_surface_to_texture_compatibility(surface, &shape);
+        if (rt_backed) {
+            /* The surface generation is authoritative here. The capture API
+             * does not expose its mutable last-writer event during binding,
+             * so leave producer_event invalid rather than guessing. */
+            texture->flags |= FI_TEXTURE_FLAG_RT_BACKED |
+                              FI_TEXTURE_FLAG_PRODUCER_EVENT_UNAVAILABLE;
+            texture->producer_surface_gen =
+                pgraph_gl_fi_intern_surface(d, surface);
+            if (texture->producer_surface_gen == FI_SURFGEN_INVALID) {
+                texture->flags |=
+                    FI_TEXTURE_FLAG_PRODUCER_SURFACE_UNAVAILABLE;
+            }
+            texture->resource_id = xemu_frameinspect_capture_resource(
+                FI_RESK_TEXTURE_RTREF, NULL, 0, surface->vram_addr);
+            if (texture->resource_id == FI_RES_INVALID) {
+                texture->flags |= FI_TEXTURE_FLAG_RESOURCE_UNAVAILABLE;
+            } else {
+                xemu_frameinspect_capture_batch_resource_ref(
+                    texture->resource_id);
+            }
+            continue;
+        }
+
+        const uint8_t *content = d->vram_ptr + texture_addr;
+        texture->content_hash = pgraph_gl_fi_content_hash(
+            content, texture->content_length);
+        uint64_t meta = ((uint64_t)shape.color_format << 32) |
+                        ((uint64_t)shape.width << 16) | shape.height;
+        texture->resource_id = xemu_frameinspect_capture_resource(
+            FI_RESK_TEXTURE, content, texture->content_length, meta);
+        if (texture->resource_id == FI_RES_INVALID) {
+            texture->flags |= FI_TEXTURE_FLAG_RESOURCE_UNAVAILABLE;
+        } else {
+            xemu_frameinspect_capture_batch_resource_ref(texture->resource_id);
+        }
+        bool writers_truncated = false;
+        capture->num_texture_writers = pgraph_gl_fi_collect_writer_spans(
+            texture_addr, texture->content_length, capture->texture_writers,
+            &writers_truncated);
+        if (writers_truncated) {
+            texture->flags |= FI_TEXTURE_FLAG_WRITERS_TRUNCATED;
+        }
+
+        bool indexed = shape.color_format ==
+            NV097_SET_TEXTURE_FORMAT_COLOR_SZ_I8_A8R8G8B8;
+        if (!indexed) {
+            continue;
+        }
+        if (!palette_length || palette_addr > vram_size ||
+            palette_length > vram_size - palette_addr ||
+            palette_length > UINT32_MAX) {
+            texture->flags |= FI_TEXTURE_FLAG_PALETTE_RANGE_INVALID;
+            continue;
+        }
+        texture->palette_length = palette_length;
+        const uint8_t *palette_content = d->vram_ptr + palette_addr;
+        texture->palette_hash = pgraph_gl_fi_content_hash(
+            palette_content, texture->palette_length);
+        texture->palette_id = xemu_frameinspect_capture_resource(
+            FI_RESK_PALETTE, palette_content, texture->palette_length,
+            palette_addr);
+        if (texture->palette_id == FI_RES_INVALID) {
+            texture->flags |= FI_TEXTURE_FLAG_PALETTE_RESOURCE_UNAVAILABLE;
+        } else {
+            xemu_frameinspect_capture_batch_resource_ref(texture->palette_id);
+        }
+        bool palette_writers_truncated = false;
+        capture->num_palette_writers = pgraph_gl_fi_collect_writer_spans(
+            palette_addr, texture->palette_length, capture->palette_writers,
+            &palette_writers_truncated);
+        if (palette_writers_truncated) {
+            texture->flags |= FI_TEXTURE_FLAG_PALETTE_WRITERS_TRUNCATED;
+        }
+    }
+}
+
+static bool pgraph_gl_fi_attach_submission_textures(uint32_t draw_id)
+{
+    for (uint32_t i = 0; i < FI_DRAW_TEXTURE_COUNT; i++) {
+        const FIGLTextureCapture *capture = &fi_texture_capture[i];
+        if (capture->texture.status == FI_VALUE_UNAVAILABLE) {
+            continue;
+        }
+        FITextureStage texture = capture->texture;
+        if (capture->num_texture_writers) {
+            texture.writer_set =
+                xemu_frameinspect_capture_submission_writer_set(
+                    draw_id, capture->texture_writers,
+                    capture->num_texture_writers);
+            if (texture.writer_set == FI_DRAW_INVALID) {
+                texture.flags |= FI_TEXTURE_FLAG_WRITERS_TRUNCATED;
+            }
+        }
+        if (capture->num_palette_writers) {
+            texture.palette_writer_set =
+                xemu_frameinspect_capture_submission_writer_set(
+                    draw_id, capture->palette_writers,
+                    capture->num_palette_writers);
+            if (texture.palette_writer_set == FI_DRAW_INVALID) {
+                texture.flags |= FI_TEXTURE_FLAG_PALETTE_WRITERS_TRUNCATED;
+            }
+        }
+        if (!xemu_frameinspect_capture_submission_texture(
+                draw_id, i, &texture)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static bool pgraph_gl_fi_finish_vertex_submission(uint32_t draw_id)
@@ -110,6 +407,10 @@ static uint32_t pgraph_gl_fi_attach_submission_state(NV2AState *d,
         !xemu_frameinspect_capture_submission_resources(
             draw_id, color_gen, zeta_gen, regs_resource, program_resource,
             constants_resource)) {
+        xemu_frameinspect_capture_submission_abort(draw_id);
+        return FI_DRAW_INVALID;
+    }
+    if (!pgraph_gl_fi_attach_submission_textures(draw_id)) {
         xemu_frameinspect_capture_submission_abort(draw_id);
         return FI_DRAW_INVALID;
     }
@@ -402,72 +703,14 @@ void pgraph_gl_draw_begin(NV2AState *d)
     xemu_frameinspect_capture_begin_batch(color_gen, zeta_gen);
 
     pgraph_gl_bind_textures(d);
+    pgraph_gl_fi_prepare_textures(d);
 
     if (xemu_frameinspect_capture_state() == FI_CAP_CAPTURING) {
-        /* Snapshot the full PGRAPH register file and the textures this batch
-         * consumes (now that pgraph_gl_bind_textures() has resolved texture
-         * state), content-hash-deduplicated into fi_cap.resources and
-         * referenced from this batch. One 32 KiB register hash per draw is
-         * acceptable since capture only runs for a single frame. */
+        /* Snapshot the full PGRAPH register file. Texture resources and typed
+         * per-stage metadata were staged above from the resolved bind state. */
         uint32_t regs_res = xemu_frameinspect_capture_resource(
             FI_RESK_REGS, pg->regs_, sizeof(pg->regs_), 0);
         xemu_frameinspect_capture_batch_resource_ref(regs_res);
-
-        for (int i = 0; i < NV2A_MAX_TEXTURES; i++) {
-            /* Mirror pgraph_gl_bind_textures()'s enable check exactly. */
-            if (!pgraph_is_texture_enabled(pg, i)) {
-                continue;
-            }
-
-            TextureShape state = pgraph_get_texture_shape(pg, i);
-            hwaddr texture_vram_offset, palette_vram_offset;
-            size_t length, palette_length;
-            length = pgraph_get_texture_length(pg, &state);
-            texture_vram_offset = pgraph_get_texture_phys_addr(pg, i);
-            palette_vram_offset = pgraph_get_texture_palette_phys_addr_length(
-                pg, i, &palette_length);
-
-            if (length == 0 || length > (16u << 20) ||
-                texture_vram_offset + length > memory_region_size(d->vram)) {
-                /* Absurd/zero length, or texture read would exceed VRAM bounds:
-                 * skip rather than snapshot garbage. This bounds the reads
-                 * independently of bind_textures' assert. Missing, never wrong. */
-                continue;
-            }
-
-            SurfaceBinding *surface =
-                pgraph_gl_surface_get(d, texture_vram_offset);
-            bool rt_backed = surface &&
-                pgraph_gl_check_surface_to_texture_compatibility(surface,
-                                                                  &state);
-
-            uint32_t tex_res;
-            if (rt_backed) {
-                /* Rendered surface: its guest-RAM bytes are stale/invalid, so
-                 * record a dependency reference instead of reading VRAM. */
-                tex_res = xemu_frameinspect_capture_resource(
-                    FI_RESK_TEXTURE_RTREF, NULL, 0, surface->vram_addr);
-                xemu_frameinspect_capture_batch_resource_ref(tex_res);
-            } else {
-                uint64_t meta = ((uint64_t)state.color_format << 32) |
-                                 ((uint64_t)state.width << 16) | state.height;
-                tex_res = xemu_frameinspect_capture_resource(
-                    FI_RESK_TEXTURE, d->vram_ptr + texture_vram_offset,
-                    (uint32_t)length, meta);
-                xemu_frameinspect_capture_batch_resource_ref(tex_res);
-
-                bool is_indexed = (state.color_format ==
-                    NV097_SET_TEXTURE_FORMAT_COLOR_SZ_I8_A8R8G8B8);
-                if (is_indexed && palette_length > 0 &&
-                    palette_vram_offset + palette_length <= memory_region_size(d->vram)) {
-                    /* Palette read bounds-checked independently of bind_textures' assert. */
-                    uint32_t pal_res = xemu_frameinspect_capture_resource(
-                        FI_RESK_PALETTE, d->vram_ptr + palette_vram_offset,
-                        (uint32_t)palette_length, palette_vram_offset);
-                    xemu_frameinspect_capture_batch_resource_ref(pal_res);
-                }
-            }
-        }
     }
 
     pgraph_gl_bind_shaders(pg);
