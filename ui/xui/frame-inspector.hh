@@ -63,6 +63,12 @@ public:
     unsigned m_isolate_tex = 0;
     int m_isolate_w = 0, m_isolate_h = 0;
     bool m_isolate_batch = false;
+    unsigned m_texture_preview[4] = {};
+    int m_texture_preview_w[4] = {};
+    int m_texture_preview_h[4] = {};
+    uint8_t m_texture_preview_status[4] = {};
+    uint64_t m_texture_preview_capture = 0;
+    int m_texture_preview_submission = -1;
     /* Pixel pinned by clicking the frame image; consumed by the Pixels tab
      * added in Task 4. */
     int m_pinned_pixel = -1;

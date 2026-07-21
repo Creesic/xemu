@@ -31,6 +31,8 @@ extern "C" {
 #include "../../xemu-frameinspect.h"
 #include "../../xemu-frameinspect-symbols.h"
 #include "../../hw/xbox/nv2a/nv2a_regs.h"
+#include "../../hw/xbox/nv2a/pgraph/swizzle.h"
+#include "../../hw/xbox/nv2a/pgraph/s3tc.h"
 #include "../xemu-settings.h"
 }
 
@@ -3192,6 +3194,12 @@ void FrameInspectorWindow::ReleaseTexture()
         GLuint tex = (GLuint)m_isolate_tex;
         glDeleteTextures(1, &tex);
     }
+    for (uint32_t i = 0; i < FI_DRAW_TEXTURE_COUNT; i++) {
+        if (m_texture_preview[i]) {
+            GLuint tex = (GLuint)m_texture_preview[i];
+            glDeleteTextures(1, &tex);
+        }
+    }
     m_frame_tex = 0;
     m_frame_w = 0;
     m_frame_h = 0;
@@ -3202,6 +3210,13 @@ void FrameInspectorWindow::ReleaseTexture()
     m_target_changed_pixels = 0;
     m_isolate_tex = 0;
     m_isolate_w = m_isolate_h = 0;
+    memset(m_texture_preview, 0, sizeof(m_texture_preview));
+    memset(m_texture_preview_w, 0, sizeof(m_texture_preview_w));
+    memset(m_texture_preview_h, 0, sizeof(m_texture_preview_h));
+    memset(m_texture_preview_status, 0,
+           sizeof(m_texture_preview_status));
+    m_texture_preview_capture = 0;
+    m_texture_preview_submission = -1;
 }
 
 static void fi_clear_target(FrameInspectorWindow *w)
@@ -3238,6 +3253,726 @@ static void fi_show_final_frame(FrameInspectorWindow *w, const FICapture *cap)
         gen >= 0 && cap->hist && (uint32_t)gen < cap->hist_count ?
             fi_colorhist_num_events(&cap->hist[gen]) : 0;
     w->UploadFrame(cap, gen, num_ev ? num_ev - 1 : 0);
+}
+
+enum {
+    FI_TEXTURE_PREVIEW_NONE,
+    FI_TEXTURE_PREVIEW_READY,
+    FI_TEXTURE_PREVIEW_UNSUPPORTED,
+    FI_TEXTURE_PREVIEW_INVALID,
+    FI_TEXTURE_PREVIEW_NO_HISTORY,
+};
+
+static const uint8_t *fi_resource_bytes(const FICapture *cap,
+                                        uint32_t resource_id,
+                                        uint32_t expected_kind,
+                                        uint32_t *length)
+{
+    if (resource_id >= cap->resources.num_res) {
+        return nullptr;
+    }
+    const FIResource *resource = &cap->resources.res[resource_id];
+    if (resource->kind != expected_kind ||
+        resource->off > cap->resources.blob_used ||
+        resource->len > cap->resources.blob_used - resource->off) {
+        return nullptr;
+    }
+    *length = resource->len;
+    return cap->resources.blob + resource->off;
+}
+
+static bool fi_latest_surface_writer_event(const FICapture *cap,
+                                           uint32_t generation,
+                                           uint32_t before_event,
+                                           uint32_t *event_out)
+{
+    uint32_t limit = std::min(before_event, cap->events.count);
+    for (uint32_t i = limit; i-- > 0;) {
+        const FIEvent *event = &cap->events.events[i];
+        if (event->surface_gen == generation &&
+            event->kind != FI_EV_SCANOUT) {
+            *event_out = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool fi_reconstruct_surface_before(const FICapture *cap,
+                                          uint32_t generation,
+                                          uint32_t before_event,
+                                          std::vector<uint32_t> *pixels,
+                                          uint32_t *width, uint32_t *height)
+{
+    if (!cap->hist || generation >= cap->hist_count) {
+        return false;
+    }
+    const FIColorHist *history = &cap->hist[generation];
+    if (!history->width || !history->height) {
+        return false;
+    }
+    uint32_t history_event = FI_EVENT_INVALID;
+    for (uint32_t i = 0; i < history->num_events; i++) {
+        if (history->events[i].event_id >= before_event) {
+            break;
+        }
+        history_event = i;
+    }
+    if (history_event == FI_EVENT_INVALID) {
+        return false;
+    }
+    pixels->resize((size_t)history->width * history->height);
+    if (!fi_colorhist_reconstruct(history, history_event, pixels->data())) {
+        pixels->clear();
+        return false;
+    }
+    *width = history->width;
+    *height = history->height;
+    return true;
+}
+
+static void fi_store_rgba(uint32_t *pixel, uint8_t r, uint8_t g, uint8_t b,
+                          uint8_t a)
+{
+    *pixel = (uint32_t)r | (uint32_t)g << 8 | (uint32_t)b << 16 |
+             (uint32_t)a << 24;
+}
+
+static uint32_t fi_texture_preview_bytes_per_pixel(uint16_t format)
+{
+    switch (format) {
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_Y8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_AY8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_Y8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_AY8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_I8_A8R8G8B8:
+        return 1;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A1R5G5B5:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_X1R5G5B5:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A4R4G4B4:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R5G6B5:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A1R5G5B5:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X1R5G5B5:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A4R4G4B4:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R5G6B5:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8Y8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8Y8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_G8B8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_G8B8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8B8:
+        return 2;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G8B8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_X8R8G8B8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8B8G8R8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_B8G8R8A8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8G8B8A8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8B8G8R8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_B8G8R8A8:
+    case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8:
+        return 4;
+    default:
+        return 0;
+    }
+}
+
+static bool fi_decode_texture_preview(const FICapture *cap,
+                                      const FITextureStage *texture,
+                                      std::vector<uint32_t> *pixels)
+{
+    if (!texture->width || !texture->height || texture->dimensionality != 2 ||
+        (texture->flags & FI_TEXTURE_FLAG_BORDER) ||
+        (uint64_t)texture->width * texture->height > (1u << 24)) {
+        return false;
+    }
+    uint32_t resource_length = 0;
+    const uint8_t *resource = fi_resource_bytes(
+        cap, texture->resource_id, FI_RESK_TEXTURE, &resource_length);
+    if (!resource || resource_length < texture->content_length) {
+        return false;
+    }
+
+    enum S3TC_DECOMPRESS_FORMAT compressed_format;
+    uint32_t block_size = 0;
+    switch (texture->format) {
+    case NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT1_A1R5G5B5:
+        compressed_format = S3TC_DECOMPRESS_FORMAT_DXT1;
+        block_size = 8;
+        break;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT23_A8R8G8B8:
+        compressed_format = S3TC_DECOMPRESS_FORMAT_DXT3;
+        block_size = 16;
+        break;
+    case NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT45_A8R8G8B8:
+        compressed_format = S3TC_DECOMPRESS_FORMAT_DXT5;
+        block_size = 16;
+        break;
+    default:
+        break;
+    }
+    if (block_size) {
+        uint64_t required = ((texture->width + 3) / 4) *
+                            ((texture->height + 3) / 4) * block_size;
+        if (required > resource_length) {
+            return false;
+        }
+        uint8_t *decoded = s3tc_decompress_2d(
+            compressed_format, resource, texture->width, texture->height);
+        if (!decoded) {
+            return false;
+        }
+        pixels->resize((size_t)texture->width * texture->height);
+        memcpy(pixels->data(), decoded, pixels->size() * sizeof(uint32_t));
+        g_free(decoded);
+        return true;
+    }
+
+    uint32_t bytes_per_pixel =
+        fi_texture_preview_bytes_per_pixel(texture->format);
+    if (!bytes_per_pixel) {
+        return false;
+    }
+    uint64_t row_bytes = (uint64_t)texture->width * bytes_per_pixel;
+    uint64_t linear_bytes = row_bytes * texture->height;
+    if (linear_bytes > SIZE_MAX) {
+        return false;
+    }
+    std::vector<uint8_t> linear((size_t)linear_bytes);
+    if (texture->layout == FI_TEXTURE_LAYOUT_LINEAR) {
+        uint32_t pitch = texture->pitch ? texture->pitch : row_bytes;
+        uint64_t required = (uint64_t)pitch * texture->height;
+        if (pitch < row_bytes || required > resource_length) {
+            return false;
+        }
+        for (uint32_t y = 0; y < texture->height; y++) {
+            memcpy(linear.data() + y * row_bytes, resource + y * pitch,
+                   (size_t)row_bytes);
+        }
+    } else {
+        if (linear_bytes > resource_length) {
+            return false;
+        }
+        unswizzle_rect(resource, texture->width, texture->height,
+                       linear.data(), (unsigned int)row_bytes,
+                       bytes_per_pixel);
+    }
+
+    pixels->resize((size_t)texture->width * texture->height);
+    if (texture->format ==
+        NV097_SET_TEXTURE_FORMAT_COLOR_SZ_I8_A8R8G8B8) {
+        uint32_t palette_length = 0;
+        const uint8_t *palette = fi_resource_bytes(
+            cap, texture->palette_id, FI_RESK_PALETTE, &palette_length);
+        if (!palette || palette_length < 4) {
+            return false;
+        }
+        for (size_t i = 0; i < pixels->size(); i++) {
+            uint32_t offset = (uint32_t)linear[i] * 4;
+            if (offset > palette_length || 4 > palette_length - offset) {
+                return false;
+            }
+            uint32_t color = fi_nv2a_read_le32(palette + offset);
+            fi_store_rgba(&(*pixels)[i], color >> 16, color >> 8, color,
+                          color >> 24);
+        }
+        return true;
+    }
+
+    for (size_t i = 0; i < pixels->size(); i++) {
+        const uint8_t *source = linear.data() + i * bytes_per_pixel;
+        uint8_t r, g, b, a;
+        switch (texture->format) {
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_Y8:
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_Y8:
+            r = g = b = source[0]; a = 255;
+            break;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_AY8:
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_AY8:
+            r = g = b = a = source[0];
+            break;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8:
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8:
+            r = g = b = 255; a = source[0];
+            break;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8Y8:
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8Y8:
+            r = g = b = source[0]; a = source[1];
+            break;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_G8B8:
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_G8B8:
+            r = b = source[0]; g = a = source[1];
+            break;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8B8:
+            r = a = source[1]; g = b = source[0];
+            break;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A1R5G5B5:
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_X1R5G5B5:
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A1R5G5B5:
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X1R5G5B5: {
+            uint16_t value = fi_nv2a_read_le16(source);
+            r = ((value >> 10) & 0x1f) * 255 / 31;
+            g = ((value >> 5) & 0x1f) * 255 / 31;
+            b = (value & 0x1f) * 255 / 31;
+            a = (texture->format ==
+                     NV097_SET_TEXTURE_FORMAT_COLOR_SZ_X1R5G5B5 ||
+                 texture->format ==
+                     NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X1R5G5B5) ?
+                    255 : (value & 0x8000 ? 255 : 0);
+            break;
+        }
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A4R4G4B4:
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A4R4G4B4: {
+            uint16_t value = fi_nv2a_read_le16(source);
+            r = ((value >> 8) & 0xf) * 17;
+            g = ((value >> 4) & 0xf) * 17;
+            b = (value & 0xf) * 17;
+            a = ((value >> 12) & 0xf) * 17;
+            break;
+        }
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R5G6B5:
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R5G6B5: {
+            uint16_t value = fi_nv2a_read_le16(source);
+            r = ((value >> 11) & 0x1f) * 255 / 31;
+            g = ((value >> 5) & 0x3f) * 255 / 63;
+            b = (value & 0x1f) * 255 / 31;
+            a = 255;
+            break;
+        }
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8R8G8B8:
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8:
+            b = source[0]; g = source[1]; r = source[2]; a = source[3];
+            break;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_X8R8G8B8:
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8:
+            b = source[0]; g = source[1]; r = source[2]; a = 255;
+            break;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_A8B8G8R8:
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8B8G8R8:
+            r = source[0]; g = source[1]; b = source[2]; a = source[3];
+            break;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_B8G8R8A8:
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_B8G8R8A8:
+            a = source[0]; r = source[1]; g = source[2]; b = source[3];
+            break;
+        case NV097_SET_TEXTURE_FORMAT_COLOR_SZ_R8G8B8A8:
+        case NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R8G8B8A8:
+            a = source[0]; b = source[1]; g = source[2]; r = source[3];
+            break;
+        default:
+            pixels->clear();
+            return false;
+        }
+        fi_store_rgba(&(*pixels)[i], r, g, b, a);
+    }
+    return true;
+}
+
+static void fi_release_texture_previews(FrameInspectorWindow *w)
+{
+    for (uint32_t i = 0; i < FI_DRAW_TEXTURE_COUNT; i++) {
+        if (w->m_texture_preview[i]) {
+            GLuint texture = (GLuint)w->m_texture_preview[i];
+            glDeleteTextures(1, &texture);
+        }
+        w->m_texture_preview[i] = 0;
+        w->m_texture_preview_w[i] = 0;
+        w->m_texture_preview_h[i] = 0;
+        w->m_texture_preview_status[i] = FI_TEXTURE_PREVIEW_NONE;
+    }
+}
+
+static void fi_update_texture_previews(FrameInspectorWindow *w,
+                                       const FICapture *cap,
+                                       const FIDrawSubmission *draw)
+{
+    if (w->m_texture_preview_capture == cap->capture_id &&
+        w->m_texture_preview_submission == w->m_selected_submission) {
+        return;
+    }
+    fi_release_texture_previews(w);
+    w->m_texture_preview_capture = cap->capture_id;
+    w->m_texture_preview_submission = w->m_selected_submission;
+    for (uint32_t stage = 0; stage < FI_DRAW_TEXTURE_COUNT; stage++) {
+        const FITextureStage *texture = &draw->textures[stage];
+        if (texture->status == FI_VALUE_UNAVAILABLE) {
+            continue;
+        }
+        std::vector<uint32_t> pixels;
+        uint32_t width = texture->width;
+        uint32_t height = texture->height;
+        if (texture->flags & FI_TEXTURE_FLAG_RT_BACKED) {
+            if (texture->producer_surface_gen == FI_DRAW_INVALID ||
+                !fi_reconstruct_surface_before(
+                    cap, texture->producer_surface_gen, draw->batch_event,
+                    &pixels, &width, &height)) {
+                w->m_texture_preview_status[stage] =
+                    FI_TEXTURE_PREVIEW_NO_HISTORY;
+                continue;
+            }
+        } else if (!fi_decode_texture_preview(cap, texture, &pixels)) {
+            w->m_texture_preview_status[stage] =
+                (texture->flags & (FI_TEXTURE_FLAG_RANGE_INVALID |
+                                   FI_TEXTURE_FLAG_RESOURCE_UNAVAILABLE |
+                                   FI_TEXTURE_FLAG_PALETTE_RANGE_INVALID |
+                                   FI_TEXTURE_FLAG_PALETTE_RESOURCE_UNAVAILABLE)) ?
+                    FI_TEXTURE_PREVIEW_INVALID :
+                    FI_TEXTURE_PREVIEW_UNSUPPORTED;
+            continue;
+        }
+        w->m_texture_preview[stage] = fi_upload_rgba_texture(
+            pixels.data(), width, height);
+        w->m_texture_preview_w[stage] = width;
+        w->m_texture_preview_h[stage] = height;
+        w->m_texture_preview_status[stage] = FI_TEXTURE_PREVIEW_READY;
+    }
+}
+
+static const char *fi_texture_layout_name(uint8_t layout)
+{
+    switch (layout) {
+    case FI_TEXTURE_LAYOUT_SWIZZLED: return "swizzled";
+    case FI_TEXTURE_LAYOUT_LINEAR: return "linear";
+    case FI_TEXTURE_LAYOUT_CUBEMAP: return "cube map";
+    default: return "unknown";
+    }
+}
+
+static const char *fi_texture_address_name(uint8_t address)
+{
+    switch (address) {
+    case 1: return "wrap";
+    case 2: return "mirror";
+    case 3: return "clamp-to-edge";
+    case 4: return "border";
+    case 5: return "clamp";
+    default: return "invalid";
+    }
+}
+
+static void fi_select_capture_event(FrameInspectorWindow *w,
+                                    const FICapture *cap, uint32_t event_id)
+{
+    if (event_id >= cap->events.count) {
+        return;
+    }
+    w->m_selected_event = event_id;
+    w->m_pinned_pixel = -1;
+    w->m_pinned_gen = -1;
+    fi_show_event(w, cap, event_id);
+}
+
+static void fi_texture_writer_summary(const FICapture *cap, uint32_t set_id,
+                                      const char *name)
+{
+    if (set_id == FI_DRAW_INVALID || set_id >= cap->draws.num_writer_sets) {
+        ImGui::TextDisabled("%s writers: unavailable", name);
+        return;
+    }
+    const FIWriterCoverage *coverage =
+        &cap->draws.writer_sets[set_id].coverage;
+    ImGui::Text("%s writers: total=%llu attributed=%llu partial=%llu "
+                "unattributed=%llu omitted=%llu truncated=%llu", name,
+                (unsigned long long)coverage->total_bytes,
+                (unsigned long long)coverage->attributed_bytes,
+                (unsigned long long)coverage->partial_bytes,
+                (unsigned long long)coverage->unattributed_bytes,
+                (unsigned long long)coverage->omitted_bytes,
+                (unsigned long long)coverage->truncated_bytes);
+}
+
+static void fi_textures_tab(FrameInspectorWindow *w, const FICapture *cap,
+                            const FIDrawSubmission *draw)
+{
+    fi_update_texture_previews(w, cap, draw);
+    for (uint32_t stage = 0; stage < FI_DRAW_TEXTURE_COUNT; stage++) {
+        const FITextureStage *texture = &draw->textures[stage];
+        ImGui::PushID((int)stage);
+        bool available = texture->status != FI_VALUE_UNAVAILABLE;
+        ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_SpanAvailWidth;
+        if (available) {
+            flags |= ImGuiTreeNodeFlags_DefaultOpen;
+        }
+        if (ImGui::TreeNodeEx("texture_stage", flags, "Stage %u: %s", stage,
+                              available ? "enabled" : "unavailable")) {
+            if (!available) {
+                ImGui::TextDisabled("No texture was enabled for this stage.");
+                ImGui::TreePop();
+                ImGui::PopID();
+                continue;
+            }
+            ImGui::Text("%ux%ux%u, %uD, format=0x%02x, %s, mip %u-%u/%u",
+                        texture->width, texture->height, texture->depth,
+                        texture->dimensionality, texture->format,
+                        fi_texture_layout_name(texture->layout),
+                        texture->min_mip_level, texture->max_mip_level,
+                        texture->mip_count);
+            ImGui::Text("DMA %c object=0x%08x offset=0x%08x phys=0x%llx "
+                        "length=%u pitch=%u",
+                        texture->dma_select ? 'B' : 'A', texture->dma_object,
+                        texture->guest_offset,
+                        (unsigned long long)texture->guest_addr,
+                        texture->content_length, texture->pitch);
+            ImGui::Text("Address: U=%s V=%s P=%s raw=0x%08x",
+                        fi_texture_address_name(texture->address_u),
+                        fi_texture_address_name(texture->address_v),
+                        fi_texture_address_name(texture->address_p),
+                        texture->address_raw);
+            uint16_t signed_flags = texture->flags &
+                (FI_TEXTURE_FLAG_SIGNED_A | FI_TEXTURE_FLAG_SIGNED_R |
+                 FI_TEXTURE_FLAG_SIGNED_G | FI_TEXTURE_FLAG_SIGNED_B);
+            ImGui::Text("Filter: min=0x%02x mag=0x%02x raw=0x%08x; "
+                        "signed=%s%s%s%s%s", texture->min_filter,
+                        texture->mag_filter, texture->filter_raw,
+                        signed_flags ? "" : "none",
+                        texture->flags & FI_TEXTURE_FLAG_SIGNED_A ? "A" : "",
+                        texture->flags & FI_TEXTURE_FLAG_SIGNED_R ? "R" : "",
+                        texture->flags & FI_TEXTURE_FLAG_SIGNED_G ? "G" : "",
+                        texture->flags & FI_TEXTURE_FLAG_SIGNED_B ? "B" : "");
+            ImGui::Text("Content resource=%s hash=0x%016llx flags=0x%04x",
+                        texture->resource_id == FI_DRAW_INVALID ?
+                            "unavailable" : "captured",
+                        (unsigned long long)texture->content_hash,
+                        texture->flags);
+            fi_texture_writer_summary(cap, texture->writer_set, "Texture");
+            if (texture->palette_id != FI_DRAW_INVALID ||
+                texture->palette_length) {
+                ImGui::Text("Palette: DMA %c object=0x%08x offset=0x%08x "
+                            "phys=0x%llx length=%u resource=%u hash=0x%016llx",
+                            texture->palette_dma_select ? 'B' : 'A',
+                            texture->palette_dma_object,
+                            texture->palette_offset,
+                            (unsigned long long)texture->palette_addr,
+                            texture->palette_length, texture->palette_id,
+                            (unsigned long long)texture->palette_hash);
+                fi_texture_writer_summary(cap, texture->palette_writer_set,
+                                          "Palette");
+            }
+            if (texture->flags & FI_TEXTURE_FLAG_RT_BACKED) {
+                ImGui::TextColored(
+                    ImVec4(0.4f, 0.8f, 1.0f, 1.0f),
+                    "Render-target backed: surface generation %u",
+                    texture->producer_surface_gen);
+                uint32_t producer_event;
+                if (texture->producer_surface_gen != FI_DRAW_INVALID &&
+                    fi_latest_surface_writer_event(
+                        cap, texture->producer_surface_gen,
+                        draw->batch_event, &producer_event)) {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Select producer")) {
+                        fi_select_capture_event(w, cap, producer_event);
+                    }
+                    ImGui::SameLine();
+                    uint32_t producer_submission = FI_DRAW_INVALID;
+                    for (uint32_t i = 0; i < cap->draws.num_submissions; i++) {
+                        if (cap->draws.submissions[i].batch_event ==
+                            producer_event) {
+                            producer_submission =
+                                cap->draws.submissions[i].submit_index;
+                            break;
+                        }
+                    }
+                    if (producer_submission == FI_DRAW_INVALID) {
+                        ImGui::TextDisabled("event #%u", producer_event);
+                    } else {
+                        ImGui::TextDisabled("event #%u submission #%u",
+                                            producer_event,
+                                            producer_submission);
+                    }
+                } else {
+                    ImGui::TextDisabled("Producer event unavailable.");
+                }
+            }
+
+            switch (w->m_texture_preview_status[stage]) {
+            case FI_TEXTURE_PREVIEW_READY: {
+                float max_size = 260.0f * g_viewport_mgr.m_scale;
+                float scale = std::min(
+                    max_size / w->m_texture_preview_w[stage],
+                    max_size / w->m_texture_preview_h[stage]);
+                scale = std::min(scale, 1.0f * g_viewport_mgr.m_scale);
+                ImGui::Image(
+                    (ImTextureID)(intptr_t)w->m_texture_preview[stage],
+                    ImVec2(w->m_texture_preview_w[stage] * scale,
+                           w->m_texture_preview_h[stage] * scale));
+                break;
+            }
+            case FI_TEXTURE_PREVIEW_NO_HISTORY:
+                ImGui::TextDisabled(
+                    "Preview unavailable: producer color history missing.");
+                break;
+            case FI_TEXTURE_PREVIEW_INVALID:
+                ImGui::TextDisabled(
+                    "Preview unavailable: captured range/resource invalid.");
+                break;
+            case FI_TEXTURE_PREVIEW_UNSUPPORTED:
+                ImGui::TextDisabled(
+                    "Preview unsupported for this captured layout/format.");
+                break;
+            default:
+                ImGui::TextDisabled("No immutable preview data.");
+                break;
+            }
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+}
+
+static bool fi_surface_shape_match(const FISurfaceKey *a,
+                                   const FISurfaceKey *b)
+{
+    return a->size == b->size && a->format == b->format &&
+           a->pitch == b->pitch &&
+           a->width == b->width && a->height == b->height &&
+           a->aa == b->aa && a->scale == b->scale &&
+           a->swizzle == b->swizzle &&
+           a->color == b->color && a->z_format == b->z_format;
+}
+
+static void fi_target_event_link(FrameInspectorWindow *w,
+                                 const FICapture *cap, uint32_t event_id)
+{
+    ImGui::PushID((int)event_id);
+    char label[64];
+    snprintf(label, sizeof(label), "#%u %s", event_id,
+             ev_kind_name(cap->events.events[event_id].kind));
+    if (ImGui::Selectable(label, (int)event_id == w->m_selected_event)) {
+        fi_select_capture_event(w, cap, event_id);
+    }
+    ImGui::PopID();
+}
+
+static void fi_render_target_navigation(FrameInspectorWindow *w,
+                                        const FICapture *cap,
+                                        const FIDrawSubmission *draw,
+                                        const char *name, uint32_t generation)
+{
+    if (generation == FI_DRAW_INVALID ||
+        generation >= cap->surfaces.num_gens) {
+        ImGui::TextDisabled("%s target unavailable.", name);
+        return;
+    }
+    const FISurfaceGen *surface = &cap->surfaces.gens[generation];
+    const FISurfaceKey *key = &surface->key;
+    ImGui::PushID((int)generation);
+    if (ImGui::TreeNodeEx("target", ImGuiTreeNodeFlags_DefaultOpen |
+                                       ImGuiTreeNodeFlags_SpanAvailWidth,
+                          "%s gen %u: guest 0x%llx, %ux%u", name,
+                          generation, (unsigned long long)key->addr,
+                          key->width, key->height)) {
+        ImGui::Text("size=0x%llx pitch=%u format=0x%x AA=0x%x generation=%u%s",
+                    (unsigned long long)key->size, key->pitch, key->format,
+                    key->aa, surface->generation,
+                    surface->alias ? ", overlapping aliases captured" : "");
+        bool self_feedback = false;
+        for (uint32_t stage = 0; stage < FI_DRAW_TEXTURE_COUNT; stage++) {
+            self_feedback |=
+                draw->textures[stage].producer_surface_gen == generation;
+        }
+        if (self_feedback) {
+            ImGui::TextColored(ImVec4(1, 0.6f, 0, 1),
+                               "Self-feedback: this submission samples its target.");
+        }
+
+        if (ImGui::TreeNode("producers", "Producer history")) {
+            bool any = false;
+            for (uint32_t i = 0; i < cap->events.count; i++) {
+                if (cap->events.events[i].surface_gen == generation &&
+                    cap->events.events[i].kind != FI_EV_SCANOUT) {
+                    any = true;
+                    fi_target_event_link(w, cap, i);
+                }
+            }
+            if (!any) ImGui::TextDisabled("No producer events.");
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("clears", "Clear history")) {
+            bool any = false;
+            for (uint32_t i = 0; i < cap->events.count; i++) {
+                if (cap->events.events[i].surface_gen == generation &&
+                    cap->events.events[i].kind == FI_EV_CLEAR) {
+                    any = true;
+                    fi_target_event_link(w, cap, i);
+                }
+            }
+            if (!any) ImGui::TextDisabled("No captured clears.");
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("consumers", "Later sampling submissions")) {
+            bool any = false;
+            for (uint32_t i = 0; i < cap->draws.num_submissions; i++) {
+                const FIDrawSubmission *consumer = &cap->draws.submissions[i];
+                if (consumer->batch_event <= draw->batch_event) {
+                    continue;
+                }
+                for (uint32_t stage = 0; stage < FI_DRAW_TEXTURE_COUNT;
+                     stage++) {
+                    if (consumer->textures[stage].producer_surface_gen !=
+                        generation) {
+                        continue;
+                    }
+                    any = true;
+                    ImGui::PushID((int)i * FI_DRAW_TEXTURE_COUNT + stage);
+                    char label[96];
+                    snprintf(label, sizeof(label),
+                             "event #%u submission #%u stage %u",
+                             consumer->batch_event, consumer->submit_index,
+                             stage);
+                    if (ImGui::Selectable(label, false)) {
+                        fi_select_capture_event(w, cap,
+                                                consumer->batch_event);
+                    }
+                    ImGui::PopID();
+                }
+            }
+            if (!any) ImGui::TextDisabled("No later sampled uses.");
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("aliases", "Aliases and rebinds")) {
+            bool any = false;
+            uint64_t end = key->addr + key->size;
+            for (uint32_t i = 0; i < cap->surfaces.num_gens; i++) {
+                if (i == generation) continue;
+                const FISurfaceKey *other = &cap->surfaces.gens[i].key;
+                uint64_t other_end = other->addr + other->size;
+                if (key->addr >= other_end || other->addr >= end) continue;
+                any = true;
+                ImGui::Text("gen %u: 0x%llx-0x%llx, %s", i,
+                            (unsigned long long)other->addr,
+                            (unsigned long long)other_end,
+                            fi_surface_shape_match(key, other) ?
+                                "shape-compatible alias" :
+                                "overlap/rebind, distinct shape");
+            }
+            if (!any) ImGui::TextDisabled("No overlapping generations.");
+            ImGui::TreePop();
+        }
+        bool scanout = false;
+        for (uint32_t i = 0; i < cap->events.count; i++) {
+            if (cap->events.events[i].kind == FI_EV_SCANOUT &&
+                cap->events.events[i].surface_gen == generation) {
+                scanout = true;
+                ImGui::Text("Scanout relationship: presented by event #%u", i);
+            }
+        }
+        if (!scanout) {
+            ImGui::TextDisabled("Scanout relationship: not directly presented.");
+        }
+        ImGui::TreePop();
+    }
+    ImGui::PopID();
+}
+
+static void fi_targets_tab(FrameInspectorWindow *w, const FICapture *cap,
+                           const FIDrawSubmission *draw)
+{
+    fi_render_target_navigation(w, cap, draw, "Color",
+                                draw->color_surface_gen);
+    fi_render_target_navigation(w, cap, draw, "Zeta",
+                                draw->zeta_surface_gen);
 }
 
 /* Resolve a render-target texture reference to the latest earlier writer at
@@ -3918,6 +4653,14 @@ void FrameInspectorWindow::Draw()
                 }
                 if (submission && ImGui::BeginTabItem("Combiner")) {
                     fi_combiner_tab(this, cap, submission);
+                    ImGui::EndTabItem();
+                }
+                if (submission && ImGui::BeginTabItem("Textures")) {
+                    fi_textures_tab(this, cap, submission);
+                    ImGui::EndTabItem();
+                }
+                if (submission && ImGui::BeginTabItem("Targets")) {
+                    fi_targets_tab(this, cap, submission);
                     ImGui::EndTabItem();
                 }
                 if (submission && ImGui::BeginTabItem("Call Paths")) {
