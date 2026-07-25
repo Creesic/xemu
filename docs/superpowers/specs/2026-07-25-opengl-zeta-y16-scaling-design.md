@@ -1,7 +1,7 @@
 # OpenGL Scaled Zeta-to-Y16 Alias Fix — Design
 
 **Date:** 2026-07-25
-**Status:** Approved (pending written-spec review)
+**Status:** Implemented; in-game visual verification pending
 
 ## Goal
 
