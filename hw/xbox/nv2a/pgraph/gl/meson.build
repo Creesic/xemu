@@ -8,6 +8,7 @@ specific_ss.add([sdl, gloffscreen, files(
 	'reports.c',
 	'shaders.c',
 	'surface.c',
+	'surface-texture-compat.c',
 	'texture.c',
 	'vertex.c',
 	)])

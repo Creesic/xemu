@@ -25,6 +25,7 @@
 #include "hw/xbox/nv2a/pgraph/swizzle.h"
 #include "debug.h"
 #include "renderer.h"
+#include "surface-texture-compat.h"
 #include "xemu-frameinspect-capture.h"
 
 static void surface_download(NV2AState *d, SurfaceBinding *surface, bool force);
@@ -388,6 +389,31 @@ bool pgraph_gl_check_surface_to_texture_compatibility(
     const TextureShape *shape)
 {
     // FIXME: Better checks/handling on formats and surface-texture compat
+
+    assert(shape->color_format <
+           ARRAY_SIZE(kelvin_color_format_info_map));
+    const BasicColorFormatInfo *texture_info =
+        &kelvin_color_format_info_map[shape->color_format];
+    PGRAPHGLSurfaceTextureLayout layout = {
+        .surface_color = surface->color,
+        .surface_swizzled = surface->swizzle,
+        .surface_width = surface->width,
+        .surface_height = surface->height,
+        .surface_pitch = surface->pitch,
+        .surface_bytes_per_pixel = surface->fmt.bytes_per_pixel,
+        .texture_linear = texture_info->linear,
+        .texture_cubemap = shape->cubemap,
+        .texture_levels = shape->levels,
+        .texture_color_format = shape->color_format,
+        .texture_width = shape->width,
+        .texture_height = shape->height,
+        .texture_pitch = shape->pitch,
+        .texture_bytes_per_pixel = texture_info->bytes_per_pixel,
+    };
+
+    if (pgraph_gl_zeta_to_y16_compatible(&layout)) {
+        return true;
+    }
 
     if ((!surface->swizzle && surface->pitch != shape->pitch) ||
         surface->width != shape->width ||

@@ -36,6 +36,9 @@ tests = {
   'test-rcu-slist': [],
   'test-qdist': [],
   'test-qht': [],
+  'test-nv2a-surface-texture-compat': [
+    '../../hw/xbox/nv2a/pgraph/gl/surface-texture-compat.c',
+  ],
   'test-qtree': [],
   'test-bitops': [],
   'test-bitcnt': [],
