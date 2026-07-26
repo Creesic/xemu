@@ -2,7 +2,13 @@
 
 An `.xct` file is a compact binary recording of a running Xbox game's function
 call graph, produced by xemu's **Debug → Call Trace** feature and read by
-`viewer.html`, `xct_dump.py`, and `make_test_xct.py`.
+`calltrace/viewer.html`, `calltrace/xct_dump.py`, and
+`calltrace/make_test_xct.py`.
+
+> This is **not** the Frame Inspector capture format, which also uses a `.xct`
+> extension but has a different magic (`XEMUXCT` / `XEMUFC`). See
+> `XFC_FORMAT.md` in this directory. Distinguish them by magic, not extension:
+> a call trace starts with `XCTR`.
 
 There are two versions:
 
@@ -298,7 +304,7 @@ async function inflateEvents(compBytes /* Uint8Array */) {
 
 ## Reference implementations
 
-- `xct_dump.py` — parse + validate + pretty-print any `.xct` (v1 or v2).
-- `make_test_xct.py` — build synthetic `.xct` fixtures (`--timed` for v2).
-- `viewer.html` — full parser in `parseXCT()` / `inflateEvents()`.
+- `calltrace/xct_dump.py` — parse + validate + pretty-print any `.xct` (v1 or v2).
+- `calltrace/make_test_xct.py` — build synthetic `.xct` fixtures (`--timed` for v2).
+- `calltrace/viewer.html` — full parser in `parseXCT()` / `inflateEvents()`.
 - The writer lives in xemu at `xemu-calltrace.c` (`xemu_calltrace_save`).
