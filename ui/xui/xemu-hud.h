@@ -34,6 +34,7 @@ extern "C" {
 int xemu_is_fullscreen(void);
 void xemu_toggle_fullscreen(void);
 SDL_Window *xemu_get_window(void);
+uintptr_t xemu_get_native_window_handle(void);
 void xemu_eject_disc(Error **errp);
 void xemu_load_disc(const char *path, Error **errp);
 void xemu_main_loop_lock(void);
@@ -43,7 +44,9 @@ void xemu_main_loop_unlock(void);
 void xemu_hud_init(SDL_Window *window, void *sdl_gl_context);
 void xemu_hud_cleanup(void);
 void xemu_hud_update(void);
+void xemu_hud_update_overlay(void);
 void xemu_hud_render(void);
+bool xemu_hud_get_draw_bounds(int *x, int *y, int *width, int *height);
 void xemu_hud_process_sdl_events(SDL_Event *event);
 void xemu_hud_should_capture_kbd_mouse(int *kbd, int *mouse);
 void xemu_hud_set_framebuffer_texture(GLuint tex, bool flip);

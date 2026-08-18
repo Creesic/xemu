@@ -183,8 +183,13 @@ endforeach
 # xemu Version
 ###########################################
 
-xemu_version_cmd = [find_program('scripts/xemu-version.sh'),
-                    meson.current_source_dir()]
+if host_os == 'windows'
+  xemu_version_cmd = [python, files('scripts/xemu-version.py'),
+                      meson.current_source_dir()]
+else
+  xemu_version_cmd = [find_program('scripts/xemu-version.sh'),
+                      meson.current_source_dir()]
+endif
 xemu_version = custom_target('xemu-version-macro.h',
                              output: 'xemu-version-macro.h',
                              command: xemu_version_cmd,

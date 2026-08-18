@@ -54,6 +54,7 @@
 #include "hw/i2c/smbus_eeprom.h"
 #include "hw/xbox/nv2a/nv2a.h"
 #include "hw/xbox/mcpx/apu/apu.h"
+#include "hw/xbox/d3d_hle/xemu_d3d_hle.h"
 
 #include "hw/xbox/xbox.h"
 #include "smbus.h"
@@ -254,6 +255,7 @@ void xbox_init_common(MachineState *machine,
 
     /* allocate ram and load rom/bios */
     xbox_memory_init(pcms, system_memory, rom_memory, &ram_memory);
+    xemu_d3d_hle_install(qemu_get_cpu(0), ram_memory);
 
     gsi_state = pc_gsi_create(&x86ms->gsi, pcmc->pci_enabled);
 

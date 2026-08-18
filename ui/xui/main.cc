@@ -18,6 +18,7 @@
 //
 
 #include <SDL3/SDL.h>
+#include <cfloat>
 #include <epoxy/gl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -189,7 +190,7 @@ void xemu_hud_set_framebuffer_texture(GLuint tex, bool flip)
     g_flip_req = flip;
 }
 
-void xemu_hud_update(void)
+static void xemu_hud_update_internal(bool render_framebuffer)
 {
     ImGuiIO& io = ImGui::GetIO();
     uint32_t now = SDL_GetTicks();
@@ -203,7 +204,7 @@ void xemu_hud_update(void)
         g_last_scale = g_viewport_mgr.m_scale;
     }
 
-    if (!first_boot_window.is_open) {
+    if (render_framebuffer && !first_boot_window.is_open) {
         int ww, wh;
         SDL_GetWindowSizeInPixels(xemu_get_window(), &ww, &wh);
         RenderFramebuffer(g_tex, ww, wh, g_flip_req);
@@ -322,6 +323,16 @@ void xemu_hud_update(void)
     // if (show_demo) ImGui::ShowDemoWindow(&show_demo);
 }
 
+void xemu_hud_update(void)
+{
+    xemu_hud_update_internal(true);
+}
+
+void xemu_hud_update_overlay(void)
+{
+    xemu_hud_update_internal(false);
+}
+
 void xemu_hud_render()
 {
     ImGui::Render();
@@ -336,4 +347,50 @@ void xemu_hud_render()
         SaveScreenshot(g_tex, g_flip_req);
         g_screenshot_pending = false;
     }
+}
+
+bool xemu_hud_get_draw_bounds(int *x, int *y, int *width, int *height)
+{
+    ImDrawData *draw_data = ImGui::GetDrawData();
+    float min_x = FLT_MAX;
+    float min_y = FLT_MAX;
+    float max_x = -FLT_MAX;
+    float max_y = -FLT_MAX;
+
+    if (!draw_data || !draw_data->Valid || draw_data->TotalVtxCount <= 0)
+        return false;
+    for (int list_index = 0; list_index < draw_data->CmdListsCount;
+         ++list_index) {
+        const ImDrawList *list = draw_data->CmdLists[list_index];
+        for (int vertex_index = 0; vertex_index < list->VtxBuffer.Size;
+             ++vertex_index) {
+            const ImVec2 &position = list->VtxBuffer[vertex_index].pos;
+            min_x = fminf(min_x, position.x);
+            min_y = fminf(min_y, position.y);
+            max_x = fmaxf(max_x, position.x);
+            max_y = fmaxf(max_y, position.y);
+        }
+    }
+
+    const float scale_x = draw_data->FramebufferScale.x;
+    const float scale_y = draw_data->FramebufferScale.y;
+    const int left = (int)floorf(
+        (min_x - draw_data->DisplayPos.x) * scale_x) - 1;
+    const int top = (int)floorf(
+        (min_y - draw_data->DisplayPos.y) * scale_y) - 1;
+    const int right = (int)ceilf(
+        (max_x - draw_data->DisplayPos.x) * scale_x) + 1;
+    const int bottom = (int)ceilf(
+        (max_y - draw_data->DisplayPos.y) * scale_y) + 1;
+    if (right <= left || bottom <= top)
+        return false;
+    if (x)
+        *x = left;
+    if (y)
+        *y = top;
+    if (width)
+        *width = right - left;
+    if (height)
+        *height = bottom - top;
+    return true;
 }

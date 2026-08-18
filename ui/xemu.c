@@ -53,6 +53,7 @@
 
 #include "hw/xbox/smbus.h" // For eject, drive tray
 #include "hw/xbox/nv2a/nv2a.h"
+#include "hw/xbox/d3d_hle/xemu_d3d_hle.h"
 #include "ui/xemu-notifications.h"
 
 #include <stb_image.h>
@@ -119,6 +120,50 @@ static QemuThread vblank_thread;
 static bool qemu_exiting;
 static int exit_status;
 
+#define XEMU_D3D_HLE_OVERLAY_INTERVAL_NS 16666666LL
+
+typedef struct XemuD3DHleOverlayGL {
+    GLuint draw_fbo;
+    GLuint draw_texture;
+    int draw_width;
+    int draw_height;
+    uint8_t *pixels;
+    size_t pixel_capacity;
+    uint64_t next_frame_ns;
+    bool failure_reported;
+    bool active_reported;
+} XemuD3DHleOverlayGL;
+
+static XemuD3DHleOverlayGL d3d_hle_overlay_gl;
+
+static void d3d_hle_update_window_title(SDL_Window *window)
+{
+    static XemuD3DHleStatus previous = (XemuD3DHleStatus)-1;
+    XemuD3DHleStatus current = xemu_d3d_hle_status();
+
+    if (!window || current == previous)
+        return;
+    previous = current;
+
+    const char *backend = xemu_d3d_hle_active_backend_name();
+    char *title;
+    if (current == XEMU_D3D_HLE_STATUS_ACTIVE && backend) {
+        title = g_strdup_printf("xemu | v%s"
+#ifdef XEMU_DEBUG_BUILD
+                                " Debug"
+#endif
+                                " | Plume (%s)", xemu_version, backend);
+    } else {
+        title = g_strdup_printf("xemu | v%s"
+#ifdef XEMU_DEBUG_BUILD
+                                " Debug"
+#endif
+                                , xemu_version);
+    }
+    SDL_SetWindowTitle(window, title);
+    g_free(title);
+}
+
 void tcg_register_init_ctx(void); // tcg.c
 
 #if DEBUG_XEMU_C
@@ -147,6 +192,18 @@ void xemu_main_loop_unlock(void)
 SDL_Window *xemu_get_window(void)
 {
     return m_window;
+}
+
+uintptr_t xemu_get_native_window_handle(void)
+{
+#if defined(_WIN32)
+    if (m_window) {
+        return (uintptr_t)SDL_GetPointerProperty(
+            SDL_GetWindowProperties(m_window),
+            SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+    }
+#endif
+    return 0;
 }
 
 static struct xemu_console *get_scon_from_window(uint32_t window_id)
@@ -800,10 +857,195 @@ static void report_stats(void)
  * Renders the main interface. Usually called from the main thread,
  * but may sometimes be called from another thread.
  */
+static void d3d_hle_overlay_gl_cleanup(void)
+{
+    XemuD3DHleOverlayGL *overlay = &d3d_hle_overlay_gl;
+
+    if (overlay->draw_fbo)
+        glDeleteFramebuffers(1, &overlay->draw_fbo);
+    if (overlay->draw_texture)
+        glDeleteTextures(1, &overlay->draw_texture);
+    g_free(overlay->pixels);
+    memset(overlay, 0, sizeof(*overlay));
+}
+
+static bool d3d_hle_overlay_gl_alloc_target(GLuint *fbo, GLuint *texture,
+                                             int width, int height)
+{
+    GLint previous_fbo;
+    GLint previous_texture;
+    GLenum status;
+
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previous_fbo);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture);
+    if (!*texture)
+        glGenTextures(1, texture);
+    if (!*fbo)
+        glGenFramebuffers(1, fbo);
+    if (!*texture || !*fbo)
+        return false;
+
+    glBindTexture(GL_TEXTURE_2D, *texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glBindFramebuffer(GL_FRAMEBUFFER, *fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, *texture, 0);
+    status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    glBindFramebuffer(GL_FRAMEBUFFER, previous_fbo);
+    glBindTexture(GL_TEXTURE_2D, previous_texture);
+    return status == GL_FRAMEBUFFER_COMPLETE;
+}
+
+static bool d3d_hle_overlay_gl_prepare(int width, int height)
+{
+    XemuD3DHleOverlayGL *overlay = &d3d_hle_overlay_gl;
+
+    if (width <= 0 || height <= 0)
+        return false;
+    if (overlay->draw_width == width && overlay->draw_height == height &&
+        overlay->draw_fbo)
+        return true;
+    if (!d3d_hle_overlay_gl_alloc_target(
+            &overlay->draw_fbo, &overlay->draw_texture, width, height))
+        return false;
+    overlay->draw_width = width;
+    overlay->draw_height = height;
+    return true;
+}
+
+static void d3d_hle_render_overlay(struct xemu_console *scon)
+{
+    XemuD3DHleOverlayGL *overlay = &d3d_hle_overlay_gl;
+    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    bool visible = false;
+    int width, height;
+    int overlay_x, overlay_y, overlay_width, overlay_height;
+    uint32_t overlay_pitch;
+    size_t overlay_bytes;
+    size_t pixel_count;
+
+    if (now < overlay->next_frame_ns) {
+        SDL_Delay(1);
+        return;
+    }
+    overlay->next_frame_ns = now + XEMU_D3D_HLE_OVERLAY_INTERVAL_NS;
+
+    SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
+    SDL_GetWindowSizeInPixels(scon->real_window, &width, &height);
+    if (!d3d_hle_overlay_gl_prepare(width, height)) {
+        if (!overlay->failure_reported) {
+            fprintf(stderr,
+                    "[D3D-HLE] unable to allocate xemu HUD offscreen target\n");
+            overlay->failure_reported = true;
+        }
+        xemu_d3d_hle_publish_overlay(NULL, 0, 0, 0, 0, 0, false);
+        return;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, overlay->draw_fbo);
+    glViewport(0, 0, width, height);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    xemu_main_loop_lock();
+    xemu_hud_update_overlay();
+    xemu_main_loop_unlock();
+    xemu_hud_render();
+
+    if (!xemu_hud_get_draw_bounds(&overlay_x, &overlay_y,
+                                  &overlay_width, &overlay_height)) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        xemu_d3d_hle_publish_overlay(NULL, 0, 0, 0, 0, 0, false);
+        return;
+    }
+    int overlay_right = MIN(overlay_x + overlay_width, width);
+    int overlay_bottom = MIN(overlay_y + overlay_height, height);
+    overlay_x = MAX(overlay_x, 0);
+    overlay_y = MAX(overlay_y, 0);
+    overlay_width = overlay_right - overlay_x;
+    overlay_height = overlay_bottom - overlay_y;
+    if (overlay_width <= 0 || overlay_height <= 0) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        xemu_d3d_hle_publish_overlay(NULL, 0, 0, 0, 0, 0, false);
+        return;
+    }
+    overlay_pitch = (uint32_t)overlay_width * 4u;
+    overlay_bytes = (size_t)overlay_pitch * overlay_height;
+    if (overlay->pixel_capacity < overlay_bytes) {
+        overlay->pixels = g_realloc(overlay->pixels, overlay_bytes);
+        overlay->pixel_capacity = overlay_bytes;
+    }
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, overlay->draw_fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(overlay_x, height - overlay_y - overlay_height,
+                 overlay_width, overlay_height, GL_RGBA, GL_UNSIGNED_BYTE,
+                 overlay->pixels);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    /* glReadPixels is bottom-up; Plume's host overlay is top-down. */
+    for (int top = 0, bottom = overlay_height - 1; top < bottom;
+         ++top, --bottom) {
+        uint8_t *top_row = overlay->pixels + (size_t)top * overlay_pitch;
+        uint8_t *bottom_row =
+            overlay->pixels + (size_t)bottom * overlay_pitch;
+        for (uint32_t byte = 0; byte < overlay_pitch; ++byte) {
+            uint8_t swap = top_row[byte];
+            top_row[byte] = bottom_row[byte];
+            bottom_row[byte] = swap;
+        }
+    }
+
+    /* ImGui's GL backend leaves a premultiplied composite in a transparent
+     * target; Plume's provider contract is straight-alpha RGBA8. */
+    pixel_count = (size_t)overlay_width * overlay_height;
+    for (size_t i = 0; i < pixel_count; ++i) {
+        uint8_t *pixel = overlay->pixels + i * 4u;
+        uint32_t alpha = pixel[3];
+        if (!alpha)
+            continue;
+        visible = true;
+        if (alpha < 255u) {
+            pixel[0] = MIN(255u, (pixel[0] * 255u + alpha / 2u) / alpha);
+            pixel[1] = MIN(255u, (pixel[1] * 255u + alpha / 2u) / alpha);
+            pixel[2] = MIN(255u, (pixel[2] * 255u + alpha / 2u) / alpha);
+        }
+    }
+    xemu_d3d_hle_publish_overlay(
+        overlay->pixels, (uint32_t)overlay_x, (uint32_t)overlay_y,
+        (uint32_t)overlay_width, (uint32_t)overlay_height, overlay_pitch,
+        visible);
+    if (!overlay->active_reported) {
+        fprintf(stderr,
+                "[D3D-HLE] xemu HUD native-resolution compositor active "
+                "(%dx%d)\n",
+                width, height);
+        overlay->active_reported = true;
+    }
+}
+
 static void gl_render_frame(struct xemu_console *scon)
 {
     static bool rendering;
     if (qatomic_xchg(&rendering, true) || qatomic_read(&qemu_exiting)) {
+        return;
+    }
+
+    d3d_hle_update_window_title(scon->real_window);
+
+    /* Plume owns the HWND swap chain. Keep xemu's existing HUD alive in an
+     * offscreen GL target and hand its transparent pixels to Plume instead of
+     * swapping OpenGL over the guest frame. */
+    if (xemu_d3d_hle_owns_window()) {
+        d3d_hle_render_overlay(scon);
+        qatomic_set(&rendering, false);
         return;
     }
 
@@ -1177,6 +1419,8 @@ static void display_finalize(void)
     }
 
     SDL_RemoveEventWatch(event_watch_callback, &scon_list[0]);
+    SDL_GL_MakeCurrent(m_window, m_context);
+    d3d_hle_overlay_gl_cleanup();
     SDL_GL_MakeCurrent(NULL, NULL);
     SDL_GL_DestroyContext(m_context);
     SDL_DestroyWindow(m_window);

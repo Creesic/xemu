@@ -116,6 +116,22 @@ bool translator_use_goto_tb(DisasContextBase *db, vaddr dest)
         return false;
     }
 
+#ifdef XBOX
+    /*
+     * A same-page direct branch normally bypasses lookup_tb_ptr entirely.
+     * Keep only exact board-declared HLE entries out of that direct chain so
+     * cpu_exec_loop can service them; all other direct edges retain the
+     * normal fast path.
+     */
+    if (unlikely(db->cpu->exec_entry_check &&
+                 dest >= db->cpu->exec_entry_min_pc &&
+                 dest <= db->cpu->exec_entry_max_pc &&
+                 db->cpu->exec_entry_check(
+                     db->cpu->exec_entry_callback_opaque, dest))) {
+        return false;
+    }
+#endif
+
     /* Check for the dest on the same page as the start of the TB.  */
     return translator_is_same_page(db, dest);
 }
@@ -131,6 +147,9 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
 
     /* Initialize DisasContext */
     db->tb = tb;
+#ifdef XBOX
+    db->cpu = cpu;
+#endif
     db->pc_first = pc;
     db->pc_next = pc;
     db->is_jmp = DISAS_NEXT;

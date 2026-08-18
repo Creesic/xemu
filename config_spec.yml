@@ -224,6 +224,10 @@ input:
           default: false
 
 display:
+  d3d_frontend:
+    type: enum
+    values: [NV2A, PLUME]
+    default: NV2A
   renderer:
     type: enum
     values: ["NULL", OPENGL, VULKAN]

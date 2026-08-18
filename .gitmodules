@@ -45,3 +45,10 @@
 [submodule "tests/lcitool/libvirt-ci"]
 	path = tests/lcitool/libvirt-ci
 	url = https://gitlab.com/libvirt/libvirt-ci.git
+[submodule "thirdparty/plume"]
+	path = thirdparty/plume
+	url = https://github.com/Creesic/plume.git
+	branch = xrecomp/game-agnostic-rhi
+[submodule "thirdparty/xbsymbol-database"]
+	path = thirdparty/xbsymbol-database
+	url = https://github.com/Cxbx-Reloaded/XbSymbolDatabase.git

@@ -28,6 +28,7 @@
 #include "misc.hh"
 #include "gl-helpers.hh"
 #include "reporting.hh"
+#include "renderer-selection.hh"
 #include "qapi/error.h"
 #include "actions.hh"
 
@@ -740,14 +741,11 @@ void MainMenuInputView::PopulateTableController(ControllerState *state)
 void MainMenuDisplayView::Draw()
 {
     SectionTitle("Renderer");
-    ChevronCombo("Backend", &g_config.display.renderer,
-                 "Null\0"
-                 "OpenGL\0"
-#ifdef CONFIG_VULKAN
-                 "Vulkan\0"
-#endif
-                 ,
-                 "Select desired renderer implementation");
+    RendererSelectionChevronCombo(
+        "Backend",
+        "Select the Xbox graphics path. After restart, Plume automatically "
+        "scans the loaded game's linked XDK D3D8 runtime.");
+    ImGui::TextDisabled("%s", RendererSelectionStatus());
     int rendering_scale = nv2a_get_surface_scale_factor() - 1;
     if (ChevronCombo("Internal resolution scale", &rendering_scale,
                      "1x\0"

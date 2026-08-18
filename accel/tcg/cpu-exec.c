@@ -410,6 +410,27 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
     TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
     s.cflags = curr_cflags(cpu);
 
+#ifdef XBOX
+    /*
+     * Indirect guest calls/returns normally stay inside TCG through
+     * lookup-and-goto, bypassing cpu_exec_loop and its board entry callback.
+     * Only exact board-declared entries, plus one pass-through return while
+     * it is pending, leave the fast path. Architectural registers are
+     * synchronized by the normal TB exit before cpu_exec_loop invokes the
+     * callback.
+     */
+    if (unlikely(cpu->exec_entry_callback)) {
+        if (s.pc == cpu->exec_entry_return_pc ||
+            (cpu->exec_entry_check &&
+             s.pc >= cpu->exec_entry_min_pc &&
+             s.pc <= cpu->exec_entry_max_pc &&
+             cpu->exec_entry_check(
+                 cpu->exec_entry_callback_opaque, s.pc))) {
+            return tcg_code_gen_epilogue;
+        }
+    }
+#endif
+
     if (check_for_breakpoints(cpu, s.pc, &s.cflags)) {
         cpu_loop_exit(cpu);
     }
@@ -967,6 +988,22 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             TranslationBlock *tb;
             TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
             s.cflags = cpu->cflags_next_tb;
+
+#ifdef XBOX
+            /*
+             * Xbox title HLE uses an exact, profile-validated entry table.
+             * The callback may complete the guest call and advance EIP/ESP;
+             * restart the loop so the next TB state is derived from those
+             * updated registers. Boards which do not install a callback pay
+             * only this unlikely null check.
+             */
+            if (unlikely(cpu->exec_entry_callback &&
+                         cpu->exec_entry_callback(
+                             cpu->exec_entry_callback_opaque, cpu, s.pc))) {
+                last_tb = NULL;
+                continue;
+            }
+#endif
 
             /*
              * When requested, use an exact setting for cflags for the next

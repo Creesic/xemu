@@ -26,6 +26,7 @@
 #include "debug.hh"
 #include "actions.hh"
 #include "compat.hh"
+#include "renderer-selection.hh"
 #include "update.hh"
 #include "../xemu-os-utils.h"
 
@@ -175,13 +176,8 @@ void ShowMainMenu()
                 }
             }
 
-            ImGui::Combo("Backend", &g_config.display.renderer,
-                 "Null\0"
-                 "OpenGL\0"
-#ifdef CONFIG_VULKAN
-                 "Vulkan\0"
-#endif
-                );
+            RendererSelectionMenuCombo("Backend");
+            ImGui::TextDisabled("%s", RendererSelectionStatus());
 
             int rendering_scale = nv2a_get_surface_scale_factor() - 1;
             if (ImGui::Combo("Int. Resolution Scale", &rendering_scale,

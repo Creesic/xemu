@@ -66,6 +66,9 @@ typedef enum DisasJumpType {
  */
 struct DisasContextBase {
     TranslationBlock *tb;
+#ifdef XBOX
+    CPUState *cpu;
+#endif
     vaddr pc_first;
     vaddr pc_next;
     DisasJumpType is_jmp;

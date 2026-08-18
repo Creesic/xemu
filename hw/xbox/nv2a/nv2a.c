@@ -20,6 +20,7 @@
  */
 
 #include "hw/xbox/nv2a/nv2a_int.h"
+#include "hw/xbox/d3d_hle/xemu_d3d_hle.h"
 #include "qemu/main-loop.h"
 
 void nv2a_update_irq(NV2AState *d)
@@ -199,6 +200,7 @@ static void nv2a_vga_gfx_update(void *opaque)
     vga->hw_ops->gfx_update(vga);
 
     NV2AState *d = container_of(vga, NV2AState, vga);
+    xemu_d3d_hle_vblank((uint32_t)d->pcrtc.start);
     d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
     d->pcrtc.raster = 0;
 

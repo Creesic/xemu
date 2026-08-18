@@ -354,6 +354,8 @@ typedef union IcountDecr {
 
 #ifdef XBOX
 typedef void (*MemAccessCallbackFunc)(void *opaque, MemoryRegion *mr, hwaddr addr, hwaddr len, bool write);
+typedef bool (*ExecEntryCallbackFunc)(void *opaque, CPUState *cpu, vaddr pc);
+typedef bool (*ExecEntryCheckFunc)(void *opaque, vaddr pc);
 
 typedef struct MemAccessCallback {
     MemoryRegion *mr;
@@ -547,6 +549,20 @@ struct CPUState {
     CPUWatchpoint *watchpoint_hit;
 
     QTAILQ_HEAD(, MemAccessCallback) mem_access_callbacks;
+
+#ifdef XBOX
+    /* Optional board-owned interception at a translated-block boundary. */
+    ExecEntryCallbackFunc exec_entry_callback;
+    ExecEntryCheckFunc exec_entry_check;
+    void *exec_entry_callback_opaque;
+    /* Indirect targets outside this inclusive range keep the normal chained
+     * lookup path. Targets inside it return to cpu_exec_loop for the callback. */
+    vaddr exec_entry_min_pc;
+    vaddr exec_entry_max_pc;
+    /* One dynamic return address used while a pass-through call is being
+     * observed so its guest result can be mirrored before chaining resumes. */
+    vaddr exec_entry_return_pc;
+#endif
 
     void *opaque;
 
