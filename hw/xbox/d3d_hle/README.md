@@ -99,6 +99,10 @@ The compiled exact-profile registry is still validated at startup for complete
 detector results, unique sorted hook addresses, required special hooks, and a
 valid bootstrap policy. A broken exact profile disables HLE for the run.
 
+The target architecture for attaching Plume to every loaded XBE
+(live discovery session, symbol classification, refuse the
+split-renderer case) is in `UNIVERSAL-SETUP.md`.
+
 ## Current limitations
 
 - Windows/D3D12 only.
