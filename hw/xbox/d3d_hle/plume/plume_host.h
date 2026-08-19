@@ -22,6 +22,13 @@ extern "C" {
 
 /* The host owns native-window creation and event processing. */
 void xgpu_plume_set_native_window(const XgpuNativeWindow *window);
+/* Retire guest work and reset draw/session state while retaining the process-
+ * lifetime host device and swapchain. */
+void xgpu_plume_reset_session(void);
+/* Retire all Plume work and release the host RHI output at process teardown.
+ * The overlay provider remains registered and becomes inert until the next
+ * host device is initialized. */
+void xgpu_plume_teardown_output(void);
 /* Returns the live native API name only after Plume initialized it. */
 const char *xgpu_plume_get_active_backend_name(void);
 /* Set the logical output extent. After renderer startup this performs a

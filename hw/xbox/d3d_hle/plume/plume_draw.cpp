@@ -642,6 +642,11 @@ static bool decode_bc3_volume_level(const uint8_t *src, size_t srcBytes,
     return true;
 }
 
+void PlumeDraw::reset()
+{
+    *this = PlumeDraw{};
+}
+
 bool PlumeDraw::configureRenderExtent(uint32_t logicalWidth,
                                       uint32_t logicalHeight,
                                       uint32_t internalResolutionScale)

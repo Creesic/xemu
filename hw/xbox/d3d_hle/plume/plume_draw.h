@@ -37,6 +37,7 @@ namespace plume {
 
 class PlumeDraw {
 public:
+    void reset();
     /* Configure the initial logical output and integer physical surface scale
      * before initPipelines(). Guest-facing extents remain logical. */
     bool configureRenderExtent(uint32_t logicalWidth, uint32_t logicalHeight,

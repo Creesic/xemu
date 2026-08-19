@@ -119,7 +119,9 @@ static uint32_t d3d_hle_guest_level_storage_bytes(
     uint32_t width, uint32_t height, uint32_t depth, uint32_t format,
     uint32_t row_pitch, uint32_t *pitch_out);
 static uint32_t d3d_hle_guest_read_u32(uint32_t va);
+static bool d3d_hle_guest_try_read_u32(uint32_t va, uint32_t *value);
 static uint32_t d3d_hle_guest_release_internal(uint32_t resource_va);
+static void d3d_hle_guest_reset_immediate_state(void);
 
 static D3DHleGuestBindings g_hle_bindings;
 static D3DHleGuestFatalDiagnostic g_hle_fatal_diagnostic;
@@ -747,6 +749,14 @@ static uint32_t d3d_hle_guest_alloc(uint32_t bytes, uint32_t alignment,
     return va;
 }
 
+bool d3d_hle_guest_synthetic_allocator_available(void)
+{
+    /* xbox_HeapAllocRange is intentionally fail-closed until the shared Xbox
+     * heap/mapping service owns synthetic guest allocations. Direct bootstrap
+     * profiles must not enter Plume while this capability is absent. */
+    return false;
+}
+
 static _Noreturn void
 d3d_hle_guest_fatal(const char *operation, HRESULT result)
 {
@@ -795,6 +805,12 @@ static const void *d3d_hle_guest_snapshot_range(
     if (!g_hle_read_range(va, g_hle_up_scratch[slot], bytes))
         d3d_hle_guest_fatal("guest range read", E_INVALIDARG);
     return g_hle_up_scratch[slot];
+}
+
+static bool d3d_hle_guest_try_read_u32(uint32_t va, uint32_t *value)
+{
+    return value && g_hle_read_range &&
+           g_hle_read_range(va, value, sizeof(*value));
 }
 
 int d3d_hle_guest_native_active(void)
@@ -981,12 +997,32 @@ HRESULT d3d_hle_guest_register_native_resource(uint32_t object_va)
 int d3d_hle_guest_adopt_switch_texture(
     uint32_t texture_va, uint32_t data, uint32_t format)
 {
-    D3DHleGuestResource *texture =
-        d3d_hle_guest_adopt_resource(texture_va);
+    D3DHleGuestResource *texture;
+    uint32_t common;
+    uint32_t live_data;
+    uint32_t live_format;
+    uint32_t live_size;
 
+    /* ESI is caller context, not part of SwitchTexture's ABI. It can be an
+     * unrelated value for callers that do not retain a PixelContainer there;
+     * validate the complete header through xemu's non-fatal range reader
+     * before the normal adopter dereferences or registers it. */
+    if (!texture_va ||
+        !d3d_hle_guest_try_read_u32(texture_va, &common) ||
+        (common & XBOX_D3DCOMMON_TYPE_MASK) !=
+            XBOX_D3DCOMMON_TYPE_TEXTURE ||
+        !(common & XBOX_D3DCOMMON_LIVE_MASK) ||
+        !d3d_hle_guest_try_read_u32(texture_va + 4u, &live_data) ||
+        !d3d_hle_guest_try_read_u32(texture_va + 12u, &live_format) ||
+        !d3d_hle_guest_try_read_u32(texture_va + 16u, &live_size) ||
+        (live_data & 0x0FFFFFFFu) != (data & 0x0FFFFFFFu) ||
+        live_format != format)
+        return 0;
+
+    (void)live_size;
+    texture = d3d_hle_guest_adopt_resource(texture_va);
     if (!texture || texture->kind != D3D_HLE_RESOURCE_TEXTURE ||
-        (texture->data_va & 0x0FFFFFFFu) != (data & 0x0FFFFFFFu) ||
-        d3d_hle_guest_read_u32(texture_va + 12u) != format)
+        (texture->data_va & 0x0FFFFFFFu) != (data & 0x0FFFFFFFu))
         return 0;
     d3d_hle_guest_index_put(
         &g_hle_texture_data_index, data & 0x0FFFFFFFu, texture);
@@ -2117,6 +2153,30 @@ static void d3d_hle_guest_destroy_resource(
     memset(resource, 0, sizeof(*resource));
     if (parent_va)
         (void)d3d_hle_guest_release_internal(parent_va);
+}
+
+static void d3d_hle_guest_destroy_resource_for_reset(
+    D3DHleGuestResource *resource)
+{
+    if (!resource)
+        return;
+    if (resource->kind == D3D_HLE_RESOURCE_VERTEX_SHADER &&
+        resource->host_handle)
+        d3d8_vsh_delete_shader(resource->host_handle);
+    if (resource->host_object &&
+        resource->kind == D3D_HLE_RESOURCE_SURFACE) {
+        IDirect3DSurface8 *surface =
+            (IDirect3DSurface8 *)resource->host_object;
+        surface->lpVtbl->Release(surface);
+    }
+    if (resource->host_object &&
+        resource->kind == D3D_HLE_RESOURCE_PIXEL_SHADER)
+        free(resource->host_object);
+    if (resource->owned_data && resource->data_va)
+        xbox_HeapFree(resource->data_va);
+    if (resource->owned_object)
+        xbox_HeapFree(resource->object_va);
+    memset(resource, 0, sizeof(*resource));
 }
 
 static uint32_t d3d_hle_guest_release_internal(uint32_t resource_va)
@@ -4021,6 +4081,91 @@ uint32_t d3d_hle_guest_device_release(void)
     return g_hle_device_refs;
 }
 
+void d3d_hle_guest_reset_registry(void)
+{
+    D3DHleGuestResourceChunk *chunk = g_hle_resource_chunks;
+    unsigned i;
+
+    memset(&g_hle_bindings, 0, sizeof(g_hle_bindings));
+    for (chunk = g_hle_resource_chunks; chunk;) {
+        D3DHleGuestResourceChunk *next = chunk->next;
+        for (i = 0; i < XBOX_D3D_HLE_RESOURCE_CHUNK_SIZE; ++i)
+            d3d_hle_guest_destroy_resource_for_reset(&chunk->resources[i]);
+        free(chunk);
+        chunk = next;
+    }
+    g_hle_resource_chunks = NULL;
+    g_hle_resource_chunks_tail = NULL;
+    g_hle_resource_capacity = 0;
+
+    free(g_hle_object_index.keys);
+    free(g_hle_object_index.records);
+    free(g_hle_texture_data_index.keys);
+    free(g_hle_texture_data_index.records);
+    memset(&g_hle_object_index, 0, sizeof(g_hle_object_index));
+    memset(&g_hle_texture_data_index, 0,
+           sizeof(g_hle_texture_data_index));
+
+    for (i = 0; i < sizeof(g_hle_up_scratch) / sizeof(g_hle_up_scratch[0]);
+         ++i) {
+        free(g_hle_up_scratch[i]);
+        g_hle_up_scratch[i] = NULL;
+        g_hle_up_scratch_capacity[i] = 0;
+    }
+    if (g_hle_device_token)
+        xbox_HeapFree(g_hle_device_token);
+    g_hle_device_token = 0;
+    g_hle_device_refs = 1;
+    g_hle_texture_version = 1;
+    g_hle_back_buffer = 0;
+    g_hle_front_buffer = 0;
+    g_hle_depth_buffer = 0;
+    g_hle_vertex_shader = 0;
+    g_hle_pixel_shader = 0;
+    g_hle_vertex_program_generation = 0;
+    memset(g_hle_loaded_vertex_programs, 0,
+           sizeof(g_hle_loaded_vertex_programs));
+    memset(g_hle_pixel_shader_constants, 0,
+           sizeof(g_hle_pixel_shader_constants));
+    g_hle_pixel_shader_constant_valid = 0;
+    memset(g_hle_pixel_shader_effective, 0,
+           sizeof(g_hle_pixel_shader_effective));
+    g_hle_pixel_shader_effective_valid = 0;
+    g_hle_fence = 0;
+    memset(g_hle_state_cache, 0, sizeof(g_hle_state_cache));
+    memset(g_hle_immediate_vertex, 0, sizeof(g_hle_immediate_vertex));
+    g_hle_overlay_enabled = 0;
+    g_hle_depth_bias = 0.0f;
+    g_hle_slope_bias = 0.0f;
+    d3d_hle_guest_reset_immediate_state();
+    d3d8_SetVblankScanoutCallback(NULL);
+}
+
+static void d3d_hle_guest_release_device(void)
+{
+    IDirect3DDevice8 *device;
+    d3d_hle_guest_reset_registry();
+    device = xbox_GetD3DDevice();
+    if (device && device->lpVtbl) {
+        ULONG refs;
+        do {
+            refs = device->lpVtbl->Release(device);
+        } while (refs);
+    }
+}
+
+void d3d_hle_guest_reset_session(void)
+{
+    d3d_hle_guest_release_device();
+    xgpu_plume_reset_session();
+}
+
+void d3d_hle_guest_teardown_host_device(void)
+{
+    d3d_hle_guest_release_device();
+    xgpu_plume_teardown_output();
+}
+
 void d3d_hle_guest_block_until_vertical_blank(void)
 {
     D3DHleGuestResource *target =
@@ -4671,6 +4816,15 @@ static uint32_t g_hle_imm_primitive;
 static uint32_t g_hle_imm_attr_mask;
 static uint32_t g_hle_imm_vert_count;
 static float g_hle_imm_verts[D3D_HLE_IMM_MAX_VERTS][16][4];
+
+static void d3d_hle_guest_reset_immediate_state(void)
+{
+    g_hle_imm_active = 0;
+    g_hle_imm_primitive = 0;
+    g_hle_imm_attr_mask = 0;
+    g_hle_imm_vert_count = 0;
+    memset(g_hle_imm_verts, 0, sizeof(g_hle_imm_verts));
+}
 
 static void d3d_hle_imm_note_attribute(uint32_t reg)
 {

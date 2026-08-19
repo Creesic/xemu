@@ -12,6 +12,7 @@
 #include "d3d8_xbox.h"
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -161,6 +162,10 @@ uint32_t d3d_hle_guest_get_stream_source(
     uint32_t stream, uint32_t stride_va);
 uint32_t d3d_hle_guest_device_add_ref(void);
 uint32_t d3d_hle_guest_device_release(void);
+bool d3d_hle_guest_synthetic_allocator_available(void);
+void d3d_hle_guest_reset_session(void);
+void d3d_hle_guest_reset_registry(void);
+void d3d_hle_guest_teardown_host_device(void);
 void d3d_hle_guest_block_until_vertical_blank(void);
 int d3d_hle_guest_vblank_scanout(void);
 uint32_t d3d_hle_guest_base_texture_get_level_count(uint32_t texture_va);

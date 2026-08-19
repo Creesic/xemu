@@ -187,6 +187,26 @@ void PlumeContext::waitPendingPresent()
     m_presentInFlight = false;
 }
 
+void PlumeContext::reset()
+{
+    if (m_presentInFlight)
+        waitPendingPresent();
+    m_framebuffers.clear();
+    m_releaseSems.clear();
+    m_acquireSem.reset();
+    m_uploadCmd.reset();
+    m_cmdList.reset();
+    m_swapChain.reset();
+    m_presentFence.reset();
+    m_fence.reset();
+    m_queue.reset();
+    m_device.reset();
+    m_iface.reset();
+    m_presentInFlight = false;
+    m_inited = false;
+    m_failed = false;
+}
+
 ::plume::RenderFramebuffer *PlumeContext::framebuffer(uint32_t index)
 {
     return index < m_framebuffers.size() ? m_framebuffers[index].get() : nullptr;

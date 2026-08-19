@@ -45,6 +45,7 @@ public:
      * any reuse of present-submission resources. */
     void submitAndPresentDeferred(uint32_t swapIndex);
     void waitPendingPresent();
+    void reset();
     bool presentInFlight() const { return m_presentInFlight; }
 
     ::plume::RenderInterface *iface() { return m_iface.get(); }

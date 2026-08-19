@@ -436,13 +436,77 @@ extern "C" void xgpu_plume_set_native_window(const XgpuNativeWindow *window)
     g_native_window = window ? *window : XgpuNativeWindow{};
 }
 
+static void plume_reset_guest_session_state()
+{
+    /* Stop the optional worker before touching owner-state/RHI objects. */
+    xgpu::plume::plume_render_worker_sync();
+    plume_retire_pending_present();
+    plume_wait_ring_drain();
+    g_draw.releaseSubmittedResources();
+
+    for (auto &slot : g_wait_ring) {
+        slot.cl.reset();
+        slot.fence.reset();
+        slot.inFlight = false;
+    }
+    g_wait_ring_head = 0;
+    g_wait_ring_ready = false;
+    g_present_ring_snapshot = 0;
+    g_scene_framebuffer.reset();
+    g_scene_depth.reset();
+    g_scene_view.reset();
+    g_scene_texture.reset();
+    g_f2_readback = PlumeF2Readback{};
+    g_draw.reset();
+    g_surface_sync = xgpu::plume::PlumeSurfaceSyncTracker{};
+
+    g_backend_selection_failed = false;
+    g_frames = 0;
+    g_frame_dirty = false;
+    g_clear_pending = true;
+    g_present_mode_configured = false;
+    g_requested_vsync = -1;
+    g_scene_width = 0;
+    g_scene_height = 0;
+    g_scene_initialized = false;
+    g_pending_present_reason = 0;
+    g_position_mode = 0;
+    g_output_width = XGPU_PANEL_WIDTH;
+    g_output_height = XGPU_PANEL_HEIGHT;
+    g_internal_resolution_scale = 1;
+    g_render_extent_configured = false;
+    g_ui_canvas_depth = 0;
+    g_ui_canvas_mode = XGPU_PLUME_UI_CANVAS_ANCHORED;
+    g_ui_canvas_width = 0.0f;
+    g_ui_canvas_height = 0.0f;
+    for (uint64_t &serial : g_texture_binding_serial)
+        serial = 0;
+    g_clear[0] = 0.0f;
+    g_clear[1] = 0.0f;
+    g_clear[2] = 0.12f;
+    g_clear[3] = 1.0f;
+}
+
+extern "C" void xgpu_plume_reset_session(void)
+{
+    plume_reset_guest_session_state();
+}
+
+extern "C" void xgpu_plume_teardown_output(void)
+{
+    xgpu_plume_reset_session();
+    g_ctx.reset();
+    g_active_backend_name = nullptr;
+    g_native_window = XgpuNativeWindow{};
+}
+
 extern "C" int xgpu_plume_set_output_extent(uint32_t width, uint32_t height)
 {
     /* Owner-state/RHI entry: finish any in-flight worker job first. */
     xgpu::plume::plume_render_worker_sync();
     if (!width || !height)
         return 0;
-    if (g_ctx.ready()) {
+    if (g_ctx.ready() && g_draw.ready()) {
         const int changed = plume_reconfigure_render_extent(
             width, height, g_internal_resolution_scale);
         if (!changed) {
@@ -457,7 +521,7 @@ extern "C" int xgpu_plume_set_output_extent(uint32_t width, uint32_t height)
     const uint32_t oldHeight = g_output_height;
     g_output_width = width;
     g_output_height = height;
-    if (g_render_extent_configured) {
+    if (g_render_extent_configured && !g_ctx.ready()) {
         g_render_extent_configured = g_draw.configureRenderExtent(
             width, height, g_internal_resolution_scale);
         if (!g_render_extent_configured) {
@@ -612,8 +676,11 @@ static bool present_ensure_init(void)
         g_present_mode_configured = true;
     }
 
-    if (!g_draw.ready() && !g_draw.initPipelines(g_ctx))
-        return false;
+    if (!g_draw.ready()) {
+        g_draw.setPipelinedPresent(plume_present_pipeline_enabled());
+        if (!g_draw.initPipelines(g_ctx))
+            return false;
+    }
 
     return g_ctx.ready() && g_draw.ready();
 }
