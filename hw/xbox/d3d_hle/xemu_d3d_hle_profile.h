@@ -73,6 +73,13 @@ typedef struct XemuD3DHleProfile {
     uint32_t reviewed_required_hook_count;
     uint32_t reviewed_implemented_hook_count;
     uint32_t reviewed_blocker_count;
+    /* Non-zero only for runtime-discovered profiles. Any unresolved linked
+     * D3D function keeps automatic Plume attach fail-closed. */
+    uint32_t discovery_recognized_count;
+    uint32_t discovery_unsupported_count;
+    uint32_t discovery_duplicate_count;
+    uint32_t discovery_mutating_uncovered_count;
+    uint32_t discovery_uncovered_abi_count;
     uint32_t xbe_base;
     uint32_t xbe_headers_size;
     uint32_t xbe_image_size;
@@ -101,6 +108,8 @@ const XemuD3DHleHook *xemu_d3d_hle_profile_find_hook(
     const XemuD3DHleProfile *profile, uint32_t pc);
 const XemuD3DHleProfile *const *xemu_d3d_hle_profiles(size_t *count);
 void xemu_d3d_hle_profile_range(uint32_t *first, uint32_t *last);
+bool xemu_d3d_hle_profile_validate(
+    const XemuD3DHleProfile *profile, char *error, size_t error_capacity);
 bool xemu_d3d_hle_profiles_validate(char *error, size_t error_capacity);
 
 #endif

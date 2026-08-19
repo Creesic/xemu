@@ -9,6 +9,9 @@
 #include "qemu/osdep.h"
 
 #include <ctype.h>
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 
 #include <libXbSymbolDatabase.h>
 #include <Xbe.h>
@@ -297,6 +300,9 @@ typedef struct XemuD3DHleScan {
     uint32_t recognized_functions;
     uint32_t unsupported_functions;
     uint32_t duplicate_functions;
+    uint32_t unsupported_mutating_functions;
+    uint32_t unsupported_native_safe_functions;
+    uint32_t uncovered_abi_functions;
     uint32_t build_version;
     uint32_t device_global_va;
     uint32_t deferred_texture_state_va;
@@ -346,6 +352,118 @@ static bool canonical_name_is(const char *name, size_t length,
 {
     return strlen(expected) == length &&
            memcmp(name, expected, length) == 0;
+}
+
+static bool discovery_name_is_exact(
+    const char *name, size_t length, const char *expected)
+{
+    return strlen(expected) == length && memcmp(name, expected, length) == 0;
+}
+
+static bool discovery_name_has_prefix(
+    const char *name, size_t length, const char *prefix)
+{
+    size_t prefix_length = strlen(prefix);
+    return length >= prefix_length &&
+           memcmp(name, prefix, prefix_length) == 0;
+}
+
+static bool discovery_name_is_object_returning(
+    const char *name, size_t length)
+{
+    static const char *const exact[] = {
+        "D3DDevice_GetBackBuffer",
+        "D3DDevice_GetBackBuffer2",
+        "D3DDevice_GetRenderTarget",
+        "D3DDevice_GetRenderTarget2",
+        "D3DDevice_GetDepthStencilSurface",
+        "D3DDevice_GetDepthStencilSurface2",
+        "D3DDevice_GetPersistedSurface2",
+        "D3DTexture_GetSurfaceLevel",
+        "D3DTexture_GetSurfaceLevel2",
+        "D3DCubeTexture_GetCubeMapSurface",
+        "D3DCubeTexture_GetCubeMapSurface2",
+        "D3D_CreateTexture",
+        "D3D_CreateStandAloneSurface",
+    };
+    static const char *const prefixes[] = {
+        "Direct3D_Create",
+        "D3DDevice_Create",
+        "D3D8_Lock",
+        "D3DTexture_Lock",
+        "D3DCubeTexture_Lock",
+        "D3DVolumeTexture_Lock",
+        "D3DSurface_Lock",
+        "D3DVertexBuffer_Lock",
+        "D3DPalette_Lock",
+        "IDirect3DVertexBuffer8_Lock",
+    };
+    size_t i;
+
+    for (i = 0; i < G_N_ELEMENTS(exact); ++i) {
+        if (discovery_name_is_exact(name, length, exact[i]))
+            return true;
+    }
+    for (i = 0; i < G_N_ELEMENTS(prefixes); ++i) {
+        if (discovery_name_has_prefix(name, length, prefixes[i]))
+            return true;
+    }
+    return false;
+}
+
+static bool discovery_name_is_native_safe(
+    const char *name, size_t length)
+{
+    static const char *const exact[] = {
+        "D3DDevice_AddRef",
+        "D3DDevice_Release",
+        "D3DResource_AddRef",
+        "D3DResource_GetType",
+        "D3DDevice_MakeSpace",
+        "D3DDevice_IsFencePending",
+        "D3D8_Get2DSurfaceDesc",
+        "D3DBaseTexture_GetLevelCount",
+    };
+    static const char *const prefixes[] = {
+        "D3D_Get",
+        "D3D_Enum",
+        "D3D_Check",
+        "D3DResource_Get",
+        "D3DBaseTexture_Get",
+        "D3DSurface_Get",
+        "D3DVertexBuffer_Get",
+        "D3D_CMiniport_Get",
+        "D3D_CMiniport_Is",
+        "Direct3D_Check",
+    };
+    size_t i;
+
+    if (discovery_name_is_object_returning(name, length))
+        return false;
+    for (i = 0; i < G_N_ELEMENTS(exact); ++i) {
+        if (discovery_name_is_exact(name, length, exact[i]))
+            return true;
+    }
+    for (i = 0; i < G_N_ELEMENTS(prefixes); ++i) {
+        if (discovery_name_has_prefix(name, length, prefixes[i]))
+            return true;
+    }
+    if (discovery_name_has_prefix(name, length, "D3DDevice_Get") ||
+        discovery_name_has_prefix(name, length, "D3DTexture_Get"))
+        return !discovery_name_is_object_returning(name, length);
+    return false;
+}
+
+static void discovery_note_unsupported(
+    XemuD3DHleScan *scan, const char *name, size_t length, bool abi)
+{
+    ++scan->unsupported_functions;
+    if (abi)
+        ++scan->uncovered_abi_functions;
+    if (discovery_name_is_native_safe(name, length))
+        ++scan->unsupported_native_safe_functions;
+    else
+        ++scan->unsupported_mutating_functions;
 }
 
 static uint8_t convert_param(XbSDBParamType type)
@@ -442,14 +560,15 @@ static void register_symbol(const char *library_str, uint32_t library_flag,
         param_list[0].type == param_void) {
         param_count = 0;
     }
-    if (param_count > XEMU_D3D_HLE_MAX_ABI_ARGS)
-        return;
-
     name_length = canonical_name_length(symbol_str);
-    binding = find_binding(symbol_str, name_length, param_count);
     ++scan->recognized_functions;
+    if (param_count > XEMU_D3D_HLE_MAX_ABI_ARGS) {
+        discovery_note_unsupported(scan, symbol_str, name_length, true);
+        return;
+    }
+    binding = find_binding(symbol_str, name_length, param_count);
     if (!binding) {
-        ++scan->unsupported_functions;
+        discovery_note_unsupported(scan, symbol_str, name_length, false);
         return;
     }
     for (i = 0; i < param_count; ++i) {
@@ -457,7 +576,7 @@ static void register_symbol(const char *library_str, uint32_t library_flag,
             stack_bytes += 4u;
         else if (param_list[i].type == param_psh2 ||
                  convert_param(param_list[i].type) == XEMU_D3D_ABI_NONE) {
-            ++scan->unsupported_functions;
+            discovery_note_unsupported(scan, symbol_str, name_length, true);
             return;
         }
     }
@@ -468,7 +587,7 @@ static void register_symbol(const char *library_str, uint32_t library_flag,
         }
     }
     if (scan->hook_count == G_N_ELEMENTS(scan->hooks)) {
-        ++scan->unsupported_functions;
+        discovery_note_unsupported(scan, symbol_str, name_length, false);
         return;
     }
     hook = &scan->hooks[scan->hook_count++];
@@ -598,6 +717,86 @@ static size_t snapshot_mapped_pages(
     return copied;
 }
 
+static bool discovery_section_name_is(
+    XemuD3DHleGuestRead read_guest, const xbe_section_header *section,
+    const char *expected)
+{
+    char name[9] = { 0 };
+    size_t length = strlen(expected);
+
+    if (!section || !section->SectionNameAddr || length > 8u ||
+        !read_guest(section->SectionNameAddr, name, sizeof(name) - 1u))
+        return false;
+    return g_ascii_strncasecmp(name, expected, length) == 0 &&
+           (length == 8u || name[length] == '\0');
+}
+
+static bool discovery_section_is_scan_candidate(
+    XemuD3DHleGuestRead read_guest, const xbe_section_header *section)
+{
+    return (section->dwFlags_value &
+            XBE_SECTION_HEADER_FLAGS_EXECUTABLE) ||
+           discovery_section_name_is(read_guest, section, "D3D") ||
+           discovery_section_name_is(read_guest, section, ".text") ||
+           discovery_section_name_is(read_guest, section, "FLASHROM");
+}
+
+static bool discovery_section_is_named_or_kernel(
+    XemuD3DHleGuestRead read_guest, const xbe_section_header *section,
+    xbaddr kernel_thunk)
+{
+    uint32_t end = section->dwVirtualAddr + section->dwSizeofRaw;
+
+    return discovery_section_name_is(read_guest, section, "D3D") ||
+           discovery_section_name_is(read_guest, section, ".text") ||
+           discovery_section_name_is(read_guest, section, "FLASHROM") ||
+           (kernel_thunk >= section->dwVirtualAddr && kernel_thunk < end);
+}
+
+static uint8_t *discovery_sparse_alloc(size_t size)
+{
+#ifdef _WIN32
+    return VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_NOACCESS);
+#else
+    void *memory = mmap(NULL, size, PROT_NONE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return memory == MAP_FAILED ? NULL : memory;
+#endif
+}
+
+static bool discovery_sparse_commit(uint8_t *base,
+                                    uint32_t offset, size_t size)
+{
+    const size_t page_size = 4096u;
+    uintptr_t start;
+    uintptr_t end;
+
+    if (!base || !size)
+        return false;
+    start = ((uintptr_t)base + offset) & ~(page_size - 1u);
+    end = ((uintptr_t)base + offset + size + page_size - 1u) &
+          ~(page_size - 1u);
+#ifdef _WIN32
+    return VirtualAlloc((void *)start, end - start,
+                        MEM_COMMIT, PAGE_READWRITE) != NULL;
+#else
+    return mprotect((void *)start, end - start,
+                    PROT_READ | PROT_WRITE) == 0;
+#endif
+}
+
+static void discovery_sparse_free(uint8_t *base, size_t size)
+{
+    if (!base)
+        return;
+#ifdef _WIN32
+    (void)size;
+    VirtualFree(base, 0, MEM_RELEASE);
+#else
+    munmap(base, size);
+#endif
+}
+
 const XemuD3DHleProfile *xemu_d3d_hle_discover(
     XemuD3DHleGuestRead read_guest, bool *retryable,
     char *error, size_t error_capacity)
@@ -617,6 +816,7 @@ const XemuD3DHleProfile *xemu_d3d_hle_discover(
     unsigned incomplete_sections = 0;
     size_t copied_section_bytes = 0;
     size_t missing_section_bytes = 0;
+    size_t *section_copied = NULL;
     size_t i;
     char *title = NULL;
     bool ok = false;
@@ -642,8 +842,11 @@ const XemuD3DHleProfile *xemu_d3d_hle_discover(
     /* dwSizeofImage is a length beginning at dwBaseAddr, not an absolute
      * virtual end address. Keep the snapshot VA-indexed for XbSDB. */
     image_end = header.dwBaseAddr + header.dwSizeofImage;
-    image = g_malloc0(image_end);
-    if (!read_guest(header.dwBaseAddr, image + header.dwBaseAddr,
+    image = discovery_sparse_alloc(image_end);
+    if (!image ||
+        !discovery_sparse_commit(image, header.dwBaseAddr,
+                                 header.dwSizeofHeaders) ||
+        !read_guest(header.dwBaseAddr, image + header.dwBaseAddr,
                     header.dwSizeofHeaders)) {
         set_error(error, error_capacity, "cannot snapshot XBE headers");
         goto out;
@@ -659,15 +862,19 @@ const XemuD3DHleProfile *xemu_d3d_hle_discover(
         goto out;
     }
     sections = (xbe_section_header *)(image + header.pSectionHeadersAddr);
+    section_copied = g_new0(size_t, header.dwSections);
+    if (!section_copied) {
+        set_error(error, error_capacity,
+                  "cannot allocate XBE section coverage table");
+        goto out;
+    }
     for (i = 0; i < header.dwSections; ++i) {
         uint32_t address = sections[i].dwVirtualAddr;
         uint32_t size = sections[i].dwSizeofRaw;
-        /* XbSymbolDatabase intentionally scans preload sections only. XBE
-         * sections without this bit are demand-loaded and usually have no
-         * guest mapping during startup, so requiring them made valid titles
-         * such as Forza fail before the D3D scan even began. */
-        if (!(sections[i].dwFlags_value &
-              XBE_SECTION_HEADER_FLAGS_PRELOAD) || !size) {
+        size_t copied;
+
+        if (!size || !discovery_section_is_scan_candidate(
+                read_guest, &sections[i])) {
             continue;
         }
         if (address < header.dwBaseAddr || address >= image_end ||
@@ -679,8 +886,14 @@ const XemuD3DHleProfile *xemu_d3d_hle_discover(
             }
             goto out;
         }
-        size_t copied = snapshot_mapped_pages(
+        if (!discovery_sparse_commit(image, address, size)) {
+            set_error(error, error_capacity,
+                      "cannot commit XBE section snapshot");
+            goto out;
+        }
+        copied = snapshot_mapped_pages(
             read_guest, address, image + address, size);
+        section_copied[i] = copied;
         copied_section_bytes += copied;
         if (copied != size) {
             ++incomplete_sections;
@@ -727,14 +940,42 @@ const XemuD3DHleProfile *xemu_d3d_hle_discover(
             "library record%s\n",
             libraries.count, libraries.count == 1u ? "" : "s");
 
-    scan_sections.count = XbSDB_GenerateSectionFilter(
-        snapshot_header, NULL, false);
+    scan_sections.count = 0;
+    {
+        xbaddr kernel_thunk = XbSDB_GetKernelThunkAddress(snapshot_header);
+        for (i = 0; i < header.dwSections; ++i) {
+            if (section_copied[i] >= sections[i].dwSizeofRaw &&
+                discovery_section_is_named_or_kernel(
+                    read_guest, &sections[i], kernel_thunk))
+                ++scan_sections.count;
+        }
+    }
     if (!scan_sections.count) {
         set_error(error, error_capacity, "XBE has no D3D-scannable sections");
         goto out;
     }
     scan_sections.filters = g_new0(XbSDBSection, scan_sections.count);
-    XbSDB_GenerateSectionFilter(snapshot_header, &scan_sections, false);
+    {
+        xbaddr kernel_thunk = XbSDB_GetKernelThunkAddress(snapshot_header);
+        size_t filter_index = 0;
+        for (i = 0; i < header.dwSections; ++i) {
+            XbSDBSection *filter;
+
+            if (section_copied[i] < sections[i].dwSizeofRaw ||
+                !discovery_section_is_named_or_kernel(
+                    read_guest, &sections[i], kernel_thunk))
+                continue;
+            filter = &scan_sections.filters[filter_index++];
+            memset(filter, 0, sizeof(*filter));
+            memcpy(filter->name, "        ", sizeof(filter->name));
+            if (sections[i].SectionNameAddr)
+                (void)read_guest(sections[i].SectionNameAddr,
+                                  filter->name, sizeof(filter->name));
+            filter->xb_virt_addr = sections[i].dwVirtualAddr;
+            filter->buffer_size = sections[i].dwSizeofRaw;
+            filter->buffer_lower = image + sections[i].dwVirtualAddr;
+        }
+    }
     if (!XbSDB_CreateContext(&context, register_symbol, libraries,
                              scan_sections,
                              XbSDB_GetKernelThunkAddress(snapshot_header)) ||
@@ -788,6 +1029,16 @@ const XemuD3DHleProfile *xemu_d3d_hle_discover(
     automatic_profile.source_xbe_sha256 = "runtime-signature-discovery";
     automatic_profile.reviewed_required_hook_count = scan.hook_count;
     automatic_profile.reviewed_implemented_hook_count = scan.hook_count;
+    automatic_profile.reviewed_blocker_count = scan.unsupported_functions;
+    automatic_profile.discovery_recognized_count =
+        scan.recognized_functions;
+    automatic_profile.discovery_unsupported_count =
+        scan.unsupported_functions;
+    automatic_profile.discovery_duplicate_count = scan.duplicate_functions;
+    automatic_profile.discovery_mutating_uncovered_count =
+        scan.unsupported_mutating_functions;
+    automatic_profile.discovery_uncovered_abi_count =
+        scan.uncovered_abi_functions;
     automatic_profile.xbe_base = header.dwBaseAddr;
     automatic_profile.xbe_headers_size = header.dwSizeofHeaders;
     automatic_profile.xbe_image_size = header.dwSizeofImage;
@@ -815,8 +1066,9 @@ out:
         XbSDBContext_Release(context);
     g_free(scan_sections.filters);
     g_free(libraries.filters);
+    g_free(section_copied);
     g_free(title);
-    g_free(image);
+    discovery_sparse_free(image, image_end);
     return ok ? &automatic_profile : NULL;
 }
 

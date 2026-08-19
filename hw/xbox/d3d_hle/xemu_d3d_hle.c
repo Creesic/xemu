@@ -9,9 +9,12 @@
 #include "qemu/osdep.h"
 #include "qemu/thread.h"
 #include "exec/target_page.h"
+#include "exec/tb-flush.h"
 #include "hw/core/cpu.h"
 #include "system/memory.h"
 #include "cpu.h"
+
+#include <Xbe.h>
 
 #include "d3d8_internal.h"
 #include "d3d_frontend.h"
@@ -61,6 +64,19 @@ typedef struct XemuD3DHleDeferred {
     uint32_t guest_result;
 } XemuD3DHleDeferred;
 
+typedef struct XemuD3DHleCoverage {
+    uint32_t image_base;
+    uint32_t image_size;
+    uint8_t *page_bits;
+    size_t page_count;
+    uint32_t d3d_needed;
+    uint32_t d3d_covered;
+    bool has_d3d_section;
+    bool ready;
+    uint32_t reported_covered;
+    uint32_t coverage_epoch;
+} XemuD3DHleCoverage;
+
 enum { XEMU_D3D_HLE_TRACE_RING_SIZE = 256 };
 
 typedef struct XemuD3DHleTraceEntry {
@@ -99,9 +115,24 @@ static XemuD3DHleStatus s_status = XEMU_D3D_HLE_STATUS_DISABLED;
 static bool s_profile_checked;
 static bool s_profile_valid;
 static const XemuD3DHleProfile *s_profile;
+static bool s_identity_valid;
+static uint32_t s_identity_title_id;
+static uint32_t s_identity_timedate;
+static uint32_t s_identity_image_size;
+static uint32_t s_generation;
+static XemuD3DHleCoverage s_coverage;
 static char s_status_detail[256];
-static uint64_t s_discovery_retry_at_ms;
-static unsigned s_discovery_retry_attempts;
+static bool s_discovery_job_queued;
+static uint32_t s_discovery_job_generation;
+static uint32_t s_discovery_job_pc;
+static uint32_t s_discovery_scanned_epoch;
+static bool s_header_valid;
+static uint64_t s_header_valid_ms;
+static bool s_loader_resolved;
+static bool s_loader_call_active;
+static bool loader_entry_span_mapped;
+static uint32_t s_loader_section_va;
+static uint32_t s_loader_section_size;
 static bool s_host_ready;
 static bool s_trace_entries;
 static bool s_trace_dumped;
@@ -121,6 +152,7 @@ static size_t s_bootstrap_deferred_count;
 static size_t s_bootstrap_deferred_capacity;
 static const char *s_active_hook_name;
 static bool s_vblank_queued;
+static bool s_session_reset_queued;
 static uint32_t s_vblank_pcrtc_start;
 
 static QemuMutex s_overlay_mutex;
@@ -142,13 +174,20 @@ extern uintptr_t xemu_get_native_window_handle(void);
 
 static void xemu_d3d_hle_dump_trace_ring(void);
 static HRESULT xemu_d3d_hle_activate_host_device(uint32_t parameters_va);
+static bool xemu_d3d_hle_read_identity(
+    uint32_t *title_id, uint32_t *timedate, uint32_t *image_size);
+static bool xemu_d3d_hle_update_coverage(void);
+static void xemu_d3d_hle_reset_coverage(void);
+static bool xemu_d3d_hle_try_resolve_kernel_loader(void);
+static void xemu_d3d_hle_queue_discovery(uint32_t pc);
+static void xemu_d3d_hle_queue_session_reset(void);
 
 static int xemu_d3d_hle_overlay_provider(
     XgpuPlumeDebugOverlayFrame *frame)
 {
     bool visible;
 
-    if (!frame || !s_overlay_initialized)
+    if (!frame || !s_overlay_initialized || !s_host_ready)
         return 0;
     qemu_mutex_lock(&s_overlay_mutex);
     visible = s_overlay_visible;
@@ -233,6 +272,356 @@ static bool xemu_d3d_hle_read_u32(uint32_t va, uint32_t *value)
     return xemu_d3d_hle_read(va, value, sizeof(*value));
 }
 
+static uint16_t xemu_d3d_hle_pe_u16(const uint8_t *bytes)
+{
+    return (uint16_t)bytes[0] | ((uint16_t)bytes[1] << 8);
+}
+
+static uint32_t xemu_d3d_hle_pe_u32(const uint8_t *bytes)
+{
+    return (uint32_t)bytes[0] |
+           ((uint32_t)bytes[1] << 8) |
+           ((uint32_t)bytes[2] << 16) |
+           ((uint32_t)bytes[3] << 24);
+}
+
+static bool xemu_d3d_hle_try_resolve_kernel_loader(void)
+{
+    enum { KERNEL_BASE = 0x80010000u };
+    uint8_t dos[64] = { 0 };
+    uint8_t nt[24] = { 0 };
+    uint8_t optional[512] = { 0 };
+    uint8_t exports[40] = { 0 };
+    uint32_t pe_offset;
+    uint32_t export_rva;
+    uint32_t export_size;
+    uint32_t ordinal_base;
+    uint32_t function_count;
+    uint32_t name_count;
+    uint32_t functions_rva;
+    uint32_t names_rva;
+    uint32_t ordinals_rva;
+    uint32_t load_rva = 0;
+    uint32_t unload_rva = 0;
+    uint16_t optional_size;
+    uint16_t optional_magic;
+    uint32_t directory_offset;
+    uint32_t i;
+
+    if (s_loader_resolved)
+        return true;
+    if (!s_cpu || !xemu_d3d_hle_read(KERNEL_BASE, dos, sizeof(dos)) ||
+        dos[0] != 'M' || dos[1] != 'Z')
+        return false;
+    pe_offset = xemu_d3d_hle_pe_u32(dos + 0x3Cu);
+    if (pe_offset > 0x00100000u ||
+        !xemu_d3d_hle_read(KERNEL_BASE + pe_offset,
+                           nt, sizeof(nt)) ||
+        memcmp(nt, "PE\0\0", 4) != 0)
+        return false;
+    optional_size = xemu_d3d_hle_pe_u16(nt + 4u + 16u);
+    if (!optional_size || optional_size > sizeof(optional) ||
+        !xemu_d3d_hle_read(KERNEL_BASE + pe_offset + sizeof(nt),
+                           optional, optional_size))
+        return false;
+    optional_magic = xemu_d3d_hle_pe_u16(optional);
+    directory_offset = optional_magic == 0x10Bu ? 96u :
+                       optional_magic == 0x20Bu ? 112u : UINT32_MAX;
+    if (directory_offset == UINT32_MAX ||
+        directory_offset + 8u > optional_size)
+        return false;
+    export_rva = xemu_d3d_hle_pe_u32(optional + directory_offset);
+    export_size = xemu_d3d_hle_pe_u32(optional + directory_offset + 4u);
+    if (!export_rva || export_size < sizeof(exports) ||
+        export_rva > UINT32_MAX - KERNEL_BASE ||
+        !xemu_d3d_hle_read(KERNEL_BASE + export_rva,
+                           exports, sizeof(exports)))
+        return false;
+
+    ordinal_base = xemu_d3d_hle_pe_u32(exports + 16u);
+    function_count = xemu_d3d_hle_pe_u32(exports + 20u);
+    name_count = xemu_d3d_hle_pe_u32(exports + 24u);
+    functions_rva = xemu_d3d_hle_pe_u32(exports + 28u);
+    names_rva = xemu_d3d_hle_pe_u32(exports + 32u);
+    ordinals_rva = xemu_d3d_hle_pe_u32(exports + 36u);
+    if (!function_count || function_count > 65536u ||
+        name_count > function_count ||
+        functions_rva > UINT32_MAX - KERNEL_BASE ||
+        names_rva > UINT32_MAX - KERNEL_BASE ||
+        ordinals_rva > UINT32_MAX - KERNEL_BASE)
+        return false;
+
+    for (i = 0; i < name_count; ++i) {
+        uint8_t name_rva_bytes[4];
+        uint8_t ordinal_bytes[2];
+        uint8_t function_bytes[4];
+        char name[32] = { 0 };
+        uint32_t name_rva;
+        uint16_t ordinal;
+        uint32_t function_rva;
+
+        if (!xemu_d3d_hle_read(
+                KERNEL_BASE + names_rva + i * 4u,
+                name_rva_bytes, sizeof(name_rva_bytes)) ||
+            !xemu_d3d_hle_read(
+                KERNEL_BASE + ordinals_rva + i * 2u,
+                ordinal_bytes, sizeof(ordinal_bytes)))
+            return false;
+        name_rva = xemu_d3d_hle_pe_u32(name_rva_bytes);
+        ordinal = xemu_d3d_hle_pe_u16(ordinal_bytes);
+        if (ordinal >= function_count ||
+            name_rva > UINT32_MAX - KERNEL_BASE ||
+            !xemu_d3d_hle_read(KERNEL_BASE + name_rva,
+                               name, sizeof(name) - 1u))
+            continue;
+        if (strcmp(name, "XeLoadSection") != 0 &&
+            strcmp(name, "XeUnloadSection") != 0)
+            continue;
+        if (!xemu_d3d_hle_read(
+                KERNEL_BASE + functions_rva + ordinal * 4u,
+                function_bytes, sizeof(function_bytes)))
+            return false;
+        function_rva = xemu_d3d_hle_pe_u32(function_bytes);
+        if (strcmp(name, "XeLoadSection") == 0)
+            load_rva = function_rva;
+        else
+            unload_rva = function_rva;
+    }
+
+    if (!load_rva && ordinal_base <= 0x0147u &&
+        0x0147u - ordinal_base < function_count) {
+        uint8_t function_bytes[4];
+        if (!xemu_d3d_hle_read(
+                KERNEL_BASE + functions_rva +
+                    (0x0147u - ordinal_base) * 4u,
+                function_bytes, sizeof(function_bytes)))
+            return false;
+        load_rva = xemu_d3d_hle_pe_u32(function_bytes);
+    }
+    if (!unload_rva && ordinal_base <= 0x0148u &&
+        0x0148u - ordinal_base < function_count) {
+        uint8_t function_bytes[4];
+        if (!xemu_d3d_hle_read(
+                KERNEL_BASE + functions_rva +
+                    (0x0148u - ordinal_base) * 4u,
+                function_bytes, sizeof(function_bytes)))
+            return false;
+        unload_rva = xemu_d3d_hle_pe_u32(function_bytes);
+    }
+    if (!load_rva || !unload_rva ||
+        load_rva > UINT32_MAX - KERNEL_BASE ||
+        unload_rva > UINT32_MAX - KERNEL_BASE)
+        return false;
+
+    s_cpu->exec_loader_pc[0] = KERNEL_BASE + load_rva;
+    s_cpu->exec_loader_pc[1] = KERNEL_BASE + unload_rva;
+    s_cpu->exec_loader_return_pc = 0;
+    queue_tb_flush(s_cpu);
+    s_loader_resolved = true;
+    fprintf(stderr,
+            "[D3D-HLE] kernel loader base=%08X XeLoadSection=%08X "
+            "XeUnloadSection=%08X\n",
+            KERNEL_BASE, (uint32_t)s_cpu->exec_loader_pc[0],
+            (uint32_t)s_cpu->exec_loader_pc[1]);
+    return true;
+}
+
+static void xemu_d3d_hle_reset_coverage(void)
+{
+    g_free(s_coverage.page_bits);
+    memset(&s_coverage, 0, sizeof(s_coverage));
+}
+
+static bool xemu_d3d_hle_section_name_is(
+    const char name[16], const char *expected)
+{
+    return g_ascii_strcasecmp(name, expected) == 0 ||
+           (expected[0] == 'D' && name[0] == '.' &&
+            g_ascii_strncasecmp(name + 1, expected, 15) == 0);
+}
+
+static uint32_t xemu_d3d_hle_covered_span(
+    uint32_t address, uint32_t size)
+{
+    uint32_t covered = 0;
+
+    while (size) {
+        uint32_t page = address & TARGET_PAGE_MASK;
+        uint32_t page_offset = address & ~TARGET_PAGE_MASK;
+        uint32_t chunk = MIN(size, TARGET_PAGE_SIZE - page_offset);
+        hwaddr physical;
+
+        if (xemu_d3d_hle_translate(page, &physical)) {
+            uint64_t page_index =
+                ((uint64_t)page - s_coverage.image_base) /
+                TARGET_PAGE_SIZE;
+            if (page >= s_coverage.image_base &&
+                page_index < s_coverage.page_count)
+                s_coverage.page_bits[page_index] = 1;
+            covered += chunk;
+        }
+        address += chunk;
+        size -= chunk;
+    }
+    return covered;
+}
+
+static bool xemu_d3d_hle_span_fully_mapped(
+    uint32_t address, uint32_t size)
+{
+    while (size) {
+        uint32_t page = address & TARGET_PAGE_MASK;
+        uint32_t page_offset = address & ~TARGET_PAGE_MASK;
+        uint32_t chunk = MIN(size, TARGET_PAGE_SIZE - page_offset);
+        hwaddr physical;
+
+        if (!xemu_d3d_hle_translate(page, &physical))
+            return false;
+        address += chunk;
+        size -= chunk;
+    }
+    return true;
+}
+
+static bool xemu_d3d_hle_update_coverage(void)
+{
+    xbe_header header;
+    xbe_section_header *sections = NULL;
+    size_t section_bytes;
+    uint32_t image_end;
+    uint32_t d3d_needed = 0;
+    uint32_t d3d_covered = 0;
+    uint32_t fallback_needed = 0;
+    uint32_t fallback_covered = 0;
+    bool has_d3d = false;
+    bool has_text = false;
+    bool have_section_names = true;
+    size_t i;
+
+    if (!xemu_d3d_hle_read(0x00010000u, &header, sizeof(header)) ||
+        header.dwMagic != 0x48454258u ||
+        header.dwBaseAddr != 0x00010000u ||
+        !header.dwSizeofImage ||
+        header.dwSizeofImage > 0x08000000u ||
+        header.dwSizeofHeaders < sizeof(header) ||
+        header.dwSections == 0 || header.dwSections > 256u ||
+        header.pSectionHeadersAddr < header.dwBaseAddr ||
+        header.pSectionHeadersAddr - header.dwBaseAddr >
+            header.dwSizeofHeaders)
+        return false;
+
+    section_bytes = (size_t)header.dwSections * sizeof(xbe_section_header);
+    if (section_bytes > header.dwSizeofHeaders ||
+        header.pSectionHeadersAddr - header.dwBaseAddr >
+            header.dwSizeofHeaders - section_bytes)
+        return false;
+    image_end = header.dwBaseAddr + header.dwSizeofImage;
+
+    if (s_coverage.image_base != header.dwBaseAddr ||
+        s_coverage.image_size != header.dwSizeofImage ||
+        !s_coverage.page_bits) {
+        xemu_d3d_hle_reset_coverage();
+        s_coverage.image_base = header.dwBaseAddr;
+        s_coverage.image_size = header.dwSizeofImage;
+        s_coverage.page_count =
+            ((uint64_t)header.dwSizeofImage + TARGET_PAGE_SIZE - 1u) /
+            TARGET_PAGE_SIZE;
+        s_coverage.page_bits = g_new0(uint8_t, s_coverage.page_count);
+        if (!s_coverage.page_bits)
+            return false;
+    }
+    memset(s_coverage.page_bits, 0, s_coverage.page_count);
+
+    sections = g_new0(xbe_section_header, header.dwSections);
+    if (!sections || !xemu_d3d_hle_read(
+            header.pSectionHeadersAddr, sections, section_bytes)) {
+        g_free(sections);
+        return false;
+    }
+
+    for (i = 0; i < header.dwSections; ++i) {
+        char name[16] = { 0 };
+        const xbe_section_header *section = &sections[i];
+
+        if (!section->dwSizeofRaw ||
+            section->dwVirtualAddr < header.dwBaseAddr ||
+            section->dwVirtualAddr >= image_end ||
+            section->dwSizeofRaw > image_end - section->dwVirtualAddr)
+            continue;
+        if (!section->SectionNameAddr ||
+            !xemu_d3d_hle_read(section->SectionNameAddr,
+                               name, sizeof(name) - 1u)) {
+            have_section_names = false;
+            continue;
+        }
+        has_d3d = has_d3d ||
+            xemu_d3d_hle_section_name_is(name, "D3D");
+        has_text = has_text ||
+            xemu_d3d_hle_section_name_is(name, ".text");
+    }
+
+    for (i = 0; i < header.dwSections; ++i) {
+        char name[16] = { 0 };
+        const xbe_section_header *section = &sections[i];
+        bool is_d3d;
+        bool is_text;
+        bool fallback_exec;
+        bool required;
+
+        if (!section->dwSizeofRaw ||
+            section->dwVirtualAddr < header.dwBaseAddr ||
+            section->dwVirtualAddr >= image_end ||
+            section->dwSizeofRaw > image_end - section->dwVirtualAddr ||
+            !section->SectionNameAddr ||
+            !xemu_d3d_hle_read(section->SectionNameAddr,
+                               name, sizeof(name) - 1u))
+            continue;
+        is_d3d = xemu_d3d_hle_section_name_is(name, "D3D");
+        is_text = xemu_d3d_hle_section_name_is(name, ".text");
+        fallback_exec = !has_d3d && !has_text &&
+            (section->dwFlags_value & XBE_SECTION_HEADER_FLAGS_EXECUTABLE);
+        required = has_d3d ? is_d3d : (has_text ? is_text : fallback_exec);
+        if (!required)
+            continue;
+        if (has_d3d) {
+            d3d_needed += section->dwSizeofRaw;
+            d3d_covered += xemu_d3d_hle_covered_span(
+                section->dwVirtualAddr, section->dwSizeofRaw);
+        } else {
+            fallback_needed += section->dwSizeofRaw;
+            fallback_covered += xemu_d3d_hle_covered_span(
+                section->dwVirtualAddr, section->dwSizeofRaw);
+        }
+    }
+    g_free(sections);
+
+    if (!have_section_names)
+        return false;
+    {
+        uint32_t needed = has_d3d ? d3d_needed : fallback_needed;
+        uint32_t covered = has_d3d ? d3d_covered : fallback_covered;
+        bool changed = s_coverage.has_d3d_section != has_d3d ||
+                       s_coverage.d3d_needed != needed ||
+                       s_coverage.d3d_covered != covered;
+
+        s_coverage.has_d3d_section = has_d3d;
+        s_coverage.d3d_needed = needed;
+        s_coverage.d3d_covered = covered;
+        if (changed)
+            ++s_coverage.coverage_epoch;
+    }
+    s_coverage.ready = s_coverage.d3d_needed != 0 &&
+                       s_coverage.d3d_covered >= s_coverage.d3d_needed;
+    if (s_coverage.d3d_covered != s_coverage.reported_covered) {
+        s_coverage.reported_covered = s_coverage.d3d_covered;
+        g_snprintf(s_status_detail, sizeof(s_status_detail),
+                   "scanning mapped D3D pages (covered=%u/%u)",
+                   s_coverage.d3d_covered, s_coverage.d3d_needed);
+        fprintf(stderr, "[D3D-HLE] %s\n", s_status_detail);
+    }
+    return s_coverage.ready;
+}
+
 static bool xemu_d3d_hle_sha1(uint32_t va, uint32_t size,
                               const char *expected)
 {
@@ -287,15 +676,127 @@ static bool xemu_d3d_hle_validate_profile(
 static const XemuD3DHleProfile *xemu_d3d_hle_select_profile(void)
 {
     const XemuD3DHleProfile *const *profiles;
+    char error[256];
     size_t count;
     size_t i;
 
     profiles = xemu_d3d_hle_profiles(&count);
     for (i = 0; i < count; ++i) {
+        if (!xemu_d3d_hle_profile_validate(
+                profiles[i], error, sizeof(error))) {
+            fprintf(stderr,
+                    "[D3D-HLE] exact-profile invalid: %s; "
+                    "skipping that override\n",
+                    error);
+            continue;
+        }
+        if (profiles[i]->bootstrap == XEMU_D3D_HLE_BOOTSTRAP_DIRECT &&
+            !d3d_hle_guest_synthetic_allocator_available()) {
+            fprintf(stderr,
+                    "[D3D-HLE] exact-profile invalid: %s requires "
+                    "synthetic guest allocation; skipping that override\n",
+                    profiles[i]->name);
+            continue;
+        }
         if (xemu_d3d_hle_validate_profile(profiles[i]))
             return profiles[i];
     }
     return NULL;
+}
+
+static bool xemu_d3d_hle_read_identity(
+    uint32_t *title_id, uint32_t *timedate, uint32_t *image_size)
+{
+    uint32_t magic;
+    uint32_t base;
+    uint32_t headers;
+    uint32_t image;
+    uint32_t timestamp;
+    uint32_t certificate;
+    uint32_t title;
+
+    if (!title_id || !timedate || !image_size ||
+        !xemu_d3d_hle_read_u32(0x00010000u, &magic) ||
+        !xemu_d3d_hle_read_u32(0x00010104u, &base) ||
+        !xemu_d3d_hle_read_u32(0x00010108u, &headers) ||
+        !xemu_d3d_hle_read_u32(0x0001010Cu, &image) ||
+        !xemu_d3d_hle_read_u32(0x00010114u, &timestamp) ||
+        !xemu_d3d_hle_read_u32(0x00010118u, &certificate) ||
+        !xemu_d3d_hle_read_u32(certificate + 8u, &title) ||
+        magic != 0x48454258u || base != 0x00010000u ||
+        headers < 0x178u || headers > image ||
+        image > 0x08000000u || image > UINT32_MAX - base)
+        return false;
+    *title_id = title;
+    *timedate = timestamp;
+    *image_size = image;
+    return true;
+}
+
+void xemu_d3d_hle_session_reset(const char *why)
+{
+    fprintf(stderr, "[D3D-HLE] session reset begin: %s\n",
+            why && why[0] ? why : "unspecified");
+    s_host_ready = false;
+    qatomic_set(&s_session_reset_queued, false);
+    qemu_mutex_lock(&s_overlay_mutex);
+    s_overlay_visible = false;
+    ++s_overlay_version;
+    qemu_mutex_unlock(&s_overlay_mutex);
+    if (s_requested)
+        d3d_hle_guest_reset_session();
+    fprintf(stderr, "[D3D-HLE] session reset teardown complete\n");
+    g_free(s_bootstrap_deferred);
+    s_bootstrap_deferred = NULL;
+    s_bootstrap_deferred_count = 0;
+    s_bootstrap_deferred_capacity = 0;
+    memset(&s_pending, 0, sizeof(s_pending));
+    memset(&s_device_pending, 0, sizeof(s_device_pending));
+    s_device_pending_active = false;
+    s_profile = NULL;
+    s_profile_checked = false;
+    s_profile_valid = false;
+    s_discovery_job_queued = false;
+    s_discovery_job_generation = 0;
+    s_discovery_job_pc = 0;
+    s_discovery_scanned_epoch = 0;
+    s_header_valid = false;
+    s_header_valid_ms = 0;
+    s_loader_call_active = false;
+    loader_entry_span_mapped = false;
+    s_loader_section_va = 0;
+    s_loader_section_size = 0;
+    if (s_cpu)
+        s_cpu->exec_loader_return_pc = 0;
+    s_identity_valid = false;
+    s_identity_title_id = 0;
+    s_identity_timedate = 0;
+    s_identity_image_size = 0;
+    xemu_d3d_hle_reset_coverage();
+    xrecomp_d3d_hle_dirty_flags_va = 0;
+    xrecomp_d3d_hle_deferred_texture_state_va = 0;
+    xrecomp_d3d_hle_fog_state_va = 0;
+    s_vblank_queued = false;
+    s_vblank_pcrtc_start = 0;
+    s_trace_dumped = false;
+    s_hook_entry_count = 0;
+    s_last_hook_pc = 0;
+    s_last_hook_name = NULL;
+    s_active_hook_name = NULL;
+    memset(s_trace_ring, 0, sizeof(s_trace_ring));
+    s_overlay_seen = false;
+    s_post_fmv = false;
+    if (s_cpu)
+        s_cpu->exec_entry_return_pc = 0;
+    ++s_generation;
+    g_snprintf(s_status_detail, sizeof(s_status_detail),
+               "session reset: %s", why && why[0] ? why : "unspecified");
+    qatomic_set(&s_status, s_requested
+        ? XEMU_D3D_HLE_STATUS_ARMED
+        : XEMU_D3D_HLE_STATUS_DISABLED);
+    fprintf(stderr,
+            "[D3D-HLE] session reset: gen=%u (%s)\n",
+            s_generation, why && why[0] ? why : "unspecified");
 }
 
 static void xemu_d3d_hle_load_registers(CPUX86State *env)
@@ -353,22 +854,16 @@ static bool xemu_d3d_hle_resolve_loaded_xbe(uint32_t pc)
         s_profile = xemu_d3d_hle_discover(
             xemu_d3d_hle_read, &retryable, error, sizeof(error));
         if (!s_profile) {
-            if (retryable && s_discovery_retry_attempts < 8u) {
-                unsigned retry = ++s_discovery_retry_attempts;
-                uint32_t delay_ms = MIN(
-                    100u << MIN(retry - 1u, 3u), 1000u);
-
+            if (retryable) {
                 s_profile_checked = false;
-                s_discovery_retry_at_ms =
-                    xrecomp_host_monotonic_ms() + delay_ms;
                 g_snprintf(s_status_detail, sizeof(s_status_detail),
-                           "%s; retry %u/8 in %u ms",
-                           error, retry, delay_ms);
+                           "%s; waiting for another mapped section",
+                           error);
                 qatomic_set(&s_status, XEMU_D3D_HLE_STATUS_ARMED);
                 fprintf(stderr,
                         "[D3D-HLE] loaded XBE is not scan-ready: %s; "
-                        "retry %u/8 in %u ms\n",
-                        error, retry, delay_ms);
+                        "waiting for coverage growth\n",
+                        error);
                 return false;
             }
             g_strlcpy(s_status_detail, error, sizeof(s_status_detail));
@@ -381,9 +876,26 @@ static bool xemu_d3d_hle_resolve_loaded_xbe(uint32_t pc)
         }
     }
 
+    if (s_profile->discovery_mutating_uncovered_count ||
+        s_profile->discovery_uncovered_abi_count) {
+        g_snprintf(s_status_detail, sizeof(s_status_detail),
+                   "automatic D3D discovery left %u mutating functions "
+                   "and %u ABI holes uncovered",
+                   s_profile->discovery_mutating_uncovered_count,
+                   s_profile->discovery_uncovered_abi_count);
+        qatomic_set(&s_status, XEMU_D3D_HLE_STATUS_PROFILE_REJECTED);
+        fprintf(stderr,
+                "[D3D-HLE] automatic profile refused: mutating=%u "
+                "uncovered-abi=%u total-uncovered=%u; leaving title on NV2A\n",
+                s_profile->discovery_mutating_uncovered_count,
+                s_profile->discovery_uncovered_abi_count,
+                s_profile->discovery_unsupported_count);
+        s_profile = NULL;
+        s_profile_valid = false;
+        return false;
+    }
+
     s_status_detail[0] = '\0';
-    s_discovery_retry_at_ms = 0;
-    s_discovery_retry_attempts = 0;
     s_profile_valid = true;
     xrecomp_d3d_hle_dirty_flags_va = s_profile->dirty_flags_va;
     xrecomp_d3d_hle_deferred_texture_state_va =
@@ -706,6 +1218,53 @@ static bool xemu_d3d_hle_exec(void *opaque, CPUState *cpu, vaddr linear_pc)
     if (!s_requested)
         return false;
 
+    if (pc == s_cpu->exec_loader_pc[0] ||
+        pc == s_cpu->exec_loader_pc[1] ||
+        (s_loader_call_active &&
+         pc == s_cpu->exec_loader_return_pc)) {
+        if (s_loader_call_active &&
+            pc == s_cpu->exec_loader_return_pc) {
+            const bool success = (int32_t)env->regs[R_EAX] >= 0;
+
+            s_cpu->exec_loader_return_pc = 0;
+            s_loader_call_active = false;
+            if (success && !loader_entry_span_mapped &&
+                s_loader_section_size) {
+                fprintf(stderr,
+                        "[D3D-HLE] section commit: va=%08X size=%X\n",
+                        s_loader_section_va, s_loader_section_size);
+                if (s_host_ready) {
+                    xemu_d3d_hle_queue_session_reset();
+                } else if (!s_profile_checked &&
+                           xemu_d3d_hle_update_coverage()) {
+                    xemu_d3d_hle_queue_discovery(s_loader_section_va);
+                }
+            }
+            return false;
+        }
+        if (!s_loader_call_active) {
+            xbe_section_header section;
+            uint32_t section_va = xemu_d3d_hle_stack(env, 1);
+
+            memset(&section, 0, sizeof(section));
+            s_loader_section_va = 0;
+            s_loader_section_size = 0;
+            loader_entry_span_mapped = false;
+            if (section_va && xemu_d3d_hle_read(
+                    section_va, &section, sizeof(section))) {
+                s_loader_section_va = section.dwVirtualAddr;
+                s_loader_section_size = section.dwSizeofRaw;
+                loader_entry_span_mapped =
+                    s_loader_section_size &&
+                    xemu_d3d_hle_span_fully_mapped(
+                        s_loader_section_va, s_loader_section_size);
+            }
+            s_cpu->exec_loader_return_pc = xemu_d3d_hle_stack(env, 0);
+            s_loader_call_active = s_cpu->exec_loader_return_pc != 0;
+        }
+        return false;
+    }
+
     if (s_pending.kind != XEMU_D3D_PENDING_NONE) {
         if (pc == s_pending.return_pc)
             xemu_d3d_hle_finish_pending(env);
@@ -956,17 +1515,91 @@ static bool xemu_d3d_hle_exec(void *opaque, CPUState *cpu, vaddr linear_pc)
     return true;
 }
 
+static void xemu_d3d_hle_discovery_on_cpu(
+    CPUState *cpu, run_on_cpu_data data)
+{
+    uint32_t generation;
+    uint32_t pc;
+
+    (void)cpu;
+    (void)data;
+    if (!s_discovery_job_queued)
+        return;
+    generation = s_discovery_job_generation;
+    pc = s_discovery_job_pc;
+    s_discovery_job_queued = false;
+    if (generation != s_generation || !s_identity_valid ||
+        s_profile_checked || !xemu_d3d_hle_update_coverage())
+        return;
+    s_discovery_scanned_epoch = s_coverage.coverage_epoch;
+    (void)xemu_d3d_hle_resolve_loaded_xbe(pc);
+}
+
+static void xemu_d3d_hle_queue_discovery(uint32_t pc)
+{
+    if (!s_cpu || s_discovery_job_queued ||
+        s_discovery_scanned_epoch == s_coverage.coverage_epoch)
+        return;
+    s_discovery_job_queued = true;
+    s_discovery_job_generation = s_generation;
+    s_discovery_job_pc = pc;
+    async_run_on_cpu(s_cpu, xemu_d3d_hle_discovery_on_cpu,
+                     RUN_ON_CPU_NULL);
+}
+
 static bool xemu_d3d_hle_is_entry(void *opaque, vaddr linear_pc)
 {
+    uint32_t title_id;
+    uint32_t timedate;
+    uint32_t image_size;
+
     (void)opaque;
+    if (xemu_d3d_hle_read_identity(
+            &title_id, &timedate, &image_size)) {
+        if (!s_identity_valid) {
+            s_identity_title_id = title_id;
+            s_identity_timedate = timedate;
+            s_identity_image_size = image_size;
+            s_identity_valid = true;
+            if (!s_generation)
+                s_generation = 1;
+        } else if (s_identity_title_id != title_id ||
+                   s_identity_timedate != timedate ||
+                   s_identity_image_size != image_size) {
+            xemu_d3d_hle_session_reset("XBE identity changed");
+            s_identity_title_id = title_id;
+            s_identity_timedate = timedate;
+            s_identity_image_size = image_size;
+            s_identity_valid = true;
+        }
+    }
+    if (!s_header_valid &&
+        xemu_d3d_hle_pc_is_in_loaded_xbe((uint32_t)linear_pc)) {
+        s_header_valid = true;
+        s_header_valid_ms = xrecomp_host_monotonic_ms();
+    }
     if (!s_profile_checked) {
-        if (s_discovery_retry_at_ms &&
-            xrecomp_host_monotonic_ms() < s_discovery_retry_at_ms) {
+        if (!xemu_d3d_hle_update_coverage()) {
+            uint64_t now = xrecomp_host_monotonic_ms();
+            if (s_header_valid &&
+                now - s_header_valid_ms >= 5000u) {
+                s_profile_checked = true;
+                s_profile_valid = false;
+                g_strlcpy(s_status_detail,
+                          "D3D section never fully mapped",
+                          sizeof(s_status_detail));
+                qatomic_set(&s_status,
+                            XEMU_D3D_HLE_STATUS_PROFILE_REJECTED);
+                fprintf(stderr,
+                        "[D3D-HLE] refusing Plume: D3D section never "
+                        "fully mapped; leaving title on NV2A\n");
+            } else {
+                qatomic_set(&s_status, XEMU_D3D_HLE_STATUS_ARMED);
+            }
             return false;
         }
-        s_discovery_retry_at_ms = 0;
-        if (!xemu_d3d_hle_resolve_loaded_xbe((uint32_t)linear_pc))
-            return false;
+        xemu_d3d_hle_queue_discovery((uint32_t)linear_pc);
+        return false;
     }
     return xemu_d3d_hle_find_any_hook((uint32_t)linear_pc) != NULL;
 }
@@ -995,12 +1628,6 @@ void xemu_d3d_hle_install(CPUState *cpu, MemoryRegion *ram)
     s_diagnostics = getenv("XEMU_D3D_HLE_DIAGNOSTICS") != NULL;
     d3d_hle_guest_set_fatal_diagnostic(
         xemu_d3d_hle_dump_trace_ring);
-    if (!xemu_d3d_hle_profiles_validate(error, sizeof(error))) {
-        qatomic_set(&s_status, XEMU_D3D_HLE_STATUS_FAILED);
-        fprintf(stderr, "[D3D-HLE] invalid reviewed profile registry: %s\n",
-                error);
-        return;
-    }
     if (!xrecomp_d3d_frontend_initialize_value(
             request, error, sizeof(error))) {
         qatomic_set(&s_status, XEMU_D3D_HLE_STATUS_FAILED);
@@ -1022,6 +1649,9 @@ void xemu_d3d_hle_install(CPUState *cpu, MemoryRegion *ram)
     cpu->exec_entry_check = xemu_d3d_hle_is_entry;
     cpu->exec_entry_callback = xemu_d3d_hle_exec;
     cpu->exec_entry_callback_opaque = NULL;
+    cpu->exec_loader_pc[0] = 0;
+    cpu->exec_loader_pc[1] = 0;
+    cpu->exec_loader_return_pc = 0;
     fprintf(stderr,
             "[D3D-HLE] opt-in armed; waiting for a loaded XBE, then "
             "discovering its linked XDK D3D8 runtime automatically\n");
@@ -1264,13 +1894,57 @@ static void xemu_d3d_hle_vblank_on_cpu(CPUState *cpu, run_on_cpu_data data)
     /* Clear first so a VBlank arriving while this callback runs can enqueue
      * the next service. All renderer calls remain serialized on this vCPU. */
     qatomic_set(&s_vblank_queued, false);
+    if (qatomic_read(&s_session_reset_queued))
+        return;
     pcrtc_start = qatomic_read(&s_vblank_pcrtc_start);
     xemu_d3d_hle_service_vblank(pcrtc_start);
 }
 
+static void xemu_d3d_hle_session_reset_on_cpu(
+    CPUState *cpu, run_on_cpu_data data)
+{
+    (void)cpu;
+    (void)data;
+    if (!qatomic_read(&s_session_reset_queued))
+        return;
+    qatomic_set(&s_session_reset_queued, false);
+    xemu_d3d_hle_session_reset("XBE header or identity changed");
+}
+
+static void xemu_d3d_hle_queue_session_reset(void)
+{
+    if (!s_cpu)
+        return;
+    /* Stop every scanout/present path before queueing the CPU0 teardown. The
+     * old guest resource addresses may already be unmapped by the loader. */
+    qatomic_set(&s_host_ready, false);
+    if (qatomic_cmpxchg(&s_session_reset_queued, false, true))
+        return;
+    async_run_on_cpu(s_cpu, xemu_d3d_hle_session_reset_on_cpu,
+                     RUN_ON_CPU_NULL);
+}
+
 void xemu_d3d_hle_vblank(uint32_t pcrtc_start)
 {
-    if (!qatomic_read(&s_host_ready) || !s_cpu)
+    uint32_t title_id;
+    uint32_t timedate;
+    uint32_t image_size;
+
+    if (!s_cpu)
+        return;
+    (void)xemu_d3d_hle_try_resolve_kernel_loader();
+    if (qatomic_read(&s_host_ready)) {
+        if (!xemu_d3d_hle_read_identity(
+                &title_id, &timedate, &image_size) ||
+            (s_identity_valid &&
+             (s_identity_title_id != title_id ||
+              s_identity_timedate != timedate ||
+              s_identity_image_size != image_size))) {
+            xemu_d3d_hle_queue_session_reset();
+            return;
+        }
+    }
+    if (!qatomic_read(&s_host_ready))
         return;
 
     qatomic_set(&s_vblank_pcrtc_start, pcrtc_start);

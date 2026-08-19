@@ -123,11 +123,14 @@ bool translator_use_goto_tb(DisasContextBase *db, vaddr dest)
      * cpu_exec_loop can service them; all other direct edges retain the
      * normal fast path.
      */
-    if (unlikely(db->cpu->exec_entry_check &&
-                 dest >= db->cpu->exec_entry_min_pc &&
-                 dest <= db->cpu->exec_entry_max_pc &&
-                 db->cpu->exec_entry_check(
-                     db->cpu->exec_entry_callback_opaque, dest))) {
+    if (unlikely((dest == db->cpu->exec_loader_pc[0] ||
+                  dest == db->cpu->exec_loader_pc[1] ||
+                  dest == db->cpu->exec_loader_return_pc) ||
+                 (db->cpu->exec_entry_check &&
+                  dest >= db->cpu->exec_entry_min_pc &&
+                  dest <= db->cpu->exec_entry_max_pc &&
+                  db->cpu->exec_entry_check(
+                      db->cpu->exec_entry_callback_opaque, dest)))) {
         return false;
     }
 #endif

@@ -562,6 +562,11 @@ struct CPUState {
     /* One dynamic return address used while a pass-through call is being
      * observed so its guest result can be mirrored before chaining resumes. */
     vaddr exec_entry_return_pc;
+    /* Process-lifetime observe-only kernel loader entry points and the one
+     * return address currently being observed. These are discrete PCs, not a
+     * widened user-space hook range. */
+    vaddr exec_loader_pc[2];
+    vaddr exec_loader_return_pc;
 #endif
 
     void *opaque;

@@ -421,6 +421,9 @@ const void *HELPER(lookup_tb_ptr)(CPUArchState *env)
      */
     if (unlikely(cpu->exec_entry_callback)) {
         if (s.pc == cpu->exec_entry_return_pc ||
+            s.pc == cpu->exec_loader_pc[0] ||
+            s.pc == cpu->exec_loader_pc[1] ||
+            s.pc == cpu->exec_loader_return_pc ||
             (cpu->exec_entry_check &&
              s.pc >= cpu->exec_entry_min_pc &&
              s.pc <= cpu->exec_entry_max_pc &&

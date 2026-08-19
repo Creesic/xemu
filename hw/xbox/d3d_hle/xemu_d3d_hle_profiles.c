@@ -79,77 +79,87 @@ void xemu_d3d_hle_profile_range(uint32_t *first, uint32_t *last)
         *last = maximum;
 }
 
+bool xemu_d3d_hle_profile_validate(
+    const XemuD3DHleProfile *profile, char *error, size_t error_capacity)
+{
+    uint32_t specials[13];
+    size_t j;
+
+    if (!profile || !profile->name || !profile->name[0] ||
+        !profile->source_xbe_sha256 ||
+        strlen(profile->source_xbe_sha256) != 64u ||
+        !profile->d3d_section_sha1 ||
+        strlen(profile->d3d_section_sha1) != 40u ||
+        !profile->hooks || !profile->hook_count) {
+        return profile_error(error, error_capacity, profile,
+                             "incomplete identity or hook metadata");
+    }
+    specials[0] = profile->special.get_back_buffer;
+    specials[1] = profile->special.set_texture;
+    specials[2] = profile->special.switch_texture;
+    specials[3] = profile->special.resource_release;
+    specials[4] = profile->special.surface_lock_rect;
+    specials[5] = profile->special.create_device;
+    specials[6] = profile->special.create_vertex_buffer;
+    specials[7] = profile->special.create_index_buffer;
+    specials[8] = profile->special.lock_3d_surface;
+    specials[9] = profile->special.create_vertex_shader;
+    specials[10] = profile->special.delete_vertex_shader;
+    specials[11] = profile->special.create_pixel_shader;
+    specials[12] = profile->special.delete_pixel_shader;
+    if (!profile->reviewed_required_hook_count ||
+        profile->reviewed_implemented_hook_count !=
+            profile->reviewed_required_hook_count ||
+        profile->reviewed_blocker_count != 0u ||
+        profile->hook_count < profile->reviewed_implemented_hook_count) {
+        return profile_error(error, error_capacity, profile,
+                             "detector readiness is not coverage-complete");
+    }
+    if (profile->bootstrap != XEMU_D3D_HLE_BOOTSTRAP_MIRROR_NATIVE &&
+        profile->bootstrap != XEMU_D3D_HLE_BOOTSTRAP_DIRECT) {
+        return profile_error(error, error_capacity, profile,
+                             "unknown CreateDevice bootstrap policy");
+    }
+    for (j = 0; j < profile->hook_count; ++j) {
+        const XemuD3DHleHook *hook = &profile->hooks[j];
+        if ((hook->address & 0xFu) != 0u || !hook->name ||
+            !hook->name[0] ||
+            (j && hook[-1].address >= hook->address)) {
+            return profile_error(error, error_capacity, profile,
+                                 "hook table is unsorted, duplicated, or unaligned");
+        }
+    }
+
+    for (j = 0; j < G_N_ELEMENTS(specials); ++j) {
+        if (specials[j] &&
+            !xemu_d3d_hle_profile_find_hook(profile, specials[j])) {
+            return profile_error(error, error_capacity, profile,
+                                 "special hook is absent from the hook table");
+        }
+    }
+    if (!profile->special.create_device) {
+        return profile_error(error, error_capacity, profile,
+                             "CreateDevice hook is missing");
+    }
+    if (profile->bootstrap == XEMU_D3D_HLE_BOOTSTRAP_DIRECT &&
+        !xemu_d3d_hle_profile_find_hook(
+             profile, profile->special.create_device)->entry) {
+        return profile_error(error, error_capacity, profile,
+                             "direct CreateDevice wrapper is missing");
+    }
+    if (error && error_capacity)
+        error[0] = '\0';
+    return true;
+}
+
 bool xemu_d3d_hle_profiles_validate(char *error, size_t error_capacity)
 {
     size_t i;
 
     for (i = 0; i < G_N_ELEMENTS(profiles); ++i) {
-        const XemuD3DHleProfile *profile = profiles[i];
-        uint32_t specials[13];
-        size_t j;
-
-        if (!profile || !profile->name || !profile->name[0] ||
-            !profile->source_xbe_sha256 ||
-            strlen(profile->source_xbe_sha256) != 64u ||
-            !profile->d3d_section_sha1 ||
-            strlen(profile->d3d_section_sha1) != 40u ||
-            !profile->hooks || !profile->hook_count) {
-            return profile_error(error, error_capacity, profile,
-                                 "incomplete identity or hook metadata");
-        }
-        specials[0] = profile->special.get_back_buffer;
-        specials[1] = profile->special.set_texture;
-        specials[2] = profile->special.switch_texture;
-        specials[3] = profile->special.resource_release;
-        specials[4] = profile->special.surface_lock_rect;
-        specials[5] = profile->special.create_device;
-        specials[6] = profile->special.create_vertex_buffer;
-        specials[7] = profile->special.create_index_buffer;
-        specials[8] = profile->special.lock_3d_surface;
-        specials[9] = profile->special.create_vertex_shader;
-        specials[10] = profile->special.delete_vertex_shader;
-        specials[11] = profile->special.create_pixel_shader;
-        specials[12] = profile->special.delete_pixel_shader;
-        if (!profile->reviewed_required_hook_count ||
-            profile->reviewed_implemented_hook_count !=
-                profile->reviewed_required_hook_count ||
-            profile->reviewed_blocker_count != 0u ||
-            profile->hook_count < profile->reviewed_implemented_hook_count) {
-            return profile_error(error, error_capacity, profile,
-                                 "detector readiness is not coverage-complete");
-        }
-        if (profile->bootstrap != XEMU_D3D_HLE_BOOTSTRAP_MIRROR_NATIVE &&
-            profile->bootstrap != XEMU_D3D_HLE_BOOTSTRAP_DIRECT) {
-            return profile_error(error, error_capacity, profile,
-                                 "unknown CreateDevice bootstrap policy");
-        }
-        for (j = 0; j < profile->hook_count; ++j) {
-            const XemuD3DHleHook *hook = &profile->hooks[j];
-            if ((hook->address & 0xFu) != 0u || !hook->name ||
-                !hook->name[0] ||
-                (j && hook[-1].address >= hook->address)) {
-                return profile_error(error, error_capacity, profile,
-                                     "hook table is unsorted, duplicated, or unaligned");
-            }
-        }
-
-        for (j = 0; j < G_N_ELEMENTS(specials); ++j) {
-            if (specials[j] &&
-                !xemu_d3d_hle_profile_find_hook(profile, specials[j])) {
-                return profile_error(error, error_capacity, profile,
-                                     "special hook is absent from the hook table");
-            }
-        }
-        if (!profile->special.create_device) {
-            return profile_error(error, error_capacity, profile,
-                                 "CreateDevice hook is missing");
-        }
-        if (profile->bootstrap == XEMU_D3D_HLE_BOOTSTRAP_DIRECT &&
-            !xemu_d3d_hle_profile_find_hook(
-                 profile, profile->special.create_device)->entry) {
-            return profile_error(error, error_capacity, profile,
-                                 "direct CreateDevice wrapper is missing");
-        }
+        if (!xemu_d3d_hle_profile_validate(
+                profiles[i], error, error_capacity))
+            return false;
     }
     if (error && error_capacity)
         error[0] = '\0';
