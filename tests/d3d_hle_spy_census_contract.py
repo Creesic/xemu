@@ -77,4 +77,28 @@ assert "[F2] call" not in exec_body or "xgpu_plume_f2_log" in exec_body
 assert "spy-swap" in exec_body
 assert "call %s class=%s" in exec_body
 
+vblank_start = HLE.index("void xemu_d3d_hle_vblank")
+# next public function
+vblank_end = HLE.index("void xemu_d3d_hle_publish_overlay", vblank_start)
+vblank_body = HLE[vblank_start:vblank_end]
+assert "xgpu_plume_f2_poll" in vblank_body
+assert "xemu_d3d_hle_spy_on_f2_poll" in vblank_body
+assert "spy-vblank" in vblank_body
+# Poll happens even when the host is not ready.
+host_ready_returns = list(__import__("re").finditer(r"if \(!qatomic_read\(&s_host_ready\)\)\s*return;", vblank_body))
+assert host_ready_returns, "vblank must still refuse Plume present when !host_ready"
+assert vblank_body.index("xgpu_plume_f2_poll") < host_ready_returns[-1].start()
+
+reset_start = HLE.index("void xemu_d3d_hle_session_reset")
+reset_end = HLE.index("static void xemu_d3d_hle_load_registers", reset_start)
+reset_body = HLE[reset_start:reset_end]
+assert "xemu_d3d_hle_spy_dump" in reset_body
+assert "xemu_d3d_hle_spy_reset" in reset_body
+assert reset_body.index("xemu_d3d_hle_spy_dump") < reset_body.index("s_profile = NULL")
+assert reset_body.index("xemu_d3d_hle_spy_dump") < reset_body.index("xemu_d3d_hle_spy_reset")
+
+README = (ROOT / "hw/xbox/d3d_hle/README.md").read_text(encoding="utf-8")
+assert "XEMU_D3D_HLE_SPY" in README
+assert "SPY-CENSUS.md" in README
+
 print("d3d_hle_spy_census_contract: OK")

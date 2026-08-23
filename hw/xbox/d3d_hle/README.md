@@ -116,5 +116,9 @@ split-renderer case) is in `UNIVERSAL-SETUP.md`.
   results above are offline detector validation and still need real runtime QA.
 - A successful build proves integration, not gameplay parity or the expected
   frametime improvement. Runtime capture is required for performance claims.
+- Optional D3D8 spy census: with Plume requested and `XEMU_D3D_HLE_SPY=1`,
+  xemu intercepts recognized D3D8 entries, leaves NV2A in charge, and writes
+  `plume_d3d8_census.log` (see `SPY-CENSUS.md`). This is a work-list tool,
+  not gameplay proof.
 
 See `PROVENANCE.md` for dependency revisions and licensing.

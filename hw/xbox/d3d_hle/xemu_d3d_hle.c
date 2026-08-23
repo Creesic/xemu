@@ -754,6 +754,9 @@ void xemu_d3d_hle_session_reset(const char *why)
     memset(&s_pending, 0, sizeof(s_pending));
     memset(&s_device_pending, 0, sizeof(s_device_pending));
     s_device_pending_active = false;
+    if (xemu_d3d_hle_spy_enabled())
+        xemu_d3d_hle_spy_dump("reset");
+    xemu_d3d_hle_spy_reset();
     s_profile = NULL;
     s_profile_checked = false;
     s_profile_valid = false;
@@ -1989,6 +1992,19 @@ void xemu_d3d_hle_vblank(uint32_t pcrtc_start)
               s_identity_image_size != image_size))) {
             xemu_d3d_hle_queue_session_reset();
             return;
+        }
+    }
+    if (xemu_d3d_hle_spy_enabled()) {
+        xgpu_plume_f2_poll();
+        xemu_d3d_hle_spy_on_f2_poll(xgpu_plume_f2_active());
+        if (xgpu_plume_f2_active() &&
+            !xemu_d3d_hle_spy_capture_seen_swap())
+            xgpu_plume_f2_present(1, "spy-vblank", 0, 0);
+        if (s_profile_valid) {
+            g_snprintf(s_status_detail, sizeof(s_status_detail),
+                       "D3D8 spy on NV2A: %u symbols, %u called holes",
+                       xemu_d3d_hle_spy_symbol_count(),
+                       xemu_d3d_hle_spy_called_holes());
         }
     }
     if (!qatomic_read(&s_host_ready))
