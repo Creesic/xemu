@@ -100,7 +100,6 @@ typedef struct XemuD3DHleProfile {
     uint32_t discovery_recognized_count;
     uint32_t discovery_unsupported_count;
     uint32_t discovery_duplicate_count;
-    uint32_t discovery_ambiguous_count;
     uint32_t discovery_mutating_uncovered_count;
     uint32_t discovery_uncovered_abi_count;
     uint32_t xbe_base;
