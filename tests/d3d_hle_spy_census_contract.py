@@ -67,4 +67,14 @@ assert "xemu_d3d_hle_spy_bind" in resolve_body
 assert "D3D8 spy on NV2A:" in resolve_body
 assert "leaving title on NV2A" in resolve_body
 
+exec_start = HLE.index("static bool xemu_d3d_hle_exec")
+exec_end = HLE.index("static void xemu_d3d_hle_discovery_on_cpu", exec_start)
+exec_body = HLE[exec_start:exec_end]
+assert "xemu_d3d_hle_spy_note" in exec_body
+assert "xemu_d3d_hle_activate_host_device" in exec_body
+assert exec_body.index("xemu_d3d_hle_spy_note") < exec_body.index("xemu_d3d_hle_activate_host_device")
+assert "[F2] call" not in exec_body or "xgpu_plume_f2_log" in exec_body
+assert "spy-swap" in exec_body
+assert "call %s class=%s" in exec_body
+
 print("d3d_hle_spy_census_contract: OK")

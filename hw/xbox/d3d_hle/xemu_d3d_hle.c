@@ -1298,6 +1298,37 @@ static bool xemu_d3d_hle_exec(void *opaque, CPUState *cpu, vaddr linear_pc)
     s_last_hook_name = hook->name;
     xemu_d3d_hle_load_registers(env);
 
+    if (xemu_d3d_hle_spy_enabled()) {
+        unsigned i;
+        char args[160];
+        size_t used = 0;
+
+        xemu_d3d_hle_spy_note(hook);
+        args[0] = '\0';
+        if (xgpu_plume_f2_active()) {
+            for (i = 0; i < hook->source_param_count && i < 8u; ++i) {
+                uint32_t value = 0;
+                int n;
+
+                (void)xemu_d3d_hle_discovered_argument(hook, i, &value);
+                n = g_snprintf(args + used, sizeof(args) - used,
+                               "%sa%u=%08X", used ? " " : "", i, value);
+                if (n < 0 || (size_t)n >= sizeof(args) - used)
+                    break;
+                used += (size_t)n;
+            }
+            xgpu_plume_f2_log("call %s class=%s %s",
+                              hook->name ? hook->name : "?",
+                              xemu_d3d_hle_spy_class_name(hook),
+                              args);
+            if (hook->name &&
+                (strcmp(hook->name, "D3DDevice_Swap") == 0 ||
+                 strcmp(hook->name, "D3DDevice_Present") == 0))
+                xgpu_plume_f2_present(1, "spy-swap", 0, 0);
+        }
+        return false;
+    }
+
     if (!s_host_ready &&
         strcmp(hook->name, "D3DDevice_LoadVertexShaderProgram") == 0) {
         HRESULT result = d3d_hle_guest_load_vertex_shader_program(
