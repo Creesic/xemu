@@ -26,6 +26,7 @@ uint8_t *xbox_guest_ptr(uint32_t va);
 typedef struct XemuD3DHleBinding {
     const char *name;
     XemuD3DHleEntry entry;
+    XemuD3DHleHookPolicy policy;
     uint8_t param_count;
     uint8_t params[XEMU_D3D_HLE_MAX_ABI_ARGS];
 } XemuD3DHleBinding;
@@ -50,22 +51,22 @@ static void automatic_create_device_compact(void)
 #define BP XEMU_D3D_ABI_EBP
 #define SI XEMU_D3D_ABI_ESI
 #define DI XEMU_D3D_ABI_EDI
-#define B0(api, entry_) { #api, (entry_), 0, { 0 } }
-#define B1(api, entry_) { #api, (entry_), 1, { ST } }
-#define B2(api, entry_) { #api, (entry_), 2, { ST, ST } }
-#define B3(api, entry_) { #api, (entry_), 3, { ST, ST, ST } }
-#define B4(api, entry_) { #api, (entry_), 4, { ST, ST, ST, ST } }
-#define B5(api, entry_) { #api, (entry_), 5, { ST, ST, ST, ST, ST } }
-#define B6(api, entry_) { #api, (entry_), 6, { ST, ST, ST, ST, ST, ST } }
-#define B7(api, entry_) { #api, (entry_), 7, { ST, ST, ST, ST, ST, ST, ST } }
-#define A1(api, entry_, a_) { #api, (entry_), 1, { (a_) } }
-#define A2(api, entry_, a_, b_) { #api, (entry_), 2, { (a_), (b_) } }
+#define B0(api, entry_) { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 0, { 0 } }
+#define B1(api, entry_) { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 1, { ST } }
+#define B2(api, entry_) { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 2, { ST, ST } }
+#define B3(api, entry_) { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 3, { ST, ST, ST } }
+#define B4(api, entry_) { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 4, { ST, ST, ST, ST } }
+#define B5(api, entry_) { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 5, { ST, ST, ST, ST, ST } }
+#define B6(api, entry_) { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 6, { ST, ST, ST, ST, ST, ST } }
+#define B7(api, entry_) { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 7, { ST, ST, ST, ST, ST, ST, ST } }
+#define A1(api, entry_, a_) { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 1, { (a_) } }
+#define A2(api, entry_, a_, b_) { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 2, { (a_), (b_) } }
 #define A3(api, entry_, a_, b_, c_) \
-    { #api, (entry_), 3, { (a_), (b_), (c_) } }
+    { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 3, { (a_), (b_), (c_) } }
 #define A5(api, entry_, a_, b_, c_, d_, e_) \
-    { #api, (entry_), 5, { (a_), (b_), (c_), (d_), (e_) } }
+    { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 5, { (a_), (b_), (c_), (d_), (e_) } }
 #define A6(api, entry_, a_, b_, c_, d_, e_, f_) \
-    { #api, (entry_), 6, { (a_), (b_), (c_), (d_), (e_), (f_) } }
+    { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 6, { (a_), (b_), (c_), (d_), (e_), (f_) } }
 
 /*
  * Canonical API -> reviewed wrapper ABI.  Most targets are ordinary stack
@@ -656,10 +657,15 @@ static void register_symbol(const char *library_str, uint32_t library_flag,
         }
     }
     for (i = 0; i < scan->hook_count; ++i) {
-        if (scan->hooks[i].address == address) {
-            ++scan->duplicate_functions;
-            return;
+        if (scan->hooks[i].address != address)
+            continue;
+        if (scan->hooks[i].policy == XEMU_D3D_HLE_HOOK_OBSERVE) {
+            /* Upgrade OBSERVE occupant to the canonical binding in place. */
+            hook = &scan->hooks[i];
+            goto install_bound_hook;
         }
+        ++scan->duplicate_functions;
+        return;
     }
     if (scan->hook_count == G_N_ELEMENTS(scan->hooks)) {
         discovery_note_unsupported(scan, symbol_str, name_length, false,
@@ -667,11 +673,14 @@ static void register_symbol(const char *library_str, uint32_t library_flag,
         return;
     }
     hook = &scan->hooks[scan->hook_count++];
+install_bound_hook:
     memset(hook, 0, sizeof(*hook));
     hook->address = address;
     hook->entry = binding->entry;
     hook->name = binding->name;
     hook->automatic = 1;
+    hook->policy = binding->policy;
+    hook->observe_class = 0;
     hook->source_param_count = param_count;
     hook->source_stack_bytes = stack_bytes;
     hook->source_caller_cleanup = call_type == call_cdecl;

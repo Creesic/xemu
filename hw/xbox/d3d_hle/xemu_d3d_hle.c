@@ -153,6 +153,7 @@ static size_t s_bootstrap_deferred_count;
 static size_t s_bootstrap_deferred_capacity;
 static const char *s_active_hook_name;
 static bool s_vblank_queued;
+static bool s_spy_vblank_queued;
 static bool s_session_reset_queued;
 static uint32_t s_vblank_pcrtc_start;
 
@@ -781,6 +782,7 @@ void xemu_d3d_hle_session_reset(const char *why)
     xrecomp_d3d_hle_deferred_texture_state_va = 0;
     xrecomp_d3d_hle_fog_state_va = 0;
     s_vblank_queued = false;
+    s_spy_vblank_queued = false;
     s_vblank_pcrtc_start = 0;
     s_trace_dumped = false;
     s_hook_entry_count = 0;
@@ -1974,6 +1976,27 @@ static void xemu_d3d_hle_queue_session_reset(void)
                      RUN_ON_CPU_NULL);
 }
 
+static void xemu_d3d_hle_spy_vblank_on_cpu(CPUState *cpu, run_on_cpu_data data)
+{
+    (void)cpu;
+    (void)data;
+    /* Clear first so a later NV2A vblank can enqueue another spy tick. */
+    qatomic_set(&s_spy_vblank_queued, false);
+    if (!xemu_d3d_hle_spy_enabled())
+        return;
+    xgpu_plume_f2_poll();
+    xemu_d3d_hle_spy_on_f2_poll(xgpu_plume_f2_active());
+    if (xgpu_plume_f2_active() &&
+        !xemu_d3d_hle_spy_capture_seen_swap())
+        xgpu_plume_f2_present(1, "spy-vblank", 0, 0);
+    if (s_profile_valid) {
+        g_snprintf(s_status_detail, sizeof(s_status_detail),
+                   "D3D8 spy on NV2A: %u symbols, %u called holes",
+                   xemu_d3d_hle_spy_symbol_count(),
+                   xemu_d3d_hle_spy_called_holes());
+    }
+}
+
 void xemu_d3d_hle_vblank(uint32_t pcrtc_start)
 {
     uint32_t title_id;
@@ -1994,18 +2017,10 @@ void xemu_d3d_hle_vblank(uint32_t pcrtc_start)
             return;
         }
     }
-    if (xemu_d3d_hle_spy_enabled()) {
-        xgpu_plume_f2_poll();
-        xemu_d3d_hle_spy_on_f2_poll(xgpu_plume_f2_active());
-        if (xgpu_plume_f2_active() &&
-            !xemu_d3d_hle_spy_capture_seen_swap())
-            xgpu_plume_f2_present(1, "spy-vblank", 0, 0);
-        if (s_profile_valid) {
-            g_snprintf(s_status_detail, sizeof(s_status_detail),
-                       "D3D8 spy on NV2A: %u symbols, %u called holes",
-                       xemu_d3d_hle_spy_symbol_count(),
-                       xemu_d3d_hle_spy_called_holes());
-        }
+    if (xemu_d3d_hle_spy_enabled() &&
+        !qatomic_cmpxchg(&s_spy_vblank_queued, false, true)) {
+        async_run_on_cpu(s_cpu, xemu_d3d_hle_spy_vblank_on_cpu,
+                         RUN_ON_CPU_NULL);
     }
     if (!qatomic_read(&s_host_ready))
         return;

@@ -91,6 +91,7 @@ subdir('functional')
 subdir('tracetool')
 
 d3d_hle_contracts = [
+  ['d3d-hle-hook-policy', files('d3d_hle_hook_policy_contract.py')],
   ['d3d-hle-spy-census', files('d3d_hle_spy_census_contract.py')],
 ]
 

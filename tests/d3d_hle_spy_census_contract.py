@@ -101,4 +101,36 @@ README = (ROOT / "hw/xbox/d3d_hle/README.md").read_text(encoding="utf-8")
 assert "XEMU_D3D_HLE_SPY" in README
 assert "SPY-CENSUS.md" in README
 
+# OBSERVE placeholder at a PC must yield to a later canonical binding.
+assert "Upgrade OBSERVE occupant to the canonical binding in place" in DISCOVERY
+assert "install_bound_hook" in DISCOVERY
+assert "hook->policy = binding->policy" in DISCOVERY
+observe_upgrade = DISCOVERY.index(
+    "Upgrade OBSERVE occupant to the canonical binding in place")
+install_bound = DISCOVERY.index("install_bound_hook")
+set_special = DISCOVERY.index(
+    "set_special(&automatic_profile.special", install_bound)
+assert DISCOVERY.index("XEMU_D3D_HLE_HOOK_OBSERVE", observe_upgrade - 200) < install_bound
+assert install_bound < set_special
+assert "hook->observe_class = 0" in DISCOVERY[install_bound:set_special]
+
+# Spy F2 clock is queued onto CPU0; the NV2A vblank path must not call F2 I/O.
+assert "xemu_d3d_hle_spy_vblank_on_cpu" in HLE
+assert "s_spy_vblank_queued" in HLE
+spy_cb = HLE[HLE.index("static void xemu_d3d_hle_spy_vblank_on_cpu"):
+             HLE.index("void xemu_d3d_hle_vblank(")]
+assert "xgpu_plume_f2_poll" in spy_cb
+assert "xemu_d3d_hle_spy_on_f2_poll" in spy_cb
+assert "spy-vblank" in spy_cb
+vblank_fn_only = HLE[HLE.index("void xemu_d3d_hle_vblank("):
+                     HLE.index("void xemu_d3d_hle_publish_overlay")]
+assert "xemu_d3d_hle_spy_vblank_on_cpu" in vblank_fn_only
+assert "xgpu_plume_f2_poll" not in vblank_fn_only
+assert "xgpu_plume_f2_present" not in vblank_fn_only
+assert "xgpu_plume_f2_log" not in vblank_fn_only
+assert "xemu_d3d_hle_spy_dump" not in vblank_fn_only
+assert "xemu_d3d_hle_spy_on_f2_poll" not in vblank_fn_only
+assert vblank_fn_only.index("xemu_d3d_hle_spy_vblank_on_cpu") < \
+    vblank_fn_only.index("if (!qatomic_read(&s_host_ready))")
+
 print("d3d_hle_spy_census_contract: OK")
