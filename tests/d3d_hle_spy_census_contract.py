@@ -49,4 +49,22 @@ assert "XEMU_D3D_HLE_OBSERVE_ABI_HOLE" in DISCOVERY
 unsupported = DISCOVERY.index("no reviewed canonical binding")
 assert "xemu_d3d_hle_spy_enabled" in DISCOVERY[unsupported:unsupported + 800]
 
+HLE = (ROOT / "hw/xbox/d3d_hle/xemu_d3d_hle.c").read_text(encoding="utf-8")
+assert '#include "xemu_d3d_hle_spy.h"' in HLE
+
+install_start = HLE.index("void xemu_d3d_hle_install")
+install_end = HLE.index("bool xemu_d3d_hle_owns_window", install_start)
+assert "xemu_d3d_hle_spy_init" in HLE[install_start:install_end]
+
+resolve_start = HLE.index("static bool xemu_d3d_hle_resolve_loaded_xbe")
+resolve_end = HLE.index("static const XemuD3DHleHook *xemu_d3d_hle_find_any_hook", resolve_start)
+resolve_body = HLE[resolve_start:resolve_end]
+assert "xemu_d3d_hle_spy_enabled" in resolve_body
+assert "xemu_d3d_hle_select_profile" in resolve_body
+# Exact profile is skipped only under spy; the call must remain for non-spy.
+assert resolve_body.index("xemu_d3d_hle_spy_enabled") < resolve_body.index("xemu_d3d_hle_select_profile")
+assert "xemu_d3d_hle_spy_bind" in resolve_body
+assert "D3D8 spy on NV2A:" in resolve_body
+assert "leaving title on NV2A" in resolve_body
+
 print("d3d_hle_spy_census_contract: OK")

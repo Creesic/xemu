@@ -28,6 +28,7 @@
 #include "xemu_d3d_hle.h"
 #include "xemu_d3d_hle_discovery.h"
 #include "xemu_d3d_hle_profile.h"
+#include "xemu_d3d_hle_spy.h"
 
 typedef enum XemuD3DHlePendingKind {
     XEMU_D3D_PENDING_NONE,
@@ -849,7 +850,9 @@ static bool xemu_d3d_hle_resolve_loaded_xbe(uint32_t pc)
     s_profile_checked = true;
     /* Preserve the two extensively runtime-validated contracts.  Every
      * other XBE falls through to title-neutral signature and ABI discovery. */
-    s_profile = xemu_d3d_hle_select_profile();
+    s_profile = xemu_d3d_hle_spy_enabled()
+        ? NULL
+        : xemu_d3d_hle_select_profile();
     if (!s_profile) {
         s_profile = xemu_d3d_hle_discover(
             xemu_d3d_hle_read, &retryable, error, sizeof(error));
@@ -876,8 +879,10 @@ static bool xemu_d3d_hle_resolve_loaded_xbe(uint32_t pc)
         }
     }
 
-    if (s_profile->discovery_mutating_uncovered_count ||
-        s_profile->discovery_uncovered_abi_count) {
+    if (!xemu_d3d_hle_spy_enabled() &&
+        (s_profile->discovery_mutating_uncovered_count ||
+         s_profile->discovery_ambiguous_count ||
+         s_profile->discovery_uncovered_abi_count)) {
         g_snprintf(s_status_detail, sizeof(s_status_detail),
                    "automatic D3D discovery left %u mutating functions "
                    "and %u ABI holes uncovered",
@@ -904,6 +909,16 @@ static bool xemu_d3d_hle_resolve_loaded_xbe(uint32_t pc)
     fprintf(stderr,
             "[D3D-HLE] selected %s with %zu D3D entry hooks\n",
             s_profile->name, s_profile->hook_count);
+    if (xemu_d3d_hle_spy_enabled()) {
+        xemu_d3d_hle_spy_bind(s_profile);
+        g_snprintf(s_status_detail, sizeof(s_status_detail),
+                   "D3D8 spy on NV2A: %u symbols, %u called holes",
+                   xemu_d3d_hle_spy_symbol_count(),
+                   xemu_d3d_hle_spy_called_holes());
+        queue_tb_flush(s_cpu);
+        qatomic_set(&s_status, XEMU_D3D_HLE_STATUS_PROFILE_VERIFIED);
+        return true;
+    }
     qatomic_set(&s_status, XEMU_D3D_HLE_STATUS_PROFILE_VERIFIED);
     return true;
 }
@@ -1619,6 +1634,7 @@ void xemu_d3d_hle_install(CPUState *cpu, MemoryRegion *ram)
                       : "nv2a";
     }
     s_requested = request && g_ascii_strcasecmp(request, "hle") == 0;
+    xemu_d3d_hle_spy_init(s_requested);
     if (!s_requested) {
         qatomic_set(&s_status, XEMU_D3D_HLE_STATUS_DISABLED);
         return;
