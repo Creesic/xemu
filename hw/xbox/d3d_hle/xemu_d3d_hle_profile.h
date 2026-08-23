@@ -21,6 +21,26 @@ typedef enum XemuD3DHleAbiLocation {
 
 enum { XEMU_D3D_HLE_MAX_ABI_ARGS = 8 };
 
+enum {
+    XEMU_D3D_HLE_OBSERVE_NONE = 0,
+    XEMU_D3D_HLE_OBSERVE_SAFE = 1,
+    XEMU_D3D_HLE_OBSERVE_MUTATING = 2,
+    XEMU_D3D_HLE_OBSERVE_ABI_HOLE = 3,
+};
+
+typedef enum XemuD3DHleHookPolicy {
+    /* The compatibility wrapper wholly replaces the native XDK body. */
+    XEMU_D3D_HLE_HOOK_REPLACE = 0,
+    /* Execute the native body, then adopt/mirror its guest-visible result. */
+    XEMU_D3D_HLE_HOOK_NATIVE_THEN_MIRROR,
+    /* Reviewed as not mutating renderer-owned GPU or guest D3D state. */
+    XEMU_D3D_HLE_HOOK_NATIVE_SAFE,
+    /* May run only before Plume activation; post-activation entry is fatal. */
+    XEMU_D3D_HLE_HOOK_BOOTSTRAP_ONLY,
+    /* Spy-only: log/count, then always fall through to the native XDK body. */
+    XEMU_D3D_HLE_HOOK_OBSERVE,
+} XemuD3DHleHookPolicy;
+
 typedef struct XemuD3DHleHook {
     uint32_t address;
     XemuD3DHleEntry entry;
@@ -30,9 +50,11 @@ typedef struct XemuD3DHleHook {
     uint8_t source_param_count;
     uint8_t source_stack_bytes;
     uint8_t source_caller_cleanup;
+    XemuD3DHleHookPolicy policy;
     uint8_t source_params[XEMU_D3D_HLE_MAX_ABI_ARGS];
     uint8_t target_param_count;
     uint8_t target_params[XEMU_D3D_HLE_MAX_ABI_ARGS];
+    uint8_t observe_class;
 } XemuD3DHleHook;
 
 typedef struct XemuD3DHleSpecialHooks {
@@ -78,6 +100,7 @@ typedef struct XemuD3DHleProfile {
     uint32_t discovery_recognized_count;
     uint32_t discovery_unsupported_count;
     uint32_t discovery_duplicate_count;
+    uint32_t discovery_ambiguous_count;
     uint32_t discovery_mutating_uncovered_count;
     uint32_t discovery_uncovered_abi_count;
     uint32_t xbe_base;
