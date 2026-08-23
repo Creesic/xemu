@@ -89,3 +89,14 @@ subdir('qtest')
 subdir('migration-stress')
 subdir('functional')
 subdir('tracetool')
+
+d3d_hle_contracts = [
+  ['d3d-hle-spy-census', files('d3d_hle_spy_census_contract.py')],
+]
+
+foreach contract : d3d_hle_contracts
+  test(contract[0], python,
+       args: contract[1],
+       workdir: meson.project_source_root(),
+       suite: 'd3d-hle')
+endforeach
