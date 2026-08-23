@@ -18,6 +18,7 @@
 
 #include "d3d_hle_guest.h"
 #include "xemu_d3d_hle_discovery.h"
+#include "xemu_d3d_hle_spy.h"
 
 extern uint32_t g_eax, g_ebx, g_ecx, g_edx, g_ebp, g_esi, g_edi, g_esp;
 uint8_t *xbox_guest_ptr(uint32_t va);
@@ -455,7 +456,8 @@ static bool discovery_name_is_native_safe(
 }
 
 static void discovery_note_unsupported(
-    XemuD3DHleScan *scan, const char *name, size_t length, bool abi)
+    XemuD3DHleScan *scan, const char *name, size_t length, bool abi,
+    const char *reason)
 {
     ++scan->unsupported_functions;
     if (abi)
@@ -464,6 +466,7 @@ static void discovery_note_unsupported(
         ++scan->unsupported_native_safe_functions;
     else
         ++scan->unsupported_mutating_functions;
+    (void)reason;
 }
 
 static uint8_t convert_param(XbSDBParamType type)
@@ -520,6 +523,67 @@ static void set_special(XemuD3DHleSpecialHooks *special,
 #undef SET
 }
 
+static uint8_t discovery_observe_class(const char *name, size_t length,
+                                      bool abi)
+{
+    if (abi)
+        return XEMU_D3D_HLE_OBSERVE_ABI_HOLE;
+    if (discovery_name_is_native_safe(name, length))
+        return XEMU_D3D_HLE_OBSERVE_SAFE;
+    return XEMU_D3D_HLE_OBSERVE_MUTATING;
+}
+
+static void discovery_add_observe_hook(
+    XemuD3DHleScan *scan, const char *symbol_str, size_t name_length,
+    xbaddr address, uint32_t call_type, uint32_t param_count,
+    const XbSDBSymbolParam *param_list, bool abi)
+{
+    XemuD3DHleHook *hook;
+    uint8_t source_params[XEMU_D3D_HLE_MAX_ABI_ARGS] = { 0 };
+    uint32_t stack_bytes = 0;
+    uint32_t stored = 0;
+    size_t i;
+
+    if (!xemu_d3d_hle_spy_enabled())
+        return;
+    if (scan->hook_count == G_N_ELEMENTS(scan->hooks)) {
+        fprintf(stderr, "[D3D-SPY] hook table full, dropping %.*s\n",
+                (int)name_length, symbol_str);
+        return;
+    }
+    for (i = 0; i < scan->hook_count; ++i) {
+        if (scan->hooks[i].address == address) {
+            ++scan->duplicate_functions;
+            return;
+        }
+    }
+    if (param_list) {
+        uint32_t n = MIN(param_count, (uint32_t)XEMU_D3D_HLE_MAX_ABI_ARGS);
+        for (i = 0; i < n; ++i) {
+            source_params[i] = convert_param(param_list[i].type);
+            if (param_list[i].type == param_psh)
+                stack_bytes += 4u;
+            if (source_params[i] != XEMU_D3D_ABI_NONE &&
+                param_list[i].type != param_psh2)
+                stored = (uint32_t)i + 1u;
+            else
+                break;
+        }
+    }
+    hook = &scan->hooks[scan->hook_count++];
+    memset(hook, 0, sizeof(*hook));
+    hook->address = address;
+    hook->entry = NULL;
+    hook->name = xemu_d3d_hle_spy_intern_name(symbol_str, name_length);
+    hook->automatic = 1;
+    hook->policy = XEMU_D3D_HLE_HOOK_OBSERVE;
+    hook->observe_class = discovery_observe_class(symbol_str, name_length, abi);
+    hook->source_param_count = stored;
+    hook->source_stack_bytes = stack_bytes;
+    hook->source_caller_cleanup = call_type == call_cdecl;
+    memcpy(hook->source_params, source_params, sizeof(hook->source_params));
+}
+
 static void register_symbol(const char *library_str, uint32_t library_flag,
                             uint32_t xref_index, const char *symbol_str,
                             xbaddr address, uint32_t build_version,
@@ -563,12 +627,20 @@ static void register_symbol(const char *library_str, uint32_t library_flag,
     name_length = canonical_name_length(symbol_str);
     ++scan->recognized_functions;
     if (param_count > XEMU_D3D_HLE_MAX_ABI_ARGS) {
-        discovery_note_unsupported(scan, symbol_str, name_length, true);
+        discovery_note_unsupported(scan, symbol_str, name_length, true,
+                                   "more than eight ABI parameters");
+        discovery_add_observe_hook(scan, symbol_str, name_length, address,
+                                   call_type, 0, NULL, true);
         return;
     }
     binding = find_binding(symbol_str, name_length, param_count);
     if (!binding) {
-        discovery_note_unsupported(scan, symbol_str, name_length, false);
+        discovery_note_unsupported(scan, symbol_str, name_length, false,
+                                   "no reviewed canonical binding");
+        if (xemu_d3d_hle_spy_enabled())
+            discovery_add_observe_hook(scan, symbol_str, name_length, address,
+                                       call_type, param_count, param_list,
+                                       false);
         return;
     }
     for (i = 0; i < param_count; ++i) {
@@ -576,7 +648,10 @@ static void register_symbol(const char *library_str, uint32_t library_flag,
             stack_bytes += 4u;
         else if (param_list[i].type == param_psh2 ||
                  convert_param(param_list[i].type) == XEMU_D3D_ABI_NONE) {
-            discovery_note_unsupported(scan, symbol_str, name_length, true);
+            discovery_note_unsupported(scan, symbol_str, name_length, true,
+                                       "unsupported ABI parameter location");
+            discovery_add_observe_hook(scan, symbol_str, name_length, address,
+                                       call_type, param_count, param_list, true);
             return;
         }
     }
@@ -587,7 +662,8 @@ static void register_symbol(const char *library_str, uint32_t library_flag,
         }
     }
     if (scan->hook_count == G_N_ELEMENTS(scan->hooks)) {
-        discovery_note_unsupported(scan, symbol_str, name_length, false);
+        discovery_note_unsupported(scan, symbol_str, name_length, false,
+                                   "automatic hook table is full");
         return;
     }
     hook = &scan->hooks[scan->hook_count++];

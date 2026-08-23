@@ -37,4 +37,16 @@ assert "xemu_d3d_hle_spy_" not in HEADER
 assert "xemu_d3d_hle_spy_" not in DISABLED
 assert "atexit" in SPY_C
 
+DISCOVERY = (ROOT / "hw/xbox/d3d_hle/xemu_d3d_hle_discovery.c").read_text(encoding="utf-8")
+assert '#include "xemu_d3d_hle_spy.h"' in DISCOVERY
+assert "XEMU_D3D_HLE_HOOK_OBSERVE" in DISCOVERY
+assert "xemu_d3d_hle_spy_enabled" in DISCOVERY
+assert "xemu_d3d_hle_spy_intern_name" in DISCOVERY
+assert "XEMU_D3D_HLE_OBSERVE_MUTATING" in DISCOVERY
+assert "XEMU_D3D_HLE_OBSERVE_SAFE" in DISCOVERY
+assert "XEMU_D3D_HLE_OBSERVE_ABI_HOLE" in DISCOVERY
+# Unbound hooks are spy-only.
+unsupported = DISCOVERY.index("no reviewed canonical binding")
+assert "xemu_d3d_hle_spy_enabled" in DISCOVERY[unsupported:unsupported + 800]
+
 print("d3d_hle_spy_census_contract: OK")
