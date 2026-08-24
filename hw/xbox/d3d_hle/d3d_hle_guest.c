@@ -5829,3 +5829,134 @@ void d3d_hle_guest_kickoff_and_wait_for_idle(void)
 {
     d3d_hle_guest_block_on_time(g_hle_fence, 2u);
 }
+
+/*
+ * Plume owns the GPU for an attached title, so the Xbox synchronization
+ * surface is answered from host state. Falling through to the native XDK
+ * bodies here would poke NV2A behind Plume's back — the split-renderer case
+ * UNIVERSAL-SETUP refuses.
+ */
+uint32_t d3d_hle_guest_insert_fence(void)
+{
+    return d3d_hle_guest_set_fence(0);
+}
+
+void d3d_hle_guest_block_on_fence(uint32_t fence)
+{
+    d3d_hle_guest_block_on_time(fence, 0);
+}
+
+uint32_t d3d_hle_guest_is_busy(void)
+{
+    /* ponytail: Plume retires work synchronously at these boundaries, so
+     * "busy" is never observable from the guest. Track real outstanding
+     * submissions here if a title ever spins on a true busy answer. */
+    return 0;
+}
+
+void d3d_hle_guest_block_until_not_busy(uint32_t resource_va)
+{
+    if (resource_va)
+        d3d_hle_guest_block_on_resource(resource_va);
+    else
+        d3d_hle_guest_block_on_time(g_hle_fence, 0);
+}
+
+/*
+ * Fixed-function lighting state lives in the hosted D3D8 device; route the
+ * guest stdcall entries through the same vtable the COM path uses instead of
+ * shadowing it here.
+ */
+HRESULT d3d_hle_guest_set_material(uint32_t material_va)
+{
+    IDirect3DDevice8 *device =
+        d3d_hle_guest_require_device("SetMaterial device");
+    if (!material_va)
+        return E_INVALIDARG;
+    return device->lpVtbl->SetMaterial(
+        device, (const D3DMATERIAL8 *)xbox_guest_ptr(material_va));
+}
+
+HRESULT d3d_hle_guest_set_light(uint32_t index, uint32_t light_va)
+{
+    IDirect3DDevice8 *device =
+        d3d_hle_guest_require_device("SetLight device");
+    if (!light_va)
+        return E_INVALIDARG;
+    return device->lpVtbl->SetLight(
+        device, index, (const D3DLIGHT8 *)xbox_guest_ptr(light_va));
+}
+
+HRESULT d3d_hle_guest_light_enable(uint32_t index, uint32_t enable)
+{
+    IDirect3DDevice8 *device =
+        d3d_hle_guest_require_device("LightEnable device");
+    return device->lpVtbl->LightEnable(device, index, (BOOL)enable);
+}
+
+/*
+ * SetPixelShaderProgram binds an inline pixel-shader definition without
+ * creating a handle. Feed the same effective-definition path a handle bind
+ * uses so the combiner state stays single-owner.
+ */
+HRESULT d3d_hle_guest_set_pixel_shader_program(uint32_t definition_va)
+{
+    if (!definition_va) {
+        g_hle_pixel_shader = 0;
+        g_hle_pixel_shader_effective_valid = 0;
+        d3d8_combiners_set_definition(NULL);
+#if !defined(XRECOMP_D3D_HLE_TEST_NO_FALLBACKS)
+        d3d_hle_guest_mark_deferred_pixel_shader_dirty();
+#endif
+        return S_OK;
+    }
+    memcpy(g_hle_pixel_shader_effective,
+           xbox_guest_ptr(definition_va),
+           sizeof(g_hle_pixel_shader_effective));
+    g_hle_pixel_shader_effective_valid = 1;
+    d3d8_combiners_set_definition(g_hle_pixel_shader_effective);
+#if !defined(XRECOMP_D3D_HLE_TEST_NO_FALLBACKS)
+    d3d_hle_guest_mark_deferred_pixel_shader_dirty();
+#endif
+    return S_OK;
+}
+
+/*
+ * Callbacks are recorded only. Plume never calls back into guest code from a
+ * host thread, and no existing path does either; a title that depends on the
+ * callback firing keeps its own polling behaviour.
+ */
+static uint32_t g_hle_swap_callback;
+static uint32_t g_hle_insert_callback;
+static uint32_t g_hle_insert_callback_context;
+
+void d3d_hle_guest_set_swap_callback(uint32_t callback_va)
+{
+    g_hle_swap_callback = callback_va;
+}
+
+void d3d_hle_guest_insert_callback(
+    uint32_t type, uint32_t callback_va, uint32_t context)
+{
+    (void)type;
+    g_hle_insert_callback = callback_va;
+    g_hle_insert_callback_context = context;
+}
+
+/*
+ * D3D_LazySetPointParams(Device) recomputes the NV2A point-size registers
+ * from the D3DRS_POINTSIZE/POINTSCALE render states the guest already set.
+ * Those render states are owned by the shared render-state path, and the
+ * hosted device recomputes point size at draw time from them, so the flush
+ * is satisfied by the state already tracked. The Device argument is the
+ * caller's XDK CDevice, which HLE deliberately does not model (see
+ * d3d_hle_lazy_set_state) — it is validated, never dereferenced.
+ *
+ * ponytail: no separate point-param shadow exists to materialize; add one
+ * only if a title is observed setting point state through a path that
+ * bypasses SetRenderState.
+ */
+void d3d_hle_guest_lazy_set_point_params(uint32_t device_va)
+{
+    (void)device_va;
+}

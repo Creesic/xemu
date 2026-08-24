@@ -964,6 +964,45 @@ DEFINE_STD_WRAPPER(d3d_hle_device_get_tile_std, 2,
 DEFINE_STD_WRAPPER(d3d_hle_device_set_vertex_data4ub_std, 5,
     d3d_hle_guest_set_vertex_data4ub(
         a[0], a[1], a[2], a[3], a[4]))
+
+/* Spy-census called holes: shared automatic-attach wrappers. */
+DEFINE_STD_WRAPPER(d3d_hle_device_set_render_state_not_inline_std, 2,
+    d3d_hle_guest_set_render_state((D3DRENDERSTATETYPE)a[0], a[1]))
+DEFINE_STD_WRAPPER(d3d_hle_device_block_on_fence_std, 1,
+    d3d_hle_guest_block_on_fence(a[0]))
+DEFINE_STD_WRAPPER(d3d_hle_resource_block_until_not_busy_std, 1,
+    d3d_hle_guest_block_until_not_busy(a[0]))
+DEFINE_STD_WRAPPER(d3d_hle_device_set_material_std, 1,
+    (void)d3d_hle_guest_set_material(a[0]))
+DEFINE_STD_WRAPPER(d3d_hle_device_set_light_std, 2,
+    (void)d3d_hle_guest_set_light(a[0], a[1]))
+DEFINE_STD_WRAPPER(d3d_hle_device_light_enable_std, 2,
+    (void)d3d_hle_guest_light_enable(a[0], a[1]))
+DEFINE_STD_WRAPPER(d3d_hle_device_set_pixel_shader_program_std, 1,
+    (void)d3d_hle_guest_set_pixel_shader_program(a[0]))
+DEFINE_STD_WRAPPER(d3d_hle_device_set_swap_callback_std, 1,
+    d3d_hle_guest_set_swap_callback(a[0]))
+DEFINE_STD_WRAPPER(d3d_hle_device_insert_callback_std, 3,
+    d3d_hle_guest_insert_callback(a[0], a[1], a[2]))
+DEFINE_STD_WRAPPER(d3d_hle_lazy_set_point_params_std, 1,
+    d3d_hle_guest_lazy_set_point_params(a[0]))
+
+/* Both return a value to the guest, so they cannot use the void wrapper. */
+extern void d3d_hle_device_insert_fence_std_gen_unused(void);
+void d3d_hle_device_insert_fence_std(void)
+{
+    HLE_FALLBACK(d3d_hle_device_insert_fence_std);
+    d3d_hle_guest_stdcall_return(0);
+    RET(d3d_hle_guest_insert_fence());
+}
+
+extern void d3d_hle_device_is_busy_std_gen_unused(void);
+void d3d_hle_device_is_busy_std(void)
+{
+    HLE_FALLBACK(d3d_hle_device_is_busy_std);
+    d3d_hle_guest_stdcall_return(0);
+    RET(d3d_hle_guest_is_busy());
+}
 DEFINE_STD_WRAPPER(d3d_hle_device_set_palette_std, 2,
     RET(d3d_hle_guest_set_palette(a[0], a[1])))
 DEFINE_STD_WRAPPER(d3d_hle_resource_get_type_std, 1,

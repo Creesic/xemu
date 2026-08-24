@@ -129,6 +129,26 @@ static const XemuD3DHleBinding bindings[] = {
     B0(D3DDevice_AddRef, d3d_hle_device_add_ref),
     B0(D3DDevice_Release, d3d_hle_device_release),
     B0(D3D_KickOffAndWaitForIdle, d3d_hle_kickoff_and_wait_for_idle),
+    /*
+     * Spy-census called holes. Plume owns the GPU once attached, so the
+     * synchronization surface is answered from host state rather than
+     * falling through to the native XDK bodies (split-renderer refuse).
+     */
+    B2(D3DDevice_SetRenderStateNotInline,
+       d3d_hle_device_set_render_state_not_inline_std),
+    B0(D3DDevice_InsertFence, d3d_hle_device_insert_fence_std),
+    B1(D3DDevice_BlockOnFence, d3d_hle_device_block_on_fence_std),
+    B0(D3DDevice_IsBusy, d3d_hle_device_is_busy_std),
+    B1(D3DResource_BlockUntilNotBusy,
+       d3d_hle_resource_block_until_not_busy_std),
+    B1(D3DDevice_SetMaterial, d3d_hle_device_set_material_std),
+    B2(D3DDevice_SetLight, d3d_hle_device_set_light_std),
+    B2(D3DDevice_LightEnable, d3d_hle_device_light_enable_std),
+    B1(D3DDevice_SetPixelShaderProgram,
+       d3d_hle_device_set_pixel_shader_program_std),
+    B1(D3DDevice_SetSwapCallback, d3d_hle_device_set_swap_callback_std),
+    B3(D3DDevice_InsertCallback, d3d_hle_device_insert_callback_std),
+    B1(D3D_LazySetPointParams, d3d_hle_lazy_set_point_params_std),
     B0(D3DDevice_BlockUntilVerticalBlank,
        d3d_hle_device_block_until_vertical_blank),
     B1(D3DDevice_SetRenderState_FogColor,

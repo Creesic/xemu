@@ -202,6 +202,18 @@ HRESULT d3d_hle_guest_create_device(
 uint32_t d3d_hle_guest_create_vertex_buffer(uint32_t length);
 uint32_t d3d_hle_guest_create_index_buffer(uint32_t length);
 uint32_t d3d_hle_guest_set_fence(uint32_t flags);
+uint32_t d3d_hle_guest_insert_fence(void);
+void d3d_hle_guest_block_on_fence(uint32_t fence);
+uint32_t d3d_hle_guest_is_busy(void);
+void d3d_hle_guest_block_until_not_busy(uint32_t resource_va);
+HRESULT d3d_hle_guest_set_material(uint32_t material_va);
+HRESULT d3d_hle_guest_set_light(uint32_t index, uint32_t light_va);
+HRESULT d3d_hle_guest_light_enable(uint32_t index, uint32_t enable);
+HRESULT d3d_hle_guest_set_pixel_shader_program(uint32_t definition_va);
+void d3d_hle_guest_set_swap_callback(uint32_t callback_va);
+void d3d_hle_guest_insert_callback(
+    uint32_t type, uint32_t callback_va, uint32_t context);
+void d3d_hle_guest_lazy_set_point_params(uint32_t device_va);
 void d3d_hle_guest_block_on_time(uint32_t fence, uint32_t flags);
 void d3d_hle_guest_block_on_resource(uint32_t resource_va);
 void d3d_hle_guest_set_bump_env(
@@ -413,6 +425,18 @@ void d3d_hle_lock_2d_surface_std(void);
 void d3d_hle_device_set_tile_std(void);
 void d3d_hle_device_get_tile_std(void);
 void d3d_hle_device_set_vertex_data4ub_std(void);
+void d3d_hle_device_set_render_state_not_inline_std(void);
+void d3d_hle_device_insert_fence_std(void);
+void d3d_hle_device_block_on_fence_std(void);
+void d3d_hle_device_is_busy_std(void);
+void d3d_hle_resource_block_until_not_busy_std(void);
+void d3d_hle_device_set_material_std(void);
+void d3d_hle_device_set_light_std(void);
+void d3d_hle_device_light_enable_std(void);
+void d3d_hle_device_set_pixel_shader_program_std(void);
+void d3d_hle_device_set_swap_callback_std(void);
+void d3d_hle_device_insert_callback_std(void);
+void d3d_hle_lazy_set_point_params_std(void);
 void d3d_hle_device_set_palette_std(void);
 void d3d_hle_resource_get_type_std(void);
 void d3d_hle_device_set_stream_source_std(void);
