@@ -1013,6 +1013,13 @@ const XemuD3DHleProfile *xemu_d3d_hle_discover(
                   "cannot allocate XBE section coverage table");
         goto out;
     }
+    {
+        bool has_d3d_section = false;
+
+        for (i = 0; i < header.dwSections; ++i) {
+            if (discovery_section_name_is(read_guest, &sections[i], "D3D"))
+                has_d3d_section = true;
+        }
     for (i = 0; i < header.dwSections; ++i) {
         uint32_t address = sections[i].dwVirtualAddr;
         uint32_t size = sections[i].dwSizeofRaw;
@@ -1066,9 +1073,33 @@ const XemuD3DHleProfile *xemu_d3d_hle_discover(
                 copied_section_bytes -= copied;
                 continue;
             }
+            {
+                bool is_core = has_d3d_section
+                    ? discovery_section_name_is(
+                          read_guest, &sections[i], "D3D")
+                    : discovery_section_name_is(
+                          read_guest, &sections[i], ".text");
+
+                /* omit-until-100%: a 1-99% non-core executable section
+                 * (Forza: 143360 bytes short of one preload .text-adjacent
+                 * blob while D3D is already complete) must not poison the
+                 * whole scan. XbSDB never sees the partial buffer; the
+                 * loader commit hook rescans when it hits 100%. Core
+                 * (named D3D, or .text if no D3D) partials stay retryable. */
+                if (!is_core) {
+                    fprintf(stderr,
+                            "[D3D-HLE] omitting incomplete non-core "
+                            "scan-target va=%08X copied=%zu/%u\n",
+                            address, copied, size);
+                    section_copied[i] = 0;
+                    copied_section_bytes -= copied;
+                    continue;
+                }
+            }
             ++incomplete_sections;
             missing_section_bytes += size - copied;
         }
+    }
     }
     if (!copied_section_bytes) {
         if (retryable)

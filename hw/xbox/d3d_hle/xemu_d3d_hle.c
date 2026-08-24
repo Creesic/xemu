@@ -1732,6 +1732,9 @@ static bool xemu_d3d_hle_exec(void *opaque, CPUState *cpu, vaddr linear_pc)
                     /* Same-identity hook churn: guest state stays valid. */
                     xemu_d3d_hle_queue_session_reset_ex(true);
                 } else if (xemu_d3d_hle_update_coverage()) {
+                    /* A non-D3D scan-target hitting 100% does not change
+                     * d3d_covered, so coverage_epoch would skip the job. */
+                    s_discovery_scanned_epoch = s_coverage.coverage_epoch - 1u;
                     xemu_d3d_hle_queue_discovery(s_loader_section_va);
                 }
             }
@@ -1779,6 +1782,9 @@ static bool xemu_d3d_hle_exec(void *opaque, CPUState *cpu, vaddr linear_pc)
         else if (s_pending.kind != XEMU_D3D_PENDING_DEVICE)
             return false;
     }
+
+    if (!s_profile_checked)
+        return false;
 
     if (!xemu_d3d_hle_resolve_loaded_xbe(pc))
         return false;

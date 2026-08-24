@@ -96,6 +96,7 @@ d3d_hle_contracts = [
   ['d3d-hle-automatic-refuse-split', files('d3d_hle_automatic_refuse_split_contract.py')],
   ['d3d-hle-automatic-readiness', files('d3d_hle_automatic_readiness_contract.py')],
   ['d3d-hle-complete-section-filter', files('d3d_hle_complete_section_filter_contract.py')],
+  ['d3d-hle-forza-omit-partial', files('d3d_hle_forza_omit_partial_contract.py')],
   ['d3d-hle-detector-catalog', files('d3d_hle_detector_catalog_contract.py')],
   ['d3d-hle-direct-bootstrap-capability', files('d3d_hle_direct_bootstrap_capability_contract.py')],
   ['d3d-hle-direct-profile-native-dependency', files('d3d_hle_direct_profile_native_dependency_contract.py')],
