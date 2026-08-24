@@ -211,6 +211,7 @@ HRESULT d3d_hle_guest_set_light(uint32_t index, uint32_t light_va);
 HRESULT d3d_hle_guest_light_enable(uint32_t index, uint32_t enable);
 HRESULT d3d_hle_guest_set_pixel_shader_program(uint32_t definition_va);
 void d3d_hle_guest_set_swap_callback(uint32_t callback_va);
+void d3d_hle_guest_set_vertical_blank_callback(uint32_t callback_va);
 void d3d_hle_guest_insert_callback(
     uint32_t type, uint32_t callback_va, uint32_t context);
 void d3d_hle_guest_lazy_set_point_params(uint32_t device_va);
@@ -435,6 +436,7 @@ void d3d_hle_device_set_light_std(void);
 void d3d_hle_device_light_enable_std(void);
 void d3d_hle_device_set_pixel_shader_program_std(void);
 void d3d_hle_device_set_swap_callback_std(void);
+void d3d_hle_device_set_vertical_blank_callback_std(void);
 void d3d_hle_device_insert_callback_std(void);
 void d3d_hle_lazy_set_point_params_std(void);
 void d3d_hle_device_set_palette_std(void);

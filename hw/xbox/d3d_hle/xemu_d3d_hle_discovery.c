@@ -147,6 +147,8 @@ static const XemuD3DHleBinding bindings[] = {
     B1(D3DDevice_SetPixelShaderProgram,
        d3d_hle_device_set_pixel_shader_program_std),
     B1(D3DDevice_SetSwapCallback, d3d_hle_device_set_swap_callback_std),
+    B1(D3DDevice_SetVerticalBlankCallback,
+       d3d_hle_device_set_vertical_blank_callback_std),
     B3(D3DDevice_InsertCallback, d3d_hle_device_insert_callback_std),
     B1(D3D_LazySetPointParams, d3d_hle_lazy_set_point_params_std),
     B0(D3DDevice_BlockUntilVerticalBlank,

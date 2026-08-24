@@ -982,6 +982,8 @@ DEFINE_STD_WRAPPER(d3d_hle_device_set_pixel_shader_program_std, 1,
     (void)d3d_hle_guest_set_pixel_shader_program(a[0]))
 DEFINE_STD_WRAPPER(d3d_hle_device_set_swap_callback_std, 1,
     d3d_hle_guest_set_swap_callback(a[0]))
+DEFINE_STD_WRAPPER(d3d_hle_device_set_vertical_blank_callback_std, 1,
+    d3d_hle_guest_set_vertical_blank_callback(a[0]))
 DEFINE_STD_WRAPPER(d3d_hle_device_insert_callback_std, 3,
     d3d_hle_guest_insert_callback(a[0], a[1], a[2]))
 DEFINE_STD_WRAPPER(d3d_hle_lazy_set_point_params_std, 1,

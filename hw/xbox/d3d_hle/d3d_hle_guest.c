@@ -5927,12 +5927,18 @@ HRESULT d3d_hle_guest_set_pixel_shader_program(uint32_t definition_va)
  * callback firing keeps its own polling behaviour.
  */
 static uint32_t g_hle_swap_callback;
+static uint32_t g_hle_vblank_callback;
 static uint32_t g_hle_insert_callback;
 static uint32_t g_hle_insert_callback_context;
 
 void d3d_hle_guest_set_swap_callback(uint32_t callback_va)
 {
     g_hle_swap_callback = callback_va;
+}
+
+void d3d_hle_guest_set_vertical_blank_callback(uint32_t callback_va)
+{
+    g_hle_vblank_callback = callback_va;
 }
 
 void d3d_hle_guest_insert_callback(
