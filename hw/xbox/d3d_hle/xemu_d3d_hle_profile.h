@@ -115,6 +115,9 @@ typedef struct XemuD3DHleProfile {
     uint32_t dirty_flags_va;
     uint32_t deferred_texture_state_va;
     uint32_t fog_state_va;
+    /* D3D_g_pDevice: the guest CDevice* whose [0]/[+4] are the push cursor
+     * and limit. Push REPLACE wrappers retarget those onto scratch. */
+    uint32_t device_global_va;
     XemuD3DHleBootstrap bootstrap;
     /* Zero-based public argument index of D3DPRESENT_PARAMETERS for a
      * direct CreateDevice wrapper. Ignored for native-mirror profiles. */

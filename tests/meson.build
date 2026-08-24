@@ -107,6 +107,7 @@ d3d_hle_contracts = [
   ['d3d-hle-mapping-coverage', files('d3d_hle_mapping_coverage_contract.py')],
   ['d3d-hle-plume-session-lifetime', files('d3d_hle_plume_session_lifetime_contract.py')],
   ['d3d-hle-profile-isolation', files('d3d_hle_profile_isolation_contract.py')],
+  ['d3d-hle-push-slice', files('d3d_hle_push_slice_contract.py')],
   ['d3d-hle-reactivation', files('d3d_hle_reactivation_contract.py')],
   ['d3d-hle-hook-policy', files('d3d_hle_hook_policy_contract.py')],
   ['d3d-hle-name', files('d3d_hle_name_contract.py')],

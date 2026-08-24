@@ -37,7 +37,11 @@ assert "M6(D3DDevice_CreateTexture2" in DISCOVERY
 assert "B6(Lock2DSurface" in DISCOVERY
 assert "O1(D3D_DestroyResource)" in DISCOVERY
 assert "O1(CDevice_KickOff)" in DISCOVERY
-assert "O2(D3D_MakeRequestedSpace)" in DISCOVERY
+# D3D_MakeRequestedSpace was bootstrap-only (NULL entry, fail-closed after
+# attach) until the push slice gave it a real destination. It now grows the
+# scratch window and retargets the guest push cursor onto it.
+assert "B2(D3D_MakeRequestedSpace, d3d_hle_make_requested_space_std)" in DISCOVERY
+assert "O2(D3D_MakeRequestedSpace)" not in DISCOVERY
 assert "A3(D3DDevice_SetTextureStageStateNotInline2" in DISCOVERY
 assert "A2(D3DDevice_SelectVertexShaderDirect" in DISCOVERY
 assert "B5(D3DDevice_SetVertexData4ub" in DISCOVERY

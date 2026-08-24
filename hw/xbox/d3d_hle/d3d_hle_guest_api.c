@@ -1005,6 +1005,44 @@ void d3d_hle_device_is_busy_std(void)
     d3d_hle_guest_stdcall_return(0);
     RET(d3d_hle_guest_is_busy());
 }
+/* Push-buffer slice: reserve scratch, then drain what the guest wrote. */
+DEFINE_STD_WRAPPER(d3d_hle_device_end_push_std, 1,
+    d3d_hle_guest_end_push(a[0]))
+DEFINE_STD_WRAPPER(d3d_hle_device_kick_push_buffer_std, 0,
+    d3d_hle_guest_kick_push_buffer())
+DEFINE_STD_WRAPPER(d3d_hle_device_begin_state_big_std, 1,
+    d3d_hle_guest_begin_state_big(a[0]))
+DEFINE_STD_WRAPPER(d3d_hle_make_requested_space_std, 2,
+    d3d_hle_guest_make_requested_space(a[0], a[1]))
+
+/* BeginPush(Count) returns the write pointer in eax. */
+extern void d3d_hle_device_begin_push_std_gen_unused(void);
+void d3d_hle_device_begin_push_std(void)
+{
+    uint32_t count;
+    HLE_FALLBACK(d3d_hle_device_begin_push_std);
+    count = d3d_hle_guest_stack_u32(0);
+    d3d_hle_guest_stdcall_return(4);
+    RET(d3d_hle_guest_begin_push(count));
+}
+
+/* BeginPush(Count, ppPush) hands the pointer back through the out param. */
+extern void d3d_hle_device_begin_push2_std_gen_unused(void);
+void d3d_hle_device_begin_push2_std(void)
+{
+    uint32_t count;
+    uint32_t out_va;
+    uint32_t push_va;
+    HLE_FALLBACK(d3d_hle_device_begin_push2_std);
+    count = d3d_hle_guest_stack_u32(0);
+    out_va = d3d_hle_guest_stack_u32(1);
+    d3d_hle_guest_stdcall_return(8);
+    push_va = d3d_hle_guest_begin_push(count);
+    if (out_va)
+        d3d_hle_guest_write_u32(out_va, push_va);
+    RET(push_va);
+}
+
 DEFINE_STD_WRAPPER(d3d_hle_device_set_palette_std, 2,
     RET(d3d_hle_guest_set_palette(a[0], a[1])))
 DEFINE_STD_WRAPPER(d3d_hle_resource_get_type_std, 1,

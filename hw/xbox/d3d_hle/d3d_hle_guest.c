@@ -59,6 +59,8 @@ void d3d_hle_guest_materialize_deferred_fog_state(void);
 void d3d_hle_guest_mark_deferred_pixel_shader_dirty(void);
 extern uint32_t xrecomp_d3d_hle_deferred_texture_state_va;
 #endif
+/* Push retarget is not a fallback path: it must resolve in test builds too. */
+extern uint32_t xrecomp_d3d_hle_device_global_va;
 
 enum {
     XBOX_D3DCOMMON_TYPE_MASK = 0x00070000u,
@@ -196,6 +198,7 @@ static uint32_t g_hle_vertex_shader;
 static uint32_t g_hle_pixel_shader;
 enum { D3D_HLE_PUSH_SCRATCH_BYTES = 16384 };
 static uint32_t g_hle_push_scratch_va;
+static uint32_t g_hle_push_scratch_bytes;
 static uint32_t g_hle_push_constant_load;
 typedef struct D3DHleGuestLoadedVertexProgram {
     uint32_t instruction_count;
@@ -4548,6 +4551,7 @@ void d3d_hle_guest_reset_registry(void)
     if (g_hle_push_scratch_va)
         xbox_HeapFree(g_hle_push_scratch_va);
     g_hle_push_scratch_va = 0;
+    g_hle_push_scratch_bytes = 0;
     g_hle_push_constant_load = 0;
     if (g_hle_device_token)
         xbox_HeapFree(g_hle_device_token);
@@ -5600,14 +5604,45 @@ void d3d_hle_guest_set_vertex_blend(uint32_t value)
     d3d_hle_guest_set_render_state(D3DRS_VERTEXBLEND, value);
 }
 
-void d3d_hle_guest_drain_inline_push(void)
+/* Arm the unmodeled-method work list: one line per distinct method id, not
+ * one per process, so a first attach of Forza/SM2 enumerates everything the
+ * decoder still has to learn instead of hiding it behind the first hit. */
+static void d3d_hle_guest_log_unmodeled_push_method(
+    uint32_t method, uint32_t count)
+{
+    enum { SEEN_MAX = 64 };
+    static uint32_t seen[SEEN_MAX];
+    static unsigned seen_count;
+    unsigned i;
+
+    for (i = 0; i < seen_count; ++i) {
+        if (seen[i] == method)
+            return;
+    }
+    if (seen_count < SEEN_MAX)
+        seen[seen_count++] = method;
+    fprintf(stderr,
+            "[D3D-HLE] inline push method 0x%04X (count %u) not modeled; "
+            "skipped\n",
+            method, count);
+}
+
+/*
+ * Decode the NV2A method stream the guest wrote into the scratch window.
+ * `end_va` bounds the walk: BeginPush/EndPush know exactly how far the
+ * caller wrote, which is stricter than trusting a zero header to terminate.
+ * Zero means "use the whole buffer" for the legacy MakeSpace callers.
+ */
+static void d3d_hle_guest_drain_push_range(uint32_t end_va)
 {
     uint32_t at = g_hle_push_scratch_va;
     uint32_t end;
 
     if (!at)
         return;
-    end = at + D3D_HLE_PUSH_SCRATCH_BYTES;
+    end = at + g_hle_push_scratch_bytes;
+    if (end_va && end_va < end)
+        end = end_va;
     while (at + 4u <= end) {
         uint32_t header = d3d_hle_guest_read_u32(at);
         uint32_t count = header >> 18;
@@ -5624,29 +5659,112 @@ void d3d_hle_guest_drain_inline_push(void)
                 g_hle_push_constant_load, at + 4u, count / 4u);
             g_hle_push_constant_load += count / 4u;
         } else {
-            static int logged;
-
-            if (!logged) {
-                logged = 1;
-                fprintf(stderr,
-                        "[D3D-HLE] inline push method 0x%04X (count %u) "
-                        "not modeled; skipped\n",
-                        method, count);
-            }
+            d3d_hle_guest_log_unmodeled_push_method(method, count);
         }
         d3d_hle_guest_write_u32(at, 0);
         at += 4u + count * 4u;
     }
 }
 
+void d3d_hle_guest_drain_inline_push(void)
+{
+    d3d_hle_guest_drain_push_range(0);
+}
+
+/*
+ * Reserve a scratch window of at least `count` dwords and hand back its VA.
+ * The XDK grow path asks for Count*4 + 0x204, so match that headroom rather
+ * than a fixed size: BeginStateBig callers write Count dwords straight at
+ * the cursor and must never run past the window.
+ */
+static uint32_t d3d_hle_guest_reserve_push(uint32_t count)
+{
+    uint64_t needed = (uint64_t)count * 4u + 0x204u;
+    uint32_t bytes;
+
+    if (needed < D3D_HLE_PUSH_SCRATCH_BYTES)
+        needed = D3D_HLE_PUSH_SCRATCH_BYTES;
+    if (needed > 0x01000000u) {
+        d3d_hle_guest_log_unmodeled_push_method(0xFFFFu, count);
+        return 0;
+    }
+    bytes = (uint32_t)((needed + 63u) & ~63ull);
+    if (g_hle_push_scratch_va && bytes <= g_hle_push_scratch_bytes) {
+        /* Reuse: retire whatever the previous window still holds first. */
+        d3d_hle_guest_drain_push_range(0);
+    } else {
+        if (g_hle_push_scratch_va) {
+            d3d_hle_guest_drain_push_range(0);
+            xbox_HeapFree(g_hle_push_scratch_va);
+        }
+        g_hle_push_scratch_va =
+            d3d_hle_guest_alloc(bytes, 64u, 0x03FFFFFFu);
+        g_hle_push_scratch_bytes = bytes;
+    }
+    memset(d3d_hle_guest_data_ptr(g_hle_push_scratch_va), 0,
+           g_hle_push_scratch_bytes);
+    return g_hle_push_scratch_va;
+}
+
+/*
+ * Point the guest's own push cursor at the scratch window.
+ *
+ * BeginStateBig and MakeRequestedSpace return nothing: the caller writes its
+ * dwords through g_pDevice->pPut ([device+0], limit at [device+4]). Handing
+ * back a VA the caller never reads would leave those writes on the native
+ * cursor and split the renderer, so the REPLACE body has to retarget the
+ * device fields themselves.
+ */
+static void d3d_hle_guest_retarget_push_cursor(uint32_t va, uint32_t bytes)
+{
+    uint32_t device;
+
+    if (!va || !xrecomp_d3d_hle_device_global_va)
+        return;
+    if (!d3d_hle_guest_try_read_u32(
+            xrecomp_d3d_hle_device_global_va, &device) || !device)
+        return;
+    d3d_hle_guest_write_u32(device, va);
+    d3d_hle_guest_write_u32(device + 4u, va + bytes);
+}
+
+uint32_t d3d_hle_guest_begin_push(uint32_t count)
+{
+    return d3d_hle_guest_reserve_push(count);
+}
+
+void d3d_hle_guest_end_push(uint32_t push_va)
+{
+    d3d_hle_guest_drain_push_range(push_va);
+}
+
+void d3d_hle_guest_kick_push_buffer(void)
+{
+    d3d_hle_guest_drain_push_range(0);
+}
+
+void d3d_hle_guest_begin_state_big(uint32_t count)
+{
+    uint32_t va = d3d_hle_guest_reserve_push(count);
+
+    d3d_hle_guest_retarget_push_cursor(va, g_hle_push_scratch_bytes);
+}
+
+void d3d_hle_guest_make_requested_space(
+    uint32_t requested, uint32_t maximum)
+{
+    uint32_t va;
+
+    (void)maximum;
+    va = d3d_hle_guest_reserve_push(requested);
+    d3d_hle_guest_retarget_push_cursor(va, g_hle_push_scratch_bytes);
+}
+
 uint32_t d3d_hle_guest_make_space(void)
 {
-    if (!g_hle_push_scratch_va) {
-        g_hle_push_scratch_va = d3d_hle_guest_alloc(
-            D3D_HLE_PUSH_SCRATCH_BYTES, 64u, 0x03FFFFFFu);
-        return g_hle_push_scratch_va;
-    }
-    d3d_hle_guest_drain_inline_push();
+    if (!g_hle_push_scratch_va)
+        return d3d_hle_guest_reserve_push(0);
+    d3d_hle_guest_drain_push_range(0);
     return g_hle_push_scratch_va;
 }
 

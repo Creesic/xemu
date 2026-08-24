@@ -104,7 +104,6 @@ static const XemuD3DHleBinding bindings[] = {
     O2(D3D_CommonSetMultiSampleModeAndScale),
     O1(D3D_DestroyResource),
     O1(CDevice_KickOff),
-    O2(D3D_MakeRequestedSpace),
     B1(D3DDevice_GetDeviceCaps, d3d_hle_device_get_device_caps),
     B1(D3DDevice_GetDisplayMode, d3d_hle_device_get_display_mode),
     B1(D3DDevice_Reset, d3d_hle_device_reset_std),
@@ -151,6 +150,18 @@ static const XemuD3DHleBinding bindings[] = {
        d3d_hle_device_set_vertical_blank_callback_std),
     B3(D3DDevice_InsertCallback, d3d_hle_device_insert_callback_std),
     B1(D3D_LazySetPointParams, d3d_hle_lazy_set_point_params_std),
+    /*
+     * Push-buffer slice. BeginPush hands the caller a write pointer, so the
+     * scratch VA it returns is enough. BeginStateBig and MakeRequestedSpace
+     * return nothing and the caller writes through g_pDevice->pPut, so those
+     * bodies retarget the guest cursor onto the same scratch instead.
+     */
+    B1(D3DDevice_BeginPush, d3d_hle_device_begin_push_std),
+    B2(D3DDevice_BeginPush, d3d_hle_device_begin_push2_std),
+    B1(D3DDevice_EndPush, d3d_hle_device_end_push_std),
+    B0(D3DDevice_KickPushBuffer, d3d_hle_device_kick_push_buffer_std),
+    B1(D3DDevice_BeginStateBig, d3d_hle_device_begin_state_big_std),
+    B2(D3D_MakeRequestedSpace, d3d_hle_make_requested_space_std),
     B0(D3DDevice_BlockUntilVerticalBlank,
        d3d_hle_device_block_until_vertical_blank),
     B1(D3DDevice_SetRenderState_FogColor,
@@ -346,10 +357,10 @@ static const XemuD3DHleBinding bindings[] = {
     B2(D3D_SetPushBufferSize, d3d_hle_direct3d_set_push_buffer_size),
     M6(Direct3D_CreateDevice, d3d_hle_direct3d_create_device_std),
     M3(Direct3D_CreateDevice, automatic_create_device_compact),
-    /* MakeSpace returns title-owned push-buffer storage. The xemu bridge has
-     * no safe synthetic guest allocator, so an automatic profile must leave
-     * the allocation and command-stream ownership with the native XDK. */
-    N0(D3DDevice_MakeSpace),
+    /* MakeSpace returns push-buffer storage. The scratch window the push
+     * slice owns is a safe destination, so the 0-arg form now routes there
+     * with the rest of the family rather than staying native. */
+    B0(D3DDevice_MakeSpace, d3d_hle_device_make_space),
 };
 
 #undef ST
@@ -1298,6 +1309,7 @@ const XemuD3DHleProfile *xemu_d3d_hle_discover(
     automatic_profile.deferred_texture_state_va =
         scan.deferred_texture_state_va;
     automatic_profile.fog_state_va = scan.deferred_render_state_va;
+    automatic_profile.device_global_va = scan.device_global_va;
     automatic_profile.bootstrap = XEMU_D3D_HLE_BOOTSTRAP_MIRROR_NATIVE;
     automatic_profile.hooks = automatic_hooks;
     automatic_profile.hook_count = scan.hook_count;

@@ -115,6 +115,7 @@ uint32_t g_eax, g_ebx, g_ecx, g_edx, g_ebp, g_esi, g_edi, g_esp;
 uint32_t xrecomp_d3d_hle_dirty_flags_va;
 uint32_t xrecomp_d3d_hle_deferred_texture_state_va;
 uint32_t xrecomp_d3d_hle_fog_state_va;
+uint32_t xrecomp_d3d_hle_device_global_va;
 
 static CPUState *s_cpu;
 static uint8_t *s_ram;
@@ -1110,6 +1111,7 @@ void xemu_d3d_hle_session_reset(const char *why)
     xemu_d3d_hle_reset_coverage();
     xrecomp_d3d_hle_dirty_flags_va = 0;
     xrecomp_d3d_hle_deferred_texture_state_va = 0;
+    xrecomp_d3d_hle_device_global_va = 0;
     xrecomp_d3d_hle_fog_state_va = 0;
     s_vblank_queued = false;
     s_spy_vblank_queued = false;
@@ -1263,6 +1265,7 @@ static bool xemu_d3d_hle_resolve_loaded_xbe(uint32_t pc)
     xrecomp_d3d_hle_deferred_texture_state_va =
         s_profile->deferred_texture_state_va;
     xrecomp_d3d_hle_fog_state_va = s_profile->fog_state_va;
+    xrecomp_d3d_hle_device_global_va = s_profile->device_global_va;
     fprintf(stderr,
             "[D3D-HLE] selected %s with %zu D3D entry hooks\n",
             s_profile->name, s_profile->hook_count);
@@ -1653,6 +1656,7 @@ static bool xemu_d3d_hle_fail_closed_call(
     xbox_HeapSyntheticReset();
     xrecomp_d3d_hle_dirty_flags_va = 0;
     xrecomp_d3d_hle_deferred_texture_state_va = 0;
+    xrecomp_d3d_hle_device_global_va = 0;
     xrecomp_d3d_hle_fog_state_va = 0;
     s_profile_valid = false;
     s_profile = NULL;
