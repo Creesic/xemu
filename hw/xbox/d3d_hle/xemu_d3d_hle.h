@@ -22,7 +22,8 @@ typedef enum XemuD3DHleStatus {
 } XemuD3DHleStatus;
 
 /* Install the dormant, fail-closed TCG entry hook on the Xbox CPU. */
-void xemu_d3d_hle_install(CPUState *cpu, MemoryRegion *ram);
+void xemu_d3d_hle_install(CPUState *cpu, MemoryRegion *ram,
+                          MemoryRegion *system_memory);
 
 /* Reset the active XBE/D3D session while keeping the process-lifetime hook
  * installed. The next valid XBE identity is discovered from scratch. */

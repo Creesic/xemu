@@ -9,6 +9,8 @@ body = SOURCE[start:end]
 
 assert "section_copied" in body
 assert "XBE_SECTION_HEADER_FLAGS_EXECUTABLE" in SOURCE
+assert "discovery_section_is_scan_target" in body
+assert "discovery_section_is_named_or_kernel" not in SOURCE
 assert "buffer_lower" in body
 assert "XbSDBSectionHeader" in body
 assert "XbSDB_GenerateSectionFilter" not in body

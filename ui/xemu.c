@@ -206,6 +206,101 @@ uintptr_t xemu_get_native_window_handle(void)
     return 0;
 }
 
+#if defined(_WIN32)
+/*
+ * Dedicated D3D presentation surface.
+ *
+ * SDL owns the top-level HWND with an OpenGL pixel format and WGL
+ * presentation. Pointing a DXGI flip-model swapchain at that same HWND is
+ * undefined: in windowed mode DWM keeps compositing the GL redirection
+ * surface, so Plume's presents land on a surface the compositor never
+ * shows and the window looks frozen. Borderless fullscreen happened to
+ * work only because DXGI promotes the swapchain to independent flip and
+ * bypasses composition entirely. Presenting to a dedicated child window
+ * gives DXGI sole ownership of its surface in both modes.
+ */
+static HWND d3d_output_window;
+static WNDPROC d3d_output_window_base_proc;
+
+static LRESULT CALLBACK d3d_output_window_proc(HWND hwnd, UINT msg,
+                                               WPARAM wparam, LPARAM lparam)
+{
+    /* All input must reach the SDL parent; the child is display-only. */
+    if (msg == WM_NCHITTEST)
+        return HTTRANSPARENT;
+    if (msg == WM_ERASEBKGND)
+        return 1;
+    if (d3d_output_window_base_proc)
+        return CallWindowProcW(d3d_output_window_base_proc, hwnd, msg,
+                               wparam, lparam);
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+static void d3d_output_window_sync(bool visible)
+{
+    HWND parent = (HWND)xemu_get_native_window_handle();
+    RECT client;
+
+    if (!parent)
+        return;
+    if (!d3d_output_window) {
+        static bool class_registered;
+        static const wchar_t class_name[] = L"xemuPlumeOutput";
+
+        if (!class_registered) {
+            WNDCLASSW wc;
+
+            memset(&wc, 0, sizeof(wc));
+            wc.lpfnWndProc = DefWindowProcW;
+            wc.hInstance = GetModuleHandleW(NULL);
+            wc.lpszClassName = class_name;
+            wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+            class_registered = RegisterClassW(&wc) != 0;
+        }
+        if (!class_registered)
+            return;
+        client.left = client.top = 0;
+        client.right = client.bottom = 16;
+        GetClientRect(parent, &client);
+        d3d_output_window = CreateWindowExW(
+            WS_EX_NOACTIVATE, class_name, L"", WS_CHILD | WS_CLIPSIBLINGS,
+            0, 0, MAX(client.right - client.left, 1),
+            MAX(client.bottom - client.top, 1), parent, NULL,
+            GetModuleHandleW(NULL), NULL);
+        if (!d3d_output_window)
+            return;
+        d3d_output_window_base_proc = (WNDPROC)SetWindowLongPtrW(
+            d3d_output_window, GWLP_WNDPROC,
+            (LONG_PTR)d3d_output_window_proc);
+    }
+    if (GetParent(d3d_output_window) != parent)
+        SetParent(d3d_output_window, parent);
+    if (!visible) {
+        if (IsWindowVisible(d3d_output_window))
+            ShowWindow(d3d_output_window, SW_HIDE);
+        return;
+    }
+    if (!GetClientRect(parent, &client))
+        return;
+    SetWindowPos(d3d_output_window, HWND_BOTTOM, 0, 0,
+                 client.right - client.left, client.bottom - client.top,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    if (!IsWindowVisible(d3d_output_window))
+        ShowWindow(d3d_output_window, SW_SHOWNA);
+}
+#endif
+
+uintptr_t xemu_get_d3d_output_window_handle(void)
+{
+#if defined(_WIN32)
+    if (!d3d_output_window)
+        d3d_output_window_sync(false);
+    if (d3d_output_window)
+        return (uintptr_t)d3d_output_window;
+#endif
+    return xemu_get_native_window_handle();
+}
+
 static struct xemu_console *get_scon_from_window(uint32_t window_id)
 {
     int i;
@@ -1044,10 +1139,16 @@ static void gl_render_frame(struct xemu_console *scon)
      * offscreen GL target and hand its transparent pixels to Plume instead of
      * swapping OpenGL over the guest frame. */
     if (xemu_d3d_hle_owns_window()) {
+#if defined(_WIN32)
+        d3d_output_window_sync(true);
+#endif
         d3d_hle_render_overlay(scon);
         qatomic_set(&rendering, false);
         return;
     }
+#if defined(_WIN32)
+    d3d_output_window_sync(false);
+#endif
 
     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
 

@@ -35,6 +35,10 @@ int xemu_is_fullscreen(void);
 void xemu_toggle_fullscreen(void);
 SDL_Window *xemu_get_window(void);
 uintptr_t xemu_get_native_window_handle(void);
+/* Dedicated D3D presentation child window (Windows). Falls back to the SDL
+ * window handle when unavailable. The DXGI flip-model swapchain must never
+ * share an HWND with SDL's OpenGL presentation. */
+uintptr_t xemu_get_d3d_output_window_handle(void);
 void xemu_eject_disc(Error **errp);
 void xemu_load_disc(const char *path, Error **errp);
 void xemu_main_loop_lock(void);

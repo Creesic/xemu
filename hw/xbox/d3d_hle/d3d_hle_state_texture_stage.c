@@ -20,6 +20,5 @@ void d3d_hle_device_set_texture_stage_state_not_inline(void)
      * plain ret and has no stack arguments.
      */
     d3d_hle_guest_stdcall_return(0);
-    d3d_hle_guest_set_texture_stage_state(
-        g_eax, (D3DTEXTURESTAGESTATETYPE)g_edx, g_ecx);
+    d3d_hle_guest_set_xbox_texture_stage_state(g_eax, g_edx, g_ecx);
 }

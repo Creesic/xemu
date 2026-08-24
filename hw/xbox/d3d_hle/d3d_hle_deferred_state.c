@@ -53,6 +53,7 @@ static const D3DHleDeferredTextureState g_deferred_texture_states[] = {
     { 6, D3DTSS_MIPMAPLODBIAS },
     { 7, D3DTSS_MAXMIPLEVEL },
     { 8, D3DTSS_MAXANISOTROPY },
+    { 9, D3DTSS_COLORKEYOP },
     { 12, D3DTSS_COLOROP },
     { 13, D3DTSS_COLORARG0 },
     { 14, D3DTSS_COLORARG1 },

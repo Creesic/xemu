@@ -247,6 +247,9 @@ typedef struct NV2ACombinerState {
      * HLSL samples as (R,0,0,1). Hardware replicates the channel, so flagged
      * stages must be swizzled to (R,R,R,1) after sampling. */
     uint8_t texture_luminance[NV2A_MAX_TEXTURES];
+    uint8_t color_key_mode[NV2A_MAX_TEXTURES];
+    uint32_t color_key[NV2A_MAX_TEXTURES];
+    uint32_t color_key_mask[NV2A_MAX_TEXTURES];
 
     /* NV097_SET_CONTROL0_Z_PERSPECTIVE_ENABLE: NV2A writes a W-BUFFER, storing
      * perspective-correct w instead of the screen-linear z/w a GPU depth buffer
@@ -384,7 +387,12 @@ void d3d8_combiners_mark_constants_dirty(void);
  * definition. Luminance formats replicate their channel across RGB on Xbox.
  */
 void d3d8_combiners_set_texture_binding(
-    UINT stage, UINT dimensionality, BOOL cube, BOOL luminance);
+    UINT stage, UINT dimensionality, BOOL cube, BOOL luminance, UINT format);
+
+/** Record an immediate Xbox bump-environment texture-state leaf. */
+BOOL d3d8_combiners_set_bump_env(UINT stage, UINT type, DWORD value);
+BOOL d3d8_combiners_set_color_key(UINT stage, DWORD value);
+BOOL d3d8_combiners_set_color_key_mode(UINT stage, UINT mode);
 
 /**
  * Select Xbox W-buffer depth output for native-HLE combiner draws.

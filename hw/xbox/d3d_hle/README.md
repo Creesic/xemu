@@ -75,14 +75,17 @@ The xemu bridge instead:
 2. checks the exact MM3/PGR2 profiles, then falls back to runtime discovery;
 3. normalizes ordinary stdcall and full-register LTCG variants into a common
    logical argument list;
-4. preserves native XDK CreateDevice long enough to create a valid guest
-   device, then mirrors it into Plume;
+4. preserves native XDK CreateDevice and title-owned allocations for
+   mirror-native profiles, while reviewed direct-bootstrap profiles use a
+   session-owned synthetic guest mapping outside retail RAM;
 5. lazily adopts guest textures, buffers, and surfaces into the shared D3D8
    state model; and
 6. completes bound state, draw, synchronization, and present calls through
    Plume while maintaining the detected guest calling convention.
 
 The generic interception and memory bridge lives in `xemu_d3d_hle.c`.
+`xemu_d3d_hle_guest_heap.c` owns the bounded allocator metadata for the
+direct-bootstrap mapping.
 `xemu_d3d_hle_discovery.c` owns runtime detection and ABI marshalling. The
 MM3/PGR2 compatibility overrides remain isolated in their profile translation
 units. Backend-neutral D3D8/Plume code remains in the other files in this

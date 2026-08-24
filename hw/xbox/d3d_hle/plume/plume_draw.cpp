@@ -19,6 +19,10 @@
 #include "plume_vertex_stream.h"
 #include "xps_translate.h"
 #include "../d3d8_vsh.h"
+#include "../kernel/xbox_memory_layout.h"
+/* NV2A pgraph YUV oracle: BT.601 integer conversion shared with xemu's
+ * native texture path (convert_yuy2_to_rgb / convert_uyvy_to_rgb). */
+#include "../../nv2a/pgraph/util.h"
 
 #include "../platform/host_time.h"
 #include "../platform/cpu_recorder.h"
@@ -1400,6 +1404,9 @@ static bool plume_map_texfmt(uint32_t d3dfmt, RenderFormat &out)
     case 0x12: out = RenderFormat::B8G8R8A8_UNORM; return true;  /* LIN_A8R8G8B8 */
     case 0x1E: out = RenderFormat::B8G8R8A8_UNORM; return true;  /* LIN_X8R8G8B8 */
     case 0x19: out = RenderFormat::R8_UNORM;        return true;  /* A8 */
+    case 0x1F: out = RenderFormat::R8_UNORM;        return true;  /* LIN_A8 */
+    case 0x24: out = RenderFormat::B8G8R8A8_UNORM;  return true;  /* YUY2, converted */
+    case 0x25: out = RenderFormat::B8G8R8A8_UNORM;  return true;  /* UYVY, converted */
     case 0x35: out = RenderFormat::R16_UNORM;       return true;  /* LU_IMAGE_Y16 */
     default:   return false;
     }
@@ -1753,6 +1760,69 @@ void PlumeDraw::uploadRecordedTexture(PlumeContext &ctx,
             mipHeight = mipHeight > 1 ? mipHeight / 2 : 1;
         }
         uploadPitch = textureLevels == 1 ? w * 4u : 0;
+        uploadBytes = (uint32_t)convertedBytes64;
+        uploadPixels = converted.data();
+    } else if (format == 0x24u || format == 0x25u) {
+        /* D3DFMT_YUY2/UYVY are the Xbox's 16-bit video formats.  Keep the
+         * conversion identical to NV2A's native texture path: util.h owns
+         * the XDK/xemu BT.601 integer coefficients and byte ordering. */
+        uint64_t sourceOffset = 0;
+        uint64_t convertedBytes64 = 0;
+        uint32_t mipWidth = w;
+        uint32_t mipHeight = h;
+        for (uint32_t level = 0; level < textureLevels; ++level) {
+            const uint64_t sourcePitch =
+                (level == 0 && pitch) ? pitch : (uint64_t)mipWidth * 2u;
+            if (!mipWidth || (mipWidth & 1u) ||
+                sourcePitch < (uint64_t)mipWidth * 2u) {
+                clear_stage();
+                return;
+            }
+            sourceOffset += sourcePitch * mipHeight;
+            convertedBytes64 += (uint64_t)mipWidth * 4u * mipHeight;
+            mipWidth = mipWidth > 1 ? mipWidth / 2 : 1;
+            mipHeight = mipHeight > 1 ? mipHeight / 2 : 1;
+        }
+        if (sourceOffset > bytes || convertedBytes64 > UINT32_MAX) {
+            clear_stage();
+            return;
+        }
+        uploadBytes = (uint32_t)convertedBytes64;
+        converted.resize(uploadBytes);
+        const uint8_t *src = (const uint8_t *)pixels;
+        sourceOffset = 0;
+        size_t destinationOffset = 0;
+        mipWidth = w;
+        mipHeight = h;
+        for (uint32_t level = 0; level < textureLevels; ++level) {
+            const uint32_t sourcePitch =
+                (level == 0 && pitch) ? pitch : mipWidth * 2u;
+            const uint32_t destinationPitch = mipWidth * 4u;
+            for (uint32_t y = 0; y < mipHeight; ++y) {
+                const uint8_t *sourceRow = src + sourceOffset +
+                    (size_t)y * sourcePitch;
+                uint8_t *destinationRow = converted.data() +
+                    destinationOffset + (size_t)y * destinationPitch;
+                for (uint32_t x = 0; x < mipWidth; ++x) {
+                    uint8_t r;
+                    uint8_t g;
+                    uint8_t b;
+                    if (format == 0x24u)
+                        convert_yuy2_to_rgb(sourceRow, x, &r, &g, &b);
+                    else
+                        convert_uyvy_to_rgb(sourceRow, x, &r, &g, &b);
+                    destinationRow[x * 4u + 0u] = b;
+                    destinationRow[x * 4u + 1u] = g;
+                    destinationRow[x * 4u + 2u] = r;
+                    destinationRow[x * 4u + 3u] = 0xFFu;
+                }
+            }
+            sourceOffset += (uint64_t)sourcePitch * mipHeight;
+            destinationOffset += (size_t)destinationPitch * mipHeight;
+            mipWidth = mipWidth > 1 ? mipWidth / 2 : 1;
+            mipHeight = mipHeight > 1 ? mipHeight / 2 : 1;
+        }
+        uploadPitch = textureLevels == 1 ? w * 4u : 0;
         uploadPixels = converted.data();
     } else if (plumeCopyX8UploadWithOpaqueAlpha(
                    format, pixels, bytes, converted)) {
@@ -1991,7 +2061,8 @@ void PlumeDraw::uploadRecordedTexture(PlumeContext &ctx,
             RenderTextureDesc::Texture2D(w, h, textureLevels, pf));
         if (!t.tex) { clear_stage(); return; }
         RenderTextureViewDesc viewDesc = RenderTextureViewDesc::Texture2D(pf);
-        if (format == 0x19) {
+        if (format == 0x19 || format == 0x1F) {
+            /* A8 / LIN_A8: alpha-only; RGB sample as 1.0. */
             viewDesc.componentMapping = RenderComponentMapping(
                 RenderSwizzle::ONE, RenderSwizzle::ONE,
                 RenderSwizzle::ONE, RenderSwizzle::R);
@@ -6937,8 +7008,6 @@ bool PlumeDraw::recordHostOutputOverlays(
     return success;
 }
 
-extern "C" ptrdiff_t g_xbox_mem_offset;
-
 /* Xbox VRAM is plain RAM: games CPU-read small render targets (MM3's 40x30
  * exposure-measurement ring drives its per-frame tonemap gain). Copy every
  * small color surface the just-recorded replay wrote into a readback buffer
@@ -6959,8 +7028,8 @@ void PlumeDraw::recordSurfaceDownloads(PlumeContext &ctx,
             xgpu_plume_guest_color_row_bytes(s.guestFormat, s.width);
         if (!guestRowBytes || s.guestPitch < guestRowBytes)
             continue;
-        if (s.guestAddr >= 0x04000000u ||
-            (uint64_t)s.guestPitch * s.height > 0x04000000u - s.guestAddr)
+        if (!xbox_guest_phys_ptr(
+                s.guestAddr, static_cast<size_t>(s.guestPitch) * s.height))
             continue;
         if (s.physicalWidth > (UINT32_MAX - 255u) / 4u)
             continue;
@@ -7074,8 +7143,12 @@ void PlumeDraw::completeDownloadsFrom(
             s.downloadBuffer->unmap();
             continue;
         }
-        uint8_t *guest = reinterpret_cast<uint8_t *>(
-            (uintptr_t)s.guestAddr + (uintptr_t)g_xbox_mem_offset);
+        uint8_t *guest = xbox_guest_phys_ptr(
+            s.guestAddr, static_cast<size_t>(s.guestPitch) * s.height);
+        if (!guest) {
+            s.downloadBuffer->unmap();
+            continue;
+        }
         const bool packed = xgpu_plume_pack_guest_color_surface(
             s.guestFormat, logical.data(), logicalPitch,
             guest, s.guestPitch,

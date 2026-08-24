@@ -290,6 +290,20 @@ void d3d_hle_cube_texture_get_cube_map_surface2(void)
     RET(d3d_hle_guest_cube_get_surface(texture, face, level));
 }
 
+extern void d3d_hle_get_2d_surface_desc_gen_unused(void);
+void d3d_hle_get_2d_surface_desc(void)
+{
+    uint32_t resource;
+    uint32_t level;
+    uint32_t desc;
+    HLE_FALLBACK(d3d_hle_get_2d_surface_desc);
+    resource = d3d_hle_guest_stack_u32(0);
+    level = d3d_hle_guest_stack_u32(1);
+    desc = d3d_hle_guest_stack_u32(2);
+    d3d_hle_guest_stdcall_return(12);
+    d3d_hle_guest_surface_desc(resource, level, desc);
+}
+
 extern void d3d_hle_volume_texture_get_level_desc_gen_unused(void);
 void d3d_hle_volume_texture_get_level_desc(void)
 {
@@ -808,7 +822,7 @@ void d3d_hle_device_set_vertex_shader_constant1_fast(void)
 {
     HLE_FALLBACK(d3d_hle_device_set_vertex_shader_constant1_fast);
     d3d_hle_guest_stdcall_return(0);
-    d3d_hle_guest_set_vertex_shader_constant((int32_t)g_ecx, g_edx, 1);
+    d3d_hle_guest_set_vertex_shader_constant_hardware(g_ecx, g_edx, 1);
 }
 
 extern void
@@ -819,8 +833,8 @@ void d3d_hle_device_set_vertex_shader_constant_not_inline_fast(void)
     HLE_FALLBACK(d3d_hle_device_set_vertex_shader_constant_not_inline_fast);
     dword_count = d3d_hle_guest_stack_u32(0);
     d3d_hle_guest_stdcall_return(4);
-    d3d_hle_guest_set_vertex_shader_constant(
-        (int32_t)g_ecx, g_edx, dword_count / 4u);
+    d3d_hle_guest_set_vertex_shader_constant_hardware(
+        g_ecx, g_edx, dword_count / 4u);
 }
 
 DEFINE_STACK_WRAPPER3(d3d_hle_device_set_vertex_shader_input,
@@ -932,6 +946,26 @@ void d3d_hle_volume_texture_lock_box(void)
 
 DEFINE_STD_WRAPPER(d3d_hle_device_set_texture_state_border_color_std, 2,
     d3d_hle_guest_set_texture_stage_state(a[0], D3DTSS_BORDERCOLOR, a[1]))
+DEFINE_STD_WRAPPER(d3d_hle_device_set_texture_state_bump_env_std, 3,
+    d3d_hle_guest_set_bump_env(a[0], a[1], a[2]))
+DEFINE_STD_WRAPPER(d3d_hle_device_set_texture_state_color_key_std, 2,
+    d3d_hle_guest_set_color_key(a[0], a[1]))
+DEFINE_STD_WRAPPER(d3d_hle_block_on_resource_std, 1,
+    d3d_hle_guest_block_on_resource(a[0]))
+DEFINE_STD_WRAPPER(d3d_hle_device_set_shader_constant_mode_std, 1,
+    d3d_hle_guest_set_shader_constant_mode(a[0]))
+DEFINE_STD_WRAPPER(d3d_hle_lock_2d_surface_std, 6,
+    d3d_hle_guest_lock_2d_surface(
+        a[0], a[1], a[2], a[3], a[4], a[5]))
+DEFINE_STD_WRAPPER(d3d_hle_device_set_tile_std, 2,
+    d3d_hle_guest_set_tile(a[0], a[1]))
+DEFINE_STD_WRAPPER(d3d_hle_device_get_tile_std, 2,
+    d3d_hle_guest_get_tile(a[0], a[1]))
+DEFINE_STD_WRAPPER(d3d_hle_device_set_vertex_data4ub_std, 5,
+    d3d_hle_guest_set_vertex_data4ub(
+        a[0], a[1], a[2], a[3], a[4]))
+DEFINE_STD_WRAPPER(d3d_hle_device_set_palette_std, 2,
+    RET(d3d_hle_guest_set_palette(a[0], a[1])))
 DEFINE_STD_WRAPPER(d3d_hle_resource_get_type_std, 1,
     RET(d3d_hle_guest_resource_type(a[0])))
 DEFINE_STD_WRAPPER(d3d_hle_device_set_stream_source_std, 3,

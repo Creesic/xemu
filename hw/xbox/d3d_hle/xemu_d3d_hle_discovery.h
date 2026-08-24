@@ -22,4 +22,11 @@ bool xemu_d3d_hle_discovered_argument(
 /* Marshal a discovered XDK ABI into the reviewed wrapper's ABI and invoke it. */
 bool xemu_d3d_hle_invoke_discovered(const XemuD3DHleHook *hook);
 
+/* True when an XBE section header describes memory the automatic detector
+ * scans (executable or a named D3D runtime section). Non-scan sections
+ * (streamed audio/video/track data) can never change a discovery verdict.
+ * `section_header` is a const xbe_section_header *. */
+bool xemu_d3d_hle_discovery_is_scan_target(
+    XemuD3DHleGuestRead read_guest, const void *section_header);
+
 #endif

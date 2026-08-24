@@ -4,7 +4,11 @@
 #include "d3d_hle_guest_driver.h"
 #include "d3d8_cpu_surface_sync.h"
 #include "d3d8_internal.h"
+#include "d3d8_palette.h"
+#include "d3d8_shader_constants.h"
 #include "d3d8_swizzle.h"
+#include "d3d8_tile_state.h"
+#include "d3d8_texture_state.h"
 #include "d3d8_vsh.h"
 #if !defined(XRECOMP_D3D_HLE_TEST_NO_FALLBACKS)
 #include "plume/plume_f2_capture.h"
@@ -53,6 +57,7 @@ int d3d8_PgraphDownloadSurfaceRange(uint32_t start, uint32_t bytes);
 void d3d_hle_guest_materialize_deferred_fixed_state(void);
 void d3d_hle_guest_materialize_deferred_fog_state(void);
 void d3d_hle_guest_mark_deferred_pixel_shader_dirty(void);
+extern uint32_t xrecomp_d3d_hle_deferred_texture_state_va;
 #endif
 
 enum {
@@ -71,6 +76,7 @@ enum {
     XBOX_D3DCOMMON_LIVE_MASK = 0x0078FFFFu,
     XBOX_D3D_MAX_STREAMS = 16,
     XBOX_D3D_MAX_TEXTURES = 4,
+    XBOX_D3D_MAX_TILES = 8,
     XBOX_D3D_HLE_RESOURCE_CHUNK_SIZE = 256,
     XBOX_D3D_HLE_MAX_STATES = 512,
     NV097_SET_ALPHA_TEST_ENABLE = 0x0300,
@@ -105,6 +111,7 @@ typedef struct D3DHleGuestBindings {
     uint32_t index_resource;
     uint32_t base_vertex;
     uint32_t texture_resource[XBOX_D3D_MAX_TEXTURES];
+    uint32_t palette_resource[XBOX_D3D_MAX_TEXTURES];
     uint32_t render_target;
     uint32_t depth_stencil;
 } D3DHleGuestBindings;
@@ -135,6 +142,7 @@ typedef enum D3DHleGuestResourceKind {
     D3D_HLE_RESOURCE_SURFACE,
     D3D_HLE_RESOURCE_VERTEX_BUFFER,
     D3D_HLE_RESOURCE_INDEX_BUFFER,
+    D3D_HLE_RESOURCE_PALETTE,
     D3D_HLE_RESOURCE_VERTEX_SHADER,
     D3D_HLE_RESOURCE_PIXEL_SHADER,
 } D3DHleGuestResourceKind;
@@ -186,6 +194,9 @@ static uint32_t g_hle_front_buffer;
 static uint32_t g_hle_depth_buffer;
 static uint32_t g_hle_vertex_shader;
 static uint32_t g_hle_pixel_shader;
+enum { D3D_HLE_PUSH_SCRATCH_BYTES = 16384 };
+static uint32_t g_hle_push_scratch_va;
+static uint32_t g_hle_push_constant_load;
 typedef struct D3DHleGuestLoadedVertexProgram {
     uint32_t instruction_count;
     uint64_t generation;
@@ -199,6 +210,14 @@ static uint32_t g_hle_pixel_shader_constant_valid;
 static DWORD g_hle_pixel_shader_effective[60];
 static uint32_t g_hle_pixel_shader_effective_valid;
 static uint32_t g_hle_fence;
+static uint32_t g_hle_shader_constant_mode;
+static XboxD3DTile g_hle_tiles[XBOX_D3D_MAX_TILES];
+/* Host-side copy of the last successfully applied present parameters;
+ * survives guest session resets so a same-title restart never rereads
+ * freed guest stack memory. */
+static D3DPRESENT_PARAMETERS g_hle_present_snapshot;
+static int g_hle_present_snapshot_valid;
+static uint64_t g_hle_palette_version[XBOX_D3D_MAX_TEXTURES];
 static uint32_t g_hle_state_cache[XBOX_D3D_HLE_MAX_STATES];
 static float g_hle_immediate_vertex[16][4];
 static int g_hle_overlay_enabled;
@@ -317,13 +336,15 @@ static void d3d_hle_guest_refresh_external_resource(
      * Games may reuse the header with a new Data allocation while it remains
      * registered or even bound. The vertex draw path already reads Data from
      * the header directly; keep the registry and index-offset recovery in
-     * lockstep with it.
+     * lockstep with it. A header page unmapped by loader section churn means
+     * there is nothing live to refresh.
      */
     if (resource->kind == D3D_HLE_RESOURCE_VERTEX_BUFFER ||
         resource->kind == D3D_HLE_RESOURCE_INDEX_BUFFER) {
-        data_va =
-            d3d_hle_guest_read_u32(resource->object_va + 4u) & 0x0FFFFFFFu;
-        resource->data_va = data_va;
+        if (!d3d_hle_guest_try_read_u32(
+                resource->object_va + 4u, &data_va))
+            return;
+        resource->data_va = data_va & 0x0FFFFFFFu;
         return;
     }
 
@@ -338,10 +359,14 @@ static void d3d_hle_guest_refresh_external_resource(
     if (resource->kind != D3D_HLE_RESOURCE_TEXTURE)
         return;
 
-    data_va =
-        d3d_hle_guest_read_u32(resource->object_va + 4u) & 0x0FFFFFFFu;
-    format_word = d3d_hle_guest_read_u32(resource->object_va + 12u);
-    size = d3d_hle_guest_read_u32(resource->object_va + 16u);
+    if (!d3d_hle_guest_try_read_u32(
+            resource->object_va + 4u, &data_va) ||
+        !d3d_hle_guest_try_read_u32(
+            resource->object_va + 12u, &format_word) ||
+        !d3d_hle_guest_try_read_u32(
+            resource->object_va + 16u, &size))
+        return;
+    data_va &= 0x0FFFFFFFu;
     format = (format_word >> 8) & 0xFFu;
     levels = (format_word >> 16) & 0xFu;
     if (!levels)
@@ -448,11 +473,13 @@ static bool d3d_hle_guest_resource_record_matches_live_type(
      * can therefore still point at a registry record whose guest address now
      * contains a different resource type. Revalidate the Common type before
      * returning the record; adopt_resource can then register the new live
-     * object without mutating or dereferencing the stale descriptor.
+     * object without mutating or dereferencing the stale descriptor. A header
+     * page unmapped by loader section churn is equally "not this resource" —
+     * never a fatal condition during a speculative registry walk.
      */
-    common_type =
-        d3d_hle_guest_read_u32(resource->object_va) &
-        XBOX_D3DCOMMON_TYPE_MASK;
+    if (!d3d_hle_guest_try_read_u32(resource->object_va, &common_type))
+        return false;
+    common_type &= XBOX_D3DCOMMON_TYPE_MASK;
     switch (resource->kind) {
     case D3D_HLE_RESOURCE_TEXTURE:
         return common_type == XBOX_D3DCOMMON_TYPE_TEXTURE;
@@ -508,14 +535,20 @@ static bool d3d_hle_guest_texture_data_candidate(
      * Data: first prove that the live guest header is still a texture and is
      * the particular texture being requested. Besides avoiding stale garbage,
      * this is the revalidation required for a potentially stale index hit.
+     * The loader can also unmap a historical header's page outright
+     * (BINKDATA-style section churn); an unreadable header is simply not a
+     * candidate.
      */
-    common = d3d_hle_guest_read_u32(resource->object_va);
+    if (!d3d_hle_guest_try_read_u32(resource->object_va, &common))
+        return false;
     if ((common & XBOX_D3DCOMMON_TYPE_MASK) !=
             XBOX_D3DCOMMON_TYPE_TEXTURE ||
         !(common & XBOX_D3DCOMMON_LIVE_MASK))
         return false;
-    live_data_va =
-        d3d_hle_guest_read_u32(resource->object_va + 4u) & 0x0FFFFFFFu;
+    if (!d3d_hle_guest_try_read_u32(
+            resource->object_va + 4u, &live_data_va))
+        return false;
+    live_data_va &= 0x0FFFFFFFu;
     if (live_data_va != data_va)
         return false;
 
@@ -742,7 +775,14 @@ static D3DHleGuestResource *d3d_hle_guest_register_resource(
 static uint32_t d3d_hle_guest_alloc(uint32_t bytes, uint32_t alignment,
                                     uint32_t high)
 {
-    uint32_t va = xbox_HeapAllocRange(bytes, alignment, 0x1000u, high);
+    uint32_t low = 0x1000u;
+    uint32_t va;
+
+    if (xbox_HeapSyntheticAvailable()) {
+        low = XBOX_HEAP_EXT_BASE;
+        high = XBOX_HEAP_EXT_BASE + XBOX_HEAP_EXT_SIZE - 1u;
+    }
+    va = xbox_HeapAllocRange(bytes, alignment, low, high);
     if (!va)
         d3d_hle_guest_fatal("guest resource allocation", E_OUTOFMEMORY);
     memset(xbox_guest_ptr(va), 0, bytes);
@@ -751,10 +791,7 @@ static uint32_t d3d_hle_guest_alloc(uint32_t bytes, uint32_t alignment,
 
 bool d3d_hle_guest_synthetic_allocator_available(void)
 {
-    /* xbox_HeapAllocRange is intentionally fail-closed until the shared Xbox
-     * heap/mapping service owns synthetic guest allocations. Direct bootstrap
-     * profiles must not enter Plume while this capability is absent. */
-    return false;
+    return xbox_HeapSyntheticAvailable();
 }
 
 static _Noreturn void
@@ -870,6 +907,8 @@ static D3DHleGuestResourceKind d3d_hle_guest_kind_from_type(
         return D3D_HLE_RESOURCE_VERTEX_BUFFER;
     case XRECOMP_XBOX_D3DRTYPE_INDEXBUFFER:
         return D3D_HLE_RESOURCE_INDEX_BUFFER;
+    case XRECOMP_XBOX_D3DRTYPE_PALETTE:
+        return D3D_HLE_RESOURCE_PALETTE;
     default:
         return D3D_HLE_RESOURCE_NONE;
     }
@@ -1083,6 +1122,15 @@ static uint32_t d3d_hle_guest_data_address(uint32_t data_va)
         && data_va < XBOX_HEAP_EXT_BASE + XBOX_HEAP_EXT_SIZE)
         return data_va;
     return data_va | 0x80000000u;
+}
+
+static uint32_t d3d_hle_guest_data_offset(uint32_t data_va)
+{
+    if (data_va >= XBOX_HEAP_EXT_BASE &&
+        data_va < XBOX_HEAP_EXT_BASE + XBOX_HEAP_EXT_SIZE) {
+        return data_va & 0x0FFFFFFFu;
+    }
+    return data_va;
 }
 
 static uint8_t *d3d_hle_guest_data_ptr(uint32_t data_va)
@@ -1430,8 +1478,27 @@ void d3d_hle_guest_set_texture_stage_state(
         d3d_hle_guest_fatal("SetTextureStageState", result);
 }
 
-void d3d_hle_guest_set_vertex_shader_constant(
-    int32_t start_register, uint32_t constant_data_va, uint32_t count)
+/* Guest-controlled constant writes are never fatal: the hardware oracle
+ * accepts or ignores them and keeps running. ponytail: single latch —
+ * first dropped write wins the diagnostic, later ones stay silent. */
+static void d3d_hle_guest_drop_vertex_shader_constant(
+    const char *operation, int32_t start_register, uint32_t count)
+{
+    static bool logged;
+
+    if (logged)
+        return;
+    logged = true;
+    fprintf(stderr,
+            "[D3D-HLE] dropped SetVertexShaderConstant %s "
+            "(start=%d count=%u mode=%08X); continuing without this "
+            "write\n",
+            operation, (int)start_register, (unsigned)count,
+            (unsigned)g_hle_shader_constant_mode);
+}
+
+void d3d_hle_guest_set_vertex_shader_constant_hardware(
+    uint32_t start_register, uint32_t constant_data_va, uint32_t count)
 {
     IDirect3DDevice8 *device = xbox_GetD3DDevice();
     const void *constant_data;
@@ -1439,11 +1506,49 @@ void d3d_hle_guest_set_vertex_shader_constant(
     if (!device)
         d3d_hle_guest_fatal(
             "SetVertexShaderConstant (device unavailable)", E_FAIL);
+    if (!count || start_register >= 192u || count > 192u - start_register) {
+        d3d_hle_guest_drop_vertex_shader_constant(
+            "hardware range", (int32_t)start_register, count);
+        return;
+    }
     constant_data = xbox_guest_ptr(constant_data_va);
     result = device->lpVtbl->SetVertexShaderConstant(
-        device, start_register, constant_data, count);
+        device, (INT)start_register, constant_data, count);
     if (result != S_OK)
         d3d_hle_guest_fatal("SetVertexShaderConstant", result);
+}
+
+void d3d_hle_guest_set_vertex_shader_constant(
+    int32_t start_register, uint32_t constant_data_va, uint32_t count)
+{
+    /* Raw pass-through: the XDK helper bodies already hand us hardware
+     * constant slots (PGR2 writes start=96 through this path), and the
+     * committed, MM3-validated implementation did no translation here.
+     * ponytail: the ±96 mode translator is unproven against any title;
+     * reintroduce only with a live-validated mode-switching title. */
+    d3d_hle_guest_set_vertex_shader_constant_hardware(
+        (uint32_t)start_register, constant_data_va, count);
+}
+
+void d3d_hle_guest_set_shader_constant_mode(uint32_t mode)
+{
+    uint32_t base_mode = mode & ~XBOX_D3DSCM_NORESERVEDCONSTANTS;
+
+    if ((mode & ~(XBOX_D3DSCM_NORESERVEDCONSTANTS | 3u)) ||
+        base_mode > XBOX_D3DSCM_192CONSTANTSANDFIXEDPIPELINE) {
+        static bool logged;
+
+        if (!logged) {
+            logged = true;
+            fprintf(stderr,
+                    "[D3D-HLE] dropped SetShaderConstantMode(%08X); "
+                    "keeping current mode %08X\n",
+                    (unsigned)mode,
+                    (unsigned)g_hle_shader_constant_mode);
+        }
+        return;
+    }
+    g_hle_shader_constant_mode = mode;
 }
 
 void d3d_hle_guest_set_stream_source(
@@ -1626,6 +1731,41 @@ void d3d_hle_guest_draw_indexed_vertices(
                 E_INVALIDARG);
         resolved_indices_va = (uint32_t)resolved;
     }
+    /*
+     * Faithful floor for a bad index pointer: real hardware DMA-reads
+     * whatever the caller pushed and draws garbage for a frame — it never
+     * halts the console. The HLE cannot read unmapped memory, so probe the
+     * resolved range (first and last index word) with tolerant reads and
+     * DROP the draw when unreadable (RSC2 intermittently issues offset
+     * 000001C0 with no usable bound index buffer during race transitions;
+     * the previous xbox_guest_ptr fail-fast killed the whole process).
+     */
+    {
+        uint32_t probe_word;
+        uint64_t index_bytes = (uint64_t)index_count * sizeof(*indices);
+        uint32_t last_va =
+            resolved_indices_va + (index_count - 1u) * sizeof(*indices);
+
+        if (resolved_indices_va > UINT32_MAX - index_bytes ||
+            !d3d_hle_guest_try_read_u32(resolved_indices_va, &probe_word) ||
+            !d3d_hle_guest_try_read_u32(last_va & ~3u, &probe_word)) {
+            D3D_HLE_F2_LOG(
+                "hle dropped indexed draw: unreadable indices "
+                "prim=%u index_count=%u arg=%08X resolved=%08X "
+                "ib=%08X ibdata=%08X ibbytes=%u",
+                (uint32_t)primitive_type, index_count, indices_va,
+                resolved_indices_va, g_hle_bindings.index_resource,
+                index_resource ? index_resource->data_va : 0u,
+                index_resource ? index_resource->data_bytes : 0u);
+            fprintf(stderr,
+                    "[D3D-HLE] dropped indexed draw: unreadable indices "
+                    "arg=%08X resolved=%08X index_count=%u ib=%08X\n",
+                    indices_va, resolved_indices_va, index_count,
+                    g_hle_bindings.index_resource);
+            XRECOMP_CPU_RECORDER_ZONE_END(cpu_hle_draw_indexed_zone);
+            return;
+        }
+    }
     indices =
         (const uint16_t *)xbox_guest_ptr(resolved_indices_va);
 #if !defined(XRECOMP_D3D_HLE_TEST_NO_FALLBACKS)
@@ -1797,15 +1937,69 @@ uint32_t d3d_hle_guest_resource_is_busy(uint32_t resource_va)
     return 0;
 }
 
+void d3d_hle_guest_block_on_resource(uint32_t resource_va)
+{
+    uint32_t common;
+    uint32_t parent_va = 0;
+
+    if (!resource_va)
+        d3d_hle_guest_fatal("BlockOnResource (null resource)",
+                            E_INVALIDARG);
+    if (!xgpu_plume_wait_for_idle(0))
+        d3d_hle_guest_fatal("BlockOnResource", E_FAIL);
+    common = d3d_hle_guest_read_u32(resource_va);
+    if ((common & XBOX_D3DCOMMON_TYPE_MASK) ==
+        XBOX_D3DCOMMON_TYPE_SURFACE) {
+        parent_va = d3d_hle_guest_read_u32(resource_va + 20u);
+    }
+    d3d_hle_guest_write_u32(resource_va + 8u, 0);
+    if (parent_va)
+        d3d_hle_guest_write_u32(parent_va + 8u, 0);
+}
+
+/* Storage widths from the XDK's PixelJar g_TextureFormat table
+ * (windows/directx/dxg/d3d8/se/pixeljar.hpp); the linear-pitch and upload
+ * layout math is only as fail-closed as this table is faithful.
+ * Contract: tests/d3d_hle_format_bpp_oracle_contract.py. */
 static uint32_t d3d_hle_guest_format_bytes_per_pixel(uint32_t format)
 {
     switch (format & 0xFFu) {
-    case 0x00: case 0x01: case 0x0B: case 0x19:
+    case 0x00: /* L8 */
+    case 0x01: /* AL8 */
+    case 0x0B: /* P8 */
+    case 0x13: /* LIN_L8 */
+    case 0x19: /* A8 */
+    case 0x1B: /* LIN_AL8 */
+    case 0x1F: /* LIN_A8 */
         return 1;
-    case 0x02: case 0x04: case 0x08: case 0x0D: case 0x10:
-    case 0x11: case 0x1A: case 0x1B: case 0x20: case 0x27:
-    case 0x24: case 0x25: case 0x28: case 0x29: case 0x32:
-    case 0x35: case 0x38: case 0x39:
+    case 0x02: /* A1R5G5B5 */
+    case 0x03: /* X1R5G5B5 */
+    case 0x04: /* A4R4G4B4 */
+    case 0x05: /* R5G6B5 */
+    case 0x10: /* LIN_A1R5G5B5 */
+    case 0x11: /* LIN_R5G6B5 */
+    case 0x16: /* LIN_R8B8 */
+    case 0x17: /* LIN_G8B8 / LIN_V8U8 */
+    case 0x1A: /* A8L8 */
+    case 0x1C: /* LIN_X1R5G5B5 */
+    case 0x1D: /* LIN_A4R4G4B4 */
+    case 0x20: /* LIN_A8L8 */
+    case 0x24: /* UYVY */
+    case 0x25: /* YUY2 */
+    case 0x27: /* R6G5B5 / L6V5U5 */
+    case 0x28: /* G8B8 / V8U8 */
+    case 0x29: /* R8B8 */
+    case 0x2C: /* D16_LOCKABLE / D16 */
+    case 0x2D: /* F16 */
+    case 0x30: /* LIN_D16 */
+    case 0x31: /* LIN_F16 */
+    case 0x32: /* L16 */
+    case 0x35: /* LIN_L16 */
+    case 0x37: /* LIN_R6G5B5 / LIN_L6V5U5 */
+    case 0x38: /* R5G5B5A1 */
+    case 0x39: /* R4G4B4A4 */
+    case 0x3D: /* LIN_R5G5B5A1 */
+    case 0x3E: /* LIN_R4G4B4A4 */
         return 2;
     default:
         return 4;
@@ -2030,7 +2224,7 @@ uint32_t d3d_hle_guest_create_texture2(
 
     resource = d3d_hle_guest_register_resource(
         D3D_HLE_RESOURCE_TEXTURE, object_va);
-    resource->data_va = data_va;
+    resource->data_va = d3d_hle_guest_data_offset(data_va);
     resource->data_bytes = bytes;
     resource->width = width;
     resource->height = height;
@@ -2346,8 +2540,17 @@ void d3d_hle_guest_surface_lock_rect(
                    left * d3d_hle_guest_format_bytes_per_pixel(
                        surface->format);
     }
-    if (flags & 0x40u)
-        data_va |= 0xF0000000u;
+    if (flags & 0x40u) {
+        if (data_va < XBOX_PHYS_RAM) {
+            data_va |= 0xF0000000u;
+        } else {
+            /* The hardware tile window only aliases the first 64 MiB of
+             * RAM. A synthetic-heap allocation has no F-window alias, so
+             * hand back its cached guest VA — the synthetic PDEs make it
+             * directly writable and it decodes to the same storage. */
+            data_va = d3d_hle_guest_data_address(data_va);
+        }
+    }
     d3d_hle_guest_write_u32(locked_rect_va, pitch);
     d3d_hle_guest_write_u32(locked_rect_va + 4u, data_va);
     d3d_hle_guest_finish_surface_cpu_lock(surface_va, flags, true);
@@ -2513,7 +2716,7 @@ void d3d_hle_guest_switch_texture(
         type == XRECOMP_XBOX_D3DRTYPE_CUBETEXTURE ? 6u : 1u;
     d3d8_combiners_set_texture_binding(
         stage, texture->depth > 1u ? 3u : 2u, face_count == 6u,
-        texture->format == 0x35u);
+        texture->format == 0x35u, texture->format);
     surface_key = face_count == 1u
         ? d3d_hle_guest_texture_surface_key(texture) : 0;
     if (surface_key) {
@@ -2636,7 +2839,8 @@ void d3d_hle_guest_switch_texture(
     binding.pitch = pitch;
     binding.bytes = bytes;
     binding.format = texture->format;
-    binding.version = texture->version;
+    binding.version = texture->version > g_hle_palette_version[stage]
+        ? texture->version : g_hle_palette_version[stage];
     binding.cube = face_count == 6u;
     /*
      * A nonzero PixelContainer Size denotes pitch-linear storage. Its texture
@@ -2663,8 +2867,9 @@ void d3d_hle_guest_switch_texture(
         cpu_hle_texture_cache_zone, "D3D HLE Texture Cache Bind");
     texture_cache_hit =
         !xgpu_plume_f2_active() &&
+        texture->format != D3DFMT_P8 &&
         (!has_host_color_mips ||
-         texture->uploaded_version == texture->version) &&
+         texture->uploaded_version == binding.version) &&
         xgpu_plume_bind_texture_if_cached(&binding);
     XRECOMP_CPU_RECORDER_ZONE_END(cpu_hle_texture_cache_zone);
     if (texture_cache_hit) {
@@ -2716,9 +2921,46 @@ void d3d_hle_guest_switch_texture(
         }
         pixels = snapshot;
     }
+    if (texture->format == D3DFMT_P8) {
+        D3DHleGuestResource *palette = d3d_hle_guest_find_resource(
+            g_hle_bindings.palette_resource[stage]);
+        const uint32_t *entries;
+        const uint8_t *indices = (const uint8_t *)pixels;
+        uint8_t *expanded;
+        uint32_t entry_count;
+        uint32_t expanded_bytes;
+        uint32_t pixel;
+
+        if (!palette || palette->kind != D3D_HLE_RESOURCE_PALETTE)
+            d3d_hle_guest_fatal("P8 texture without bound palette",
+                                E_INVALIDARG);
+        entry_count = xbox_d3d8_palette_entry_count(
+            d3d_hle_guest_read_u32(palette->object_va));
+        entries = (const uint32_t *)d3d_hle_guest_data_ptr(palette->data_va);
+        if (bytes > UINT32_MAX / 4u)
+            d3d_hle_guest_fatal("P8 texture expansion overflow",
+                                E_INVALIDARG);
+        expanded_bytes = bytes * 4u;
+        expanded = (uint8_t *)malloc(expanded_bytes);
+        if (!expanded)
+            d3d_hle_guest_fatal("P8 texture expansion", E_OUTOFMEMORY);
+        for (pixel = 0; pixel < bytes; ++pixel) {
+            uint32_t color = xbox_d3d8_palette_lookup(
+                entries, entry_count, indices[pixel]);
+            memcpy(expanded + pixel * 4u, &color, sizeof(color));
+        }
+        free(snapshot);
+        snapshot = expanded;
+        pixels = expanded;
+        bytes = expanded_bytes;
+        pitch *= 4u;
+        binding.format = D3DFMT_A8R8G8B8;
+        binding.bytes = bytes;
+        binding.pitch = pitch;
+    }
     binding.pixels = pixels;
     xgpu_plume_set_texture_ex(&binding);
-    texture->uploaded_version = texture->version;
+    texture->uploaded_version = binding.version;
     {
         uint32_t head[4] = {0};
         uint32_t head_bytes = bytes < sizeof(head) ? bytes : sizeof(head);
@@ -2734,7 +2976,7 @@ void d3d_hle_guest_switch_texture(
             texture->width, texture->height, texture->depth,
             texture->levels, texture->format, format, texture->size,
             pitch, encoded_pitch, bytes,
-            (unsigned long long)texture->version,
+            (unsigned long long)binding.version,
             resolved_surfaces, resolved_color_mips,
             resolved_nonzero_bytes,
             head[0], head[1], head[2], head[3]);
@@ -2854,6 +3096,126 @@ void d3d_hle_guest_set_texcoord_index(uint32_t stage, uint32_t value)
         d3d_hle_guest_fatal("TexCoordIndex stage", E_INVALIDARG);
     d3d_hle_guest_set_texture_stage_state(
         stage, D3DTSS_TEXCOORDINDEX, value);
+}
+
+void d3d_hle_guest_set_bump_env(
+    uint32_t stage, uint32_t type, uint32_t value)
+{
+    if (stage >= XBOX_D3D_MAX_TEXTURES ||
+        xbox_d3d8_bump_env_component(type) < 0 ||
+        !d3d8_combiners_set_bump_env(stage, type, value)) {
+        d3d_hle_guest_fatal("SetTextureState_BumpEnv", E_INVALIDARG);
+    }
+#if !defined(XRECOMP_D3D_HLE_TEST_NO_FALLBACKS)
+    if (xrecomp_d3d_hle_deferred_texture_state_va) {
+        d3d_hle_guest_write_u32(
+            xrecomp_d3d_hle_deferred_texture_state_va +
+                (stage * 32u + type) * sizeof(uint32_t),
+            value);
+    }
+#endif
+}
+
+void d3d_hle_guest_set_color_key(uint32_t stage, uint32_t value)
+{
+    if (stage >= XBOX_D3D_MAX_TEXTURES ||
+        !d3d8_combiners_set_color_key(stage, value)) {
+        d3d_hle_guest_fatal("SetTextureState_ColorKeyColor", E_INVALIDARG);
+    }
+#if !defined(XRECOMP_D3D_HLE_TEST_NO_FALLBACKS)
+    if (xrecomp_d3d_hle_deferred_texture_state_va) {
+        d3d_hle_guest_write_u32(
+            xrecomp_d3d_hle_deferred_texture_state_va +
+                (stage * 32u + XBOX_D3DTSS_COLORKEYCOLOR) * sizeof(uint32_t),
+            value);
+    }
+#endif
+}
+
+void d3d_hle_guest_set_xbox_texture_stage_state(
+    uint32_t stage, uint32_t type, uint32_t value)
+{
+    D3DTEXTURESTAGESTATETYPE host_state;
+
+    switch (type) {
+    case XBOX_D3DTSS_ADDRESSU: host_state = D3DTSS_ADDRESSU; break;
+    case XBOX_D3DTSS_ADDRESSV: host_state = D3DTSS_ADDRESSV; break;
+    case XBOX_D3DTSS_MAGFILTER: host_state = D3DTSS_MAGFILTER; break;
+    case XBOX_D3DTSS_MINFILTER: host_state = D3DTSS_MINFILTER; break;
+    case XBOX_D3DTSS_MIPFILTER: host_state = D3DTSS_MIPFILTER; break;
+    case XBOX_D3DTSS_MIPMAPLODBIAS: host_state = D3DTSS_MIPMAPLODBIAS; break;
+    case XBOX_D3DTSS_MAXMIPLEVEL: host_state = D3DTSS_MAXMIPLEVEL; break;
+    case XBOX_D3DTSS_MAXANISOTROPY: host_state = D3DTSS_MAXANISOTROPY; break;
+    case XBOX_D3DTSS_COLORKEYOP: host_state = D3DTSS_COLORKEYOP; break;
+    case XBOX_D3DTSS_COLOROP: host_state = D3DTSS_COLOROP; break;
+    case XBOX_D3DTSS_COLORARG0: host_state = D3DTSS_COLORARG0; break;
+    case XBOX_D3DTSS_COLORARG1: host_state = D3DTSS_COLORARG1; break;
+    case XBOX_D3DTSS_COLORARG2: host_state = D3DTSS_COLORARG2; break;
+    case XBOX_D3DTSS_ALPHAOP: host_state = D3DTSS_ALPHAOP; break;
+    case XBOX_D3DTSS_ALPHAARG0: host_state = D3DTSS_ALPHAARG0; break;
+    case XBOX_D3DTSS_ALPHAARG1: host_state = D3DTSS_ALPHAARG1; break;
+    case XBOX_D3DTSS_ALPHAARG2: host_state = D3DTSS_ALPHAARG2; break;
+    case XBOX_D3DTSS_RESULTARG: host_state = D3DTSS_RESULTARG; break;
+    case XBOX_D3DTSS_TEXCOORDINDEX: host_state = D3DTSS_TEXCOORDINDEX; break;
+    case XBOX_D3DTSS_BORDERCOLOR: host_state = D3DTSS_BORDERCOLOR; break;
+    case XBOX_D3DTSS_BUMPENVMAT00:
+    case XBOX_D3DTSS_BUMPENVMAT01:
+    case XBOX_D3DTSS_BUMPENVMAT11:
+    case XBOX_D3DTSS_BUMPENVMAT10:
+    case XBOX_D3DTSS_BUMPENVLSCALE:
+    case XBOX_D3DTSS_BUMPENVLOFFSET:
+        d3d_hle_guest_set_bump_env(stage, type, value);
+        return;
+    case XBOX_D3DTSS_COLORKEYCOLOR:
+        d3d_hle_guest_set_color_key(stage, value);
+        return;
+    default:
+        d3d_hle_guest_fatal(
+            "SetTextureStageState unsupported Xbox state", E_NOTIMPL);
+    }
+    d3d_hle_guest_set_texture_stage_state(stage, host_state, value);
+#if !defined(XRECOMP_D3D_HLE_TEST_NO_FALLBACKS)
+    if (xrecomp_d3d_hle_deferred_texture_state_va) {
+        d3d_hle_guest_write_u32(
+            xrecomp_d3d_hle_deferred_texture_state_va +
+                (stage * 32u + type) * sizeof(uint32_t),
+            value);
+    }
+#endif
+}
+
+static const XboxD3DTile *d3d_hle_guest_find_tile(uint32_t data_va)
+{
+    unsigned i;
+
+    for (i = 0; i < XBOX_D3D_MAX_TILES; ++i) {
+        if (xbox_d3d8_tile_contains(&g_hle_tiles[i], data_va))
+            return &g_hle_tiles[i];
+    }
+    return NULL;
+}
+
+void d3d_hle_guest_set_tile(uint32_t index, uint32_t tile_va)
+{
+    XboxD3DTile tile = { 0 };
+
+    if (index >= XBOX_D3D_MAX_TILES)
+        d3d_hle_guest_fatal("SetTile index", E_INVALIDARG);
+    if (tile_va && (!g_hle_read_range ||
+                    !g_hle_read_range(tile_va, &tile, sizeof(tile)))) {
+        d3d_hle_guest_fatal("SetTile descriptor", E_INVALIDARG);
+    }
+    if (tile.memory && (!tile.size || !tile.pitch))
+        d3d_hle_guest_fatal("SetTile extent", E_INVALIDARG);
+    g_hle_tiles[index] = tile;
+}
+
+void d3d_hle_guest_get_tile(uint32_t index, uint32_t tile_va)
+{
+    if (index >= XBOX_D3D_MAX_TILES || !tile_va)
+        d3d_hle_guest_fatal("GetTile", E_INVALIDARG);
+    memcpy(xbox_guest_ptr(tile_va), &g_hle_tiles[index],
+           sizeof(g_hle_tiles[index]));
 }
 
 void d3d_hle_guest_set_simple(uint32_t method_header, uint32_t value)
@@ -3240,7 +3602,11 @@ HRESULT d3d_hle_guest_create_pixel_shader(
 static uint32_t d3d_hle_guest_surface_pitch(
     const D3DHleGuestResource *surface)
 {
+    const XboxD3DTile *tile =
+        d3d_hle_guest_find_tile(surface->data_va);
     uint32_t pitch;
+    if (tile && tile->pitch)
+        return tile->pitch;
     if (surface->size)
         return (((surface->size >> 24) & 0xFFu) + 1u) << 6;
     (void)d3d_hle_guest_level_bytes(
@@ -3419,7 +3785,8 @@ static uint32_t d3d_hle_guest_proxy_surface(
      * after the caller releases its reference.
      */
     d3d_hle_guest_write_u32(object_va, 0x01050002u);
-    d3d_hle_guest_write_u32(object_va + 4u, data_va);
+    d3d_hle_guest_write_u32(
+        object_va + 4u, d3d_hle_guest_data_offset(data_va));
     d3d_hle_guest_write_u32(object_va + 8u, 0);
     d3d_hle_guest_write_u32(
         object_va + 12u,
@@ -3429,7 +3796,7 @@ static uint32_t d3d_hle_guest_proxy_surface(
     d3d_hle_guest_write_u32(object_va + 20u, 0);
     resource = d3d_hle_guest_register_resource(
         D3D_HLE_RESOURCE_SURFACE, object_va);
-    resource->data_va = data_va;
+    resource->data_va = d3d_hle_guest_data_offset(data_va);
     resource->data_bytes = bytes;
     resource->width = host->width;
     resource->height = host->height;
@@ -3439,7 +3806,7 @@ static uint32_t d3d_hle_guest_proxy_surface(
     resource->size = size_word;
     resource->host_handle = host->resource_id;
     resource->host_object = host_surface;
-    host->guest_address = data_va;
+    host->guest_address = resource->data_va;
     resource->owned_object = 1;
     resource->owned_data = 1;
     resource->version = ++g_hle_texture_version;
@@ -3617,6 +3984,40 @@ HRESULT d3d_hle_guest_start_host_device(
         return E_FAIL;
     result = factory->lpVtbl->CreateDevice(
         factory, 0, 1, (HWND)native_window, 0, &parameters, &device);
+    if (result == S_OK && device) {
+        d3d8_SetVblankScanoutCallback(d3d_hle_guest_vblank_scanout);
+        /* The guest's D3DPRESENT_PARAMETERS usually live on its stack and
+         * are dead after this call returns. Snapshot the decoded copy so a
+         * same-title session reset can restart the host device without
+         * rereading freed guest memory. */
+        g_hle_present_snapshot = parameters;
+        g_hle_present_snapshot_valid = 1;
+    }
+    return result == S_OK && device ? S_OK : E_FAIL;
+}
+
+HRESULT d3d_hle_guest_restart_host_device(uintptr_t native_window)
+{
+    D3DPRESENT_PARAMETERS parameters;
+    IDirect3D8 *factory;
+    IDirect3DDevice8 *device = NULL;
+    HRESULT result;
+
+    if (!native_window)
+        return E_INVALIDARG;
+    if (!g_hle_present_snapshot_valid)
+        return E_FAIL;
+    if (xbox_GetD3DDevice())
+        return S_OK;
+
+    parameters = g_hle_present_snapshot;
+    parameters.hDeviceWindow = (HWND)native_window;
+    parameters.Windowed = TRUE;
+    factory = xbox_Direct3DCreate8(0);
+    if (!factory)
+        return E_FAIL;
+    result = factory->lpVtbl->CreateDevice(
+        factory, 0, 1, (HWND)native_window, 0, &parameters, &device);
     if (result == S_OK && device)
         d3d8_SetVblankScanoutCallback(d3d_hle_guest_vblank_scanout);
     return result == S_OK && device ? S_OK : E_FAIL;
@@ -3646,7 +4047,8 @@ static HRESULT d3d_hle_guest_bind_memory_render_target(
     binding.image_height = color->height;
     binding.color_pitch = d3d_hle_guest_surface_pitch(color);
     binding.color_format = color->format;
-    binding.layout = color->size ?
+    binding.layout = (color->size ||
+                      d3d_hle_guest_find_tile(color->data_va)) ?
         XGPU_SURFACE_PITCH : XGPU_SURFACE_SWIZZLE;
     binding.sample_count = 1;
     if (depth) {
@@ -3976,7 +4378,7 @@ HRESULT d3d_hle_guest_set_texture(uint32_t stage, uint32_t texture_va)
         previous = g_hle_bindings.texture_resource[stage];
         g_hle_bindings.texture_resource[stage] = 0;
         d3d8_combiners_set_texture_binding(
-            stage, 2, FALSE, FALSE);
+            stage, 2, FALSE, FALSE, 0);
         xgpu_plume_set_texture(
             stage, 0, NULL, 0, 0, 0, 0, 0, ++g_hle_texture_version);
         d3d_hle_guest_resource_release_bind_ref(previous);
@@ -3993,6 +4395,34 @@ HRESULT d3d_hle_guest_set_texture(uint32_t stage, uint32_t texture_va)
         d3d_hle_guest_read_u32(texture_va + 4u),
         d3d_hle_guest_read_u32(texture_va + 12u));
     d3d_hle_guest_resource_release_bind_ref(previous);
+    return S_OK;
+}
+
+HRESULT d3d_hle_guest_set_palette(uint32_t stage, uint32_t palette_va)
+{
+    D3DHleGuestResource *palette = NULL;
+    uint32_t previous;
+
+    if (stage >= XBOX_D3D_MAX_TEXTURES)
+        return E_INVALIDARG;
+    if (palette_va) {
+        palette = d3d_hle_guest_adopt_resource(palette_va);
+        if (!palette || palette->kind != D3D_HLE_RESOURCE_PALETTE)
+            return E_INVALIDARG;
+        d3d_hle_guest_resource_add_bind_ref(palette_va);
+    }
+    previous = g_hle_bindings.palette_resource[stage];
+    g_hle_bindings.palette_resource[stage] = palette_va;
+    g_hle_palette_version[stage] = ++g_hle_texture_version;
+    d3d_hle_guest_resource_release_bind_ref(previous);
+
+    if (g_hle_bindings.texture_resource[stage]) {
+        uint32_t texture_va = g_hle_bindings.texture_resource[stage];
+        d3d_hle_guest_switch_texture(
+            NV097_SET_TEXTURE_OFFSET + stage * 0x40u,
+            d3d_hle_guest_read_u32(texture_va + 4u),
+            d3d_hle_guest_read_u32(texture_va + 12u));
+    }
     return S_OK;
 }
 
@@ -4043,8 +4473,11 @@ uint32_t d3d_hle_guest_device_release(void)
     }
     for (stage = 0; stage < XBOX_D3D_MAX_TEXTURES; ++stage) {
         uint32_t resource = g_hle_bindings.texture_resource[stage];
+        uint32_t palette = g_hle_bindings.palette_resource[stage];
         g_hle_bindings.texture_resource[stage] = 0;
+        g_hle_bindings.palette_resource[stage] = 0;
         d3d_hle_guest_resource_release_bind_ref(resource);
+        d3d_hle_guest_resource_release_bind_ref(palette);
     }
     {
         uint32_t resource = g_hle_bindings.index_resource;
@@ -4112,6 +4545,10 @@ void d3d_hle_guest_reset_registry(void)
         g_hle_up_scratch[i] = NULL;
         g_hle_up_scratch_capacity[i] = 0;
     }
+    if (g_hle_push_scratch_va)
+        xbox_HeapFree(g_hle_push_scratch_va);
+    g_hle_push_scratch_va = 0;
+    g_hle_push_constant_load = 0;
     if (g_hle_device_token)
         xbox_HeapFree(g_hle_device_token);
     g_hle_device_token = 0;
@@ -4132,6 +4569,9 @@ void d3d_hle_guest_reset_registry(void)
            sizeof(g_hle_pixel_shader_effective));
     g_hle_pixel_shader_effective_valid = 0;
     g_hle_fence = 0;
+    g_hle_shader_constant_mode = XBOX_D3DSCM_96CONSTANTS;
+    memset(g_hle_tiles, 0, sizeof(g_hle_tiles));
+    memset(g_hle_palette_version, 0, sizeof(g_hle_palette_version));
     memset(g_hle_state_cache, 0, sizeof(g_hle_state_cache));
     memset(g_hle_immediate_vertex, 0, sizeof(g_hle_immediate_vertex));
     g_hle_overlay_enabled = 0;
@@ -4297,7 +4737,8 @@ uint32_t d3d_hle_guest_create_surface(
                 (((height - 1u) & 0xFFFu) << 12) |
                 (((pitch >> 6) - 1u) << 24);
     d3d_hle_guest_write_u32(object_va, 0x81050001u);
-    d3d_hle_guest_write_u32(object_va + 4u, data_va);
+    d3d_hle_guest_write_u32(
+        object_va + 4u, d3d_hle_guest_data_offset(data_va));
     d3d_hle_guest_write_u32(object_va + 8u, 0);
     d3d_hle_guest_write_u32(
         object_va + 12u,
@@ -4306,7 +4747,7 @@ uint32_t d3d_hle_guest_create_surface(
     d3d_hle_guest_write_u32(object_va + 20u, 0);
     resource = d3d_hle_guest_register_resource(
         D3D_HLE_RESOURCE_SURFACE, object_va);
-    resource->data_va = data_va;
+    resource->data_va = d3d_hle_guest_data_offset(data_va);
     resource->data_bytes = bytes;
     resource->width = width;
     resource->height = height;
@@ -4562,10 +5003,11 @@ static uint32_t d3d_hle_guest_create_buffer(
     d3d_hle_guest_write_u32(
         object_va, kind == D3D_HLE_RESOURCE_INDEX_BUFFER ?
         0x01010001u : 0x01000001u);
-    d3d_hle_guest_write_u32(object_va + 4u, data_va);
+    d3d_hle_guest_write_u32(
+        object_va + 4u, d3d_hle_guest_data_offset(data_va));
     d3d_hle_guest_write_u32(object_va + 8u, 0);
     resource = d3d_hle_guest_register_resource(kind, object_va);
-    resource->data_va = data_va;
+    resource->data_va = d3d_hle_guest_data_offset(data_va);
     resource->data_bytes = length;
     resource->owned_object = 1;
     resource->owned_data = 1;
@@ -4896,6 +5338,14 @@ void d3d_hle_guest_set_vertex_data_color(uint32_t reg, uint32_t color)
         reg, bits[0], bits[1], bits[2], bits[3]);
 }
 
+void d3d_hle_guest_set_vertex_data4ub(
+    uint32_t reg, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
+{
+    uint32_t packed = (a & 0xFFu) | ((b & 0xFFu) << 8) |
+                      ((c & 0xFFu) << 16) | ((d & 0xFFu) << 24);
+    d3d_hle_guest_set_vertex_data_color(reg, packed);
+}
+
 void d3d_hle_guest_begin(uint32_t primitive_type)
 {
     if (g_hle_imm_active)
@@ -5150,10 +5600,6 @@ void d3d_hle_guest_set_vertex_blend(uint32_t value)
     d3d_hle_guest_set_render_state(D3DRS_VERTEXBLEND, value);
 }
 
-enum { D3D_HLE_PUSH_SCRATCH_BYTES = 16384 };
-static uint32_t g_hle_push_scratch_va;
-static uint32_t g_hle_push_constant_load;
-
 void d3d_hle_guest_drain_inline_push(void)
 {
     uint32_t at = g_hle_push_scratch_va;
@@ -5172,8 +5618,10 @@ void d3d_hle_guest_drain_inline_push(void)
         if (method == 0x1EA4u && count == 1u) {
             g_hle_push_constant_load = d3d_hle_guest_read_u32(at + 4u);
         } else if (method == 0x0B80u && count && (count & 3u) == 0u) {
-            d3d_hle_guest_set_vertex_shader_constant(
-                (int32_t)g_hle_push_constant_load, at + 4u, count / 4u);
+            /* NV097_SET_TRANSFORM_CONSTANT_LOAD carries the hardware slot
+             * (0..191) directly; the public-mode bias must not reapply. */
+            d3d_hle_guest_set_vertex_shader_constant_hardware(
+                g_hle_push_constant_load, at + 4u, count / 4u);
             g_hle_push_constant_load += count / 4u;
         } else {
             static int logged;

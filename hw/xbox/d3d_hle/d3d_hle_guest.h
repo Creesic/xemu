@@ -29,6 +29,7 @@ void d3d_hle_guest_set_read_range(D3DHleGuestReadRange reader);
 int d3d_hle_guest_native_active(void);
 HRESULT d3d_hle_guest_start_host_device(
     uint32_t parameters_va, uintptr_t native_window);
+HRESULT d3d_hle_guest_restart_host_device(uintptr_t native_window);
 HRESULT d3d_hle_guest_register_vertex_buffer(
     uint32_t object_va, uint32_t length);
 HRESULT d3d_hle_guest_register_index_buffer(
@@ -93,6 +94,9 @@ void d3d_hle_guest_set_texture_stage_state(
     uint32_t stage, D3DTEXTURESTAGESTATETYPE state, uint32_t value);
 void d3d_hle_guest_set_vertex_shader_constant(
     int32_t start_register, uint32_t constant_data_va, uint32_t count);
+void d3d_hle_guest_set_vertex_shader_constant_hardware(
+    uint32_t start_register, uint32_t constant_data_va, uint32_t count);
+void d3d_hle_guest_set_shader_constant_mode(uint32_t mode);
 void d3d_hle_guest_set_stream_source(
     uint32_t stream, uint32_t resource_va, uint32_t stride);
 void d3d_hle_guest_set_indices(
@@ -157,6 +161,7 @@ HRESULT d3d_hle_guest_set_viewport(uint32_t viewport_va);
 HRESULT d3d_hle_guest_get_viewport(uint32_t viewport_va);
 uint32_t d3d_hle_guest_get_texture(uint32_t stage);
 HRESULT d3d_hle_guest_set_texture(uint32_t stage, uint32_t texture_va);
+HRESULT d3d_hle_guest_set_palette(uint32_t stage, uint32_t palette_va);
 uint32_t d3d_hle_guest_get_indices(uint32_t base_vertex_va);
 uint32_t d3d_hle_guest_get_stream_source(
     uint32_t stream, uint32_t stride_va);
@@ -198,6 +203,14 @@ uint32_t d3d_hle_guest_create_vertex_buffer(uint32_t length);
 uint32_t d3d_hle_guest_create_index_buffer(uint32_t length);
 uint32_t d3d_hle_guest_set_fence(uint32_t flags);
 void d3d_hle_guest_block_on_time(uint32_t fence, uint32_t flags);
+void d3d_hle_guest_block_on_resource(uint32_t resource_va);
+void d3d_hle_guest_set_bump_env(
+    uint32_t stage, uint32_t type, uint32_t value);
+void d3d_hle_guest_set_color_key(uint32_t stage, uint32_t value);
+void d3d_hle_guest_set_xbox_texture_stage_state(
+    uint32_t stage, uint32_t type, uint32_t value);
+void d3d_hle_guest_set_tile(uint32_t index, uint32_t tile_va);
+void d3d_hle_guest_get_tile(uint32_t index, uint32_t tile_va);
 void d3d_hle_guest_lock_2d_surface(
     uint32_t texture_va, uint32_t face, uint32_t level,
     uint32_t locked_rect_va, uint32_t rect_va, uint32_t flags);
@@ -220,6 +233,8 @@ void d3d_hle_guest_set_vertex_data4f(
 void d3d_hle_guest_set_vertex_data2f(uint32_t reg, uint32_t x, uint32_t y);
 void d3d_hle_guest_set_vertex_data2s(uint32_t reg, uint32_t a, uint32_t b);
 void d3d_hle_guest_set_vertex_data_color(uint32_t reg, uint32_t color);
+void d3d_hle_guest_set_vertex_data4ub(
+    uint32_t reg, uint32_t a, uint32_t b, uint32_t c, uint32_t d);
 void d3d_hle_guest_begin(uint32_t primitive_type);
 void d3d_hle_guest_end(void);
 void d3d_hle_guest_begin_visibility_test(void);
@@ -318,6 +333,7 @@ void d3d_hle_device_set_render_state_multisample_render_target_mode(void);
 void d3d_hle_device_set_render_state_two_sided_lighting(void);
 void d3d_hle_common_set_render_target(void);
 void d3d_hle_base_texture_get_level_count(void);
+void d3d_hle_get_2d_surface_desc(void);
 void d3d_hle_cube_texture_get_cube_map_surface2(void);
 void d3d_hle_volume_texture_get_level_desc(void);
 void d3d_hle_resource_register(void);
@@ -389,6 +405,15 @@ void d3d_hle_device_make_space(void);
 void d3d_hle_cube_texture_lock_rect(void);
 void d3d_hle_volume_texture_lock_box(void);
 void d3d_hle_device_set_texture_state_border_color_std(void);
+void d3d_hle_device_set_texture_state_bump_env_std(void);
+void d3d_hle_device_set_texture_state_color_key_std(void);
+void d3d_hle_block_on_resource_std(void);
+void d3d_hle_device_set_shader_constant_mode_std(void);
+void d3d_hle_lock_2d_surface_std(void);
+void d3d_hle_device_set_tile_std(void);
+void d3d_hle_device_get_tile_std(void);
+void d3d_hle_device_set_vertex_data4ub_std(void);
+void d3d_hle_device_set_palette_std(void);
 void d3d_hle_resource_get_type_std(void);
 void d3d_hle_device_set_stream_source_std(void);
 void d3d_hle_device_set_indices_std(void);

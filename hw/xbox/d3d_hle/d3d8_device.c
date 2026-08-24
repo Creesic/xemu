@@ -10,6 +10,7 @@
 #include "d3d8_cpu_surface_sync.h"
 #include "d3d8_index_range.h"
 #include "d3d_hle_guest.h"
+#include "kernel/xbox_memory_layout.h"
 #include "plume/plume_f2_capture.h"
 #include "plume/plume_host.h"
 #include "platform/host_events.h"
@@ -41,7 +42,6 @@ enum {
 };
 
 extern void xgpu_plume_set_present_reason(uint32_t reason);
-extern ptrdiff_t g_xbox_mem_offset;
 
 typedef struct D3D8DeviceState {
     void *native_window;
@@ -243,7 +243,7 @@ static void mirror_texture(uint32_t stage, IDirect3DBaseTexture8 *base)
     BYTE *snapshot;
 
     if (!base) {
-        d3d8_combiners_set_texture_binding(stage, 2, FALSE, FALSE);
+        d3d8_combiners_set_texture_binding(stage, 2, FALSE, FALSE, 0);
         xgpu_plume_set_texture(stage, 0, NULL, 0, 0, 0, 0, 0, 0);
         return;
     }
@@ -268,7 +268,8 @@ static void mirror_texture(uint32_t stage, IDirect3DBaseTexture8 *base)
     binding.format = (uint32_t)texture->d3d8_format;
     binding.version = texture->plume_version;
     d3d8_combiners_set_texture_binding(
-        stage, 2, FALSE, texture->d3d8_format == (D3DFORMAT)0x35u);
+        stage, 2, FALSE, texture->d3d8_format == (D3DFORMAT)0x35u,
+        (UINT)texture->d3d8_format);
     switch (texture->d3d8_format) {
     case D3DFMT_LIN_A8R8G8B8:
     case D3DFMT_LIN_X8R8G8B8:
@@ -341,7 +342,6 @@ void d3d8_PgraphMarkCpuSurfaceLock(uint32_t guest_address,
 
         if (d3d8_cpu_surface_lock_needs_readback(
                 lock_flags, xgpu_plume_surface_known(surface->offset)) &&
-            g_xbox_mem_offset &&
             surface->layout == XGPU_SURFACE_PITCH &&
             d3d8_cpu_surface_format_is_32bpp(surface->format) &&
             surface->width && surface->height &&
@@ -352,12 +352,10 @@ void d3d8_PgraphMarkCpuSurfaceLock(uint32_t guest_address,
 
             span = (size_t)(surface->height - 1u) * surface->pitch +
                    active_row_bytes;
-            if (surface->offset < 0x04000000u &&
-                span <= 0x04000000u - surface->offset) {
+            pixels = xbox_guest_phys_ptr(surface->offset, span);
+            if (pixels) {
                 D3D8CpuSurfaceFingerprint current;
 
-                pixels = (BYTE *)((uintptr_t)surface->offset +
-                                  g_xbox_mem_offset);
                 if (xgpu_plume_download_color_surface(
                         surface->offset, pixels, surface->width,
                         surface->height, surface->pitch)) {
@@ -382,7 +380,7 @@ static int sync_cpu_surface(PgraphHostSurface *surface)
     size_t span;
     int needs_upload;
 
-    if (!surface || !g_xbox_mem_offset ||
+    if (!surface ||
         surface->layout != XGPU_SURFACE_PITCH ||
         !d3d8_cpu_surface_format_is_32bpp(surface->format) ||
         !surface->width || !surface->height)
@@ -396,8 +394,8 @@ static int sync_cpu_surface(PgraphHostSurface *surface)
         return 0;
     span = (size_t)(surface->height - 1u) * surface->pitch +
            active_row_bytes;
-    if (surface->offset >= 0x04000000u ||
-        span > 0x04000000u - surface->offset)
+    pixels = xbox_guest_phys_ptr(surface->offset, span);
+    if (!pixels)
         return 0;
 
     /* The fingerprint below hashes the whole surface a byte at a time — 1.2 MB
@@ -420,8 +418,6 @@ static int sync_cpu_surface(PgraphHostSurface *surface)
         return 0;
     surface->cpu_hash_epoch = g_cpu_surface_epoch;
 
-    pixels = (const BYTE *)((uintptr_t)surface->offset +
-                            g_xbox_mem_offset);
     current = d3d8_cpu_surface_fingerprint(
         pixels, surface->width, surface->height, surface->pitch);
     needs_upload = d3d8_cpu_surface_needs_upload(
@@ -591,8 +587,6 @@ int d3d8_PgraphDownloadSurfaceRange(uint32_t start, uint32_t bytes)
     int refreshed = 0;
     UINT i;
 
-    if (!g_xbox_mem_offset)
-        return 0;
     for (i = 0; i < g_pgraph_surface_count; ++i) {
         PgraphHostSurface *surface = &g_pgraph_surfaces[i];
         size_t active_row_bytes;
@@ -624,10 +618,9 @@ int d3d8_PgraphDownloadSurfaceRange(uint32_t start, uint32_t bytes)
         /* Overlap test against the requested range. */
         if (end <= (uint64_t)start || (uint64_t)surface->offset >= want_end)
             continue;
-        if (surface->offset >= 0x04000000u ||
-            span > 0x04000000u - surface->offset)
+        pixels = xbox_guest_phys_ptr(surface->offset, (size_t)span);
+        if (!pixels)
             continue;
-        pixels = (BYTE *)((uintptr_t)surface->offset + g_xbox_mem_offset);
         if (xgpu_plume_download_color_surface(surface->offset, pixels,
                                               image_width, image_height,
                                               surface->pitch))
@@ -652,10 +645,9 @@ int d3d8_PgraphDownloadSurfaceRange(uint32_t start, uint32_t bytes)
         end = (uint64_t)zeta->offset + span;
         if (end <= (uint64_t)start || (uint64_t)zeta->offset >= want_end)
             continue;
-        if (zeta->offset >= 0x04000000u ||
-            span > 0x04000000u - zeta->offset)
+        pixels = xbox_guest_phys_ptr(zeta->offset, (size_t)span);
+        if (!pixels)
             continue;
-        pixels = (BYTE *)((uintptr_t)zeta->offset + g_xbox_mem_offset);
         if (xgpu_plume_download_zeta_surface(zeta->offset, pixels, zeta->width,
                                              zeta->height, zeta->pitch))
             refreshed++;
@@ -1625,11 +1617,13 @@ static HRESULT submit_persistent_indexed_draw(
     cached.vb_data_va = vb_data_va;
     cached.ib_data_va = ib_data_va;
     cached.index_byte_offset = 0;
-    if (g_xbox_mem_offset) {
-        uintptr_t guest = (uintptr_t)indices16
-            - (uintptr_t)g_xbox_mem_offset;
-        if (guest >= ib_data_va && guest - ib_data_va <= UINT32_MAX)
-            cached.index_byte_offset = (uint32_t)(guest - ib_data_va);
+    {
+        uint32_t guest;
+
+        if (xbox_guest_host_to_phys(indices16, &guest) &&
+            guest >= ib_data_va) {
+            cached.index_byte_offset = guest - ib_data_va;
+        }
     }
     cached.index_count = index_count;
     cached.stride = draw_stride;
@@ -2101,6 +2095,9 @@ static HRESULT __stdcall dev_SetTextureStageState(
 {
     (void)self;
     if (stage >= MAX_TEXTURE_STAGES || (DWORD)type >= MAX_TSS_STATES)
+        return E_INVALIDARG;
+    if (type == D3DTSS_COLORKEYOP &&
+        !d3d8_combiners_set_color_key_mode(stage, value))
         return E_INVALIDARG;
     g_device_state.tss[stage][(DWORD)type] = value;
     if (type == D3DTSS_COLOROP || type == D3DTSS_COLORARG0 ||

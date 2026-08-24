@@ -3,10 +3,12 @@
 #include "system/memory.h"
 #include "xemu_d3d_hle.h"
 
-void xemu_d3d_hle_install(CPUState *cpu, MemoryRegion *ram)
+void xemu_d3d_hle_install(CPUState *cpu, MemoryRegion *ram,
+                          MemoryRegion *system_memory)
 {
     (void)cpu;
     (void)ram;
+    (void)system_memory;
 }
 
 bool xemu_d3d_hle_owns_window(void)

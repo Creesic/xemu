@@ -61,6 +61,7 @@ if host_os == 'windows'
   )
   specific_ss.add(files(
     'd3d_hle/xemu_d3d_hle.c',
+    'd3d_hle/xemu_d3d_hle_guest_heap.c',
     'd3d_hle/xemu_d3d_hle_discovery.c',
     'd3d_hle/xemu_d3d_hle_spy.c',
     'd3d_hle/xemu_xbsdb_d3d_only.c',

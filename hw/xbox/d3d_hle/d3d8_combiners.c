@@ -34,6 +34,7 @@
 
 #include "d3d8_internal.h"
 #include "d3d8_combiners.h"
+#include "d3d8_texture_state.h"
 #include "plume/plume_host.h"
 #include <string.h>
 #include <stdio.h>
@@ -54,6 +55,11 @@ static uint8_t g_texture_dimensions[NV2A_MAX_TEXTURES];
 static uint8_t g_texture_cube[NV2A_MAX_TEXTURES];
 static uint8_t g_texture_luminance[NV2A_MAX_TEXTURES];
 static uint8_t g_z_perspective;
+/* Authored Xbox D3D stage order: m00, m01, m10, m11, scale, offset. */
+static float g_bump_env[NV2A_MAX_TEXTURES][6];
+static uint8_t g_color_key_mode[NV2A_MAX_TEXTURES];
+static uint32_t g_color_key[NV2A_MAX_TEXTURES];
+static uint32_t g_color_key_mask[NV2A_MAX_TEXTURES];
 
 /** Dirty flags for generated-shader state and draw-time constants. */
 static BOOL g_dirty = TRUE;
@@ -1068,6 +1074,27 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
          */
         if (sampled && state->texture_luminance[i])
             EMIT("    r_t%d = float4(r_t%d.rrr, 1.0);\n", i, i);
+        if (sampled && state->color_key_mode[i] !=
+                           XBOX_D3DTCOLORKEYOP_DISABLE) {
+            EMIT("    uint4 color_key_bytes%d = "
+                 "(uint4)round(saturate(r_t%d) * 255.0);\n", i, i);
+            EMIT("    uint color_key_sample%d = "
+                 "(color_key_bytes%d.a << 24) | "
+                 "(color_key_bytes%d.r << 16) | "
+                 "(color_key_bytes%d.g << 8) | color_key_bytes%d.b;\n",
+                 i, i, i, i, i);
+            EMIT("    if ((color_key_sample%d & 0x%08Xu) == "
+                 "(0x%08Xu & 0x%08Xu)) {\n",
+                 i, state->color_key_mask[i], state->color_key[i],
+                 state->color_key_mask[i]);
+            if (state->color_key_mode[i] == XBOX_D3DTCOLORKEYOP_ALPHA)
+                EMIT("        r_t%d.a = 0.0;\n", i);
+            else if (state->color_key_mode[i] == XBOX_D3DTCOLORKEYOP_RGBA)
+                EMIT("        r_t%d = float4(0, 0, 0, 0);\n", i);
+            else
+                EMIT("        discard;\n");
+            EMIT("    }\n");
+        }
     }
 
     /* NV2A clears temporary-register RGB before the first general combiner.
@@ -1417,10 +1444,15 @@ HRESULT d3d8_combiners_init(void)
     memset(g_cache, 0, sizeof(g_cache));
     memset(&g_combiner_state, 0, sizeof(g_combiner_state));
     memset(&g_constants, 0, sizeof(g_constants));
-    for (i = 0; i < NV2A_MAX_TEXTURES; ++i)
+    for (i = 0; i < NV2A_MAX_TEXTURES; ++i) {
         g_texture_dimensions[i] = 2;
+        g_color_key_mask[i] = UINT32_MAX;
+    }
     memset(g_texture_cube, 0, sizeof(g_texture_cube));
     memset(g_texture_luminance, 0, sizeof(g_texture_luminance));
+    memset(g_bump_env, 0, sizeof(g_bump_env));
+    memset(g_color_key_mode, 0, sizeof(g_color_key_mode));
+    memset(g_color_key, 0, sizeof(g_color_key));
     g_z_perspective = 0;
     g_ps_token = 0;
     g_definition_active = FALSE;
@@ -1440,6 +1472,10 @@ void d3d8_combiners_shutdown(void)
     memset(g_texture_dimensions, 0, sizeof(g_texture_dimensions));
     memset(g_texture_cube, 0, sizeof(g_texture_cube));
     memset(g_texture_luminance, 0, sizeof(g_texture_luminance));
+    memset(g_bump_env, 0, sizeof(g_bump_env));
+    memset(g_color_key_mode, 0, sizeof(g_color_key_mode));
+    memset(g_color_key, 0, sizeof(g_color_key));
+    memset(g_color_key_mask, 0, sizeof(g_color_key_mask));
     g_z_perspective = 0;
     g_definition_active = FALSE;
     memset(g_definition, 0, sizeof(g_definition));
@@ -1491,24 +1527,65 @@ void d3d8_combiners_mark_constants_dirty(void)
 }
 
 void d3d8_combiners_set_texture_binding(
-    UINT stage, UINT dimensionality, BOOL cube, BOOL luminance)
+    UINT stage, UINT dimensionality, BOOL cube, BOOL luminance, UINT format)
 {
     uint8_t normalized_dimension;
     uint8_t normalized_cube;
     uint8_t normalized_luminance;
+    uint32_t color_key_mask;
     if (stage >= NV2A_MAX_TEXTURES)
         return;
     normalized_dimension = dimensionality == 3u ? 3u : 2u;
     normalized_cube = cube ? 1u : 0u;
     normalized_luminance = luminance ? 1u : 0u;
+    color_key_mask = xbox_d3d8_color_key_mask(format);
     if (g_texture_dimensions[stage] != normalized_dimension ||
         g_texture_cube[stage] != normalized_cube ||
-        g_texture_luminance[stage] != normalized_luminance) {
+        g_texture_luminance[stage] != normalized_luminance ||
+        g_color_key_mask[stage] != color_key_mask) {
         g_texture_dimensions[stage] = normalized_dimension;
         g_texture_cube[stage] = normalized_cube;
         g_texture_luminance[stage] = normalized_luminance;
+        g_color_key_mask[stage] = color_key_mask;
         g_dirty = TRUE;
     }
+}
+
+BOOL d3d8_combiners_set_bump_env(UINT stage, UINT type, DWORD value)
+{
+    int component = xbox_d3d8_bump_env_component(type);
+    float converted;
+
+    if (stage >= NV2A_MAX_TEXTURES || component < 0)
+        return FALSE;
+    memcpy(&converted, &value, sizeof(converted));
+    if (g_bump_env[stage][component] != converted) {
+        g_bump_env[stage][component] = converted;
+        g_dirty = TRUE;
+    }
+    return TRUE;
+}
+
+BOOL d3d8_combiners_set_color_key(UINT stage, DWORD value)
+{
+    if (stage >= NV2A_MAX_TEXTURES)
+        return FALSE;
+    if (g_color_key[stage] != value) {
+        g_color_key[stage] = value;
+        g_dirty = TRUE;
+    }
+    return TRUE;
+}
+
+BOOL d3d8_combiners_set_color_key_mode(UINT stage, UINT mode)
+{
+    if (stage >= NV2A_MAX_TEXTURES || mode > XBOX_D3DTCOLORKEYOP_KILL)
+        return FALSE;
+    if (g_color_key_mode[stage] != mode) {
+        g_color_key_mode[stage] = (uint8_t)mode;
+        g_dirty = TRUE;
+    }
+    return TRUE;
 }
 
 void d3d8_combiners_set_z_perspective(BOOL enabled)
@@ -1541,11 +1618,25 @@ BOOL d3d8_combiners_prepare_draw(void)
             d3d8_combiners_parse_token(
                 g_ps_token, rs, &g_combiner_state);
         for (i = 0; i < NV2A_MAX_TEXTURES; ++i) {
+            int bump_stage = g_definition_active ? i : i + 1;
+
             g_combiner_state.texture_dimensions[i] =
                 g_texture_dimensions[i];
             g_combiner_state.texture_cube[i] = g_texture_cube[i];
             g_combiner_state.texture_luminance[i] =
                 g_texture_luminance[i];
+            g_combiner_state.color_key_mode[i] = g_color_key_mode[i];
+            g_combiner_state.color_key[i] = g_color_key[i];
+            g_combiner_state.color_key_mask[i] = g_color_key_mask[i];
+            if (bump_stage < NV2A_MAX_TEXTURES) {
+                memcpy(g_combiner_state.bump_env_mat[bump_stage],
+                       g_bump_env[i],
+                       sizeof(g_combiner_state.bump_env_mat[bump_stage]));
+                g_combiner_state.bump_env_scale[bump_stage] =
+                    g_bump_env[i][4];
+                g_combiner_state.bump_env_offset[bump_stage] =
+                    g_bump_env[i][5];
+            }
         }
         g_combiner_state.z_perspective = g_z_perspective;
         g_current_shader_handle =

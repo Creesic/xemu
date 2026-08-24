@@ -18,6 +18,7 @@
 
 #include "d3d_hle_guest.h"
 #include "xemu_d3d_hle_discovery.h"
+#include "xemu_d3d_hle_name.h"
 #include "xemu_d3d_hle_spy.h"
 
 extern uint32_t g_eax, g_ebx, g_ecx, g_edx, g_ebp, g_esi, g_edi, g_esp;
@@ -51,22 +52,40 @@ static void automatic_create_device_compact(void)
 #define BP XEMU_D3D_ABI_EBP
 #define SI XEMU_D3D_ABI_ESI
 #define DI XEMU_D3D_ABI_EDI
-#define B0(api, entry_) { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 0, { 0 } }
-#define B1(api, entry_) { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 1, { ST } }
-#define B2(api, entry_) { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 2, { ST, ST } }
-#define B3(api, entry_) { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 3, { ST, ST, ST } }
-#define B4(api, entry_) { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 4, { ST, ST, ST, ST } }
-#define B5(api, entry_) { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 5, { ST, ST, ST, ST, ST } }
-#define B6(api, entry_) { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 6, { ST, ST, ST, ST, ST, ST } }
-#define B7(api, entry_) { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 7, { ST, ST, ST, ST, ST, ST, ST } }
-#define A1(api, entry_, a_) { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 1, { (a_) } }
-#define A2(api, entry_, a_, b_) { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 2, { (a_), (b_) } }
+#define ROW(policy_, api, entry_, count_, ...) \
+    { #api, (entry_), (policy_), (count_), { __VA_ARGS__ } }
+#define B0(api, entry_) ROW(XEMU_D3D_HLE_HOOK_REPLACE, api, entry_, 0, 0)
+#define B1(api, entry_) ROW(XEMU_D3D_HLE_HOOK_REPLACE, api, entry_, 1, ST)
+#define B2(api, entry_) ROW(XEMU_D3D_HLE_HOOK_REPLACE, api, entry_, 2, ST, ST)
+#define B3(api, entry_) ROW(XEMU_D3D_HLE_HOOK_REPLACE, api, entry_, 3, ST, ST, ST)
+#define B4(api, entry_) ROW(XEMU_D3D_HLE_HOOK_REPLACE, api, entry_, 4, ST, ST, ST, ST)
+#define B5(api, entry_) ROW(XEMU_D3D_HLE_HOOK_REPLACE, api, entry_, 5, ST, ST, ST, ST, ST)
+#define B6(api, entry_) ROW(XEMU_D3D_HLE_HOOK_REPLACE, api, entry_, 6, ST, ST, ST, ST, ST, ST)
+#define B7(api, entry_) ROW(XEMU_D3D_HLE_HOOK_REPLACE, api, entry_, 7, ST, ST, ST, ST, ST, ST, ST)
+#define A1(api, entry_, a_) ROW(XEMU_D3D_HLE_HOOK_REPLACE, api, entry_, 1, a_)
+#define A2(api, entry_, a_, b_) ROW(XEMU_D3D_HLE_HOOK_REPLACE, api, entry_, 2, a_, b_)
 #define A3(api, entry_, a_, b_, c_) \
-    { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 3, { (a_), (b_), (c_) } }
+    ROW(XEMU_D3D_HLE_HOOK_REPLACE, api, entry_, 3, a_, b_, c_)
 #define A5(api, entry_, a_, b_, c_, d_, e_) \
-    { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 5, { (a_), (b_), (c_), (d_), (e_) } }
+    ROW(XEMU_D3D_HLE_HOOK_REPLACE, api, entry_, 5, a_, b_, c_, d_, e_)
 #define A6(api, entry_, a_, b_, c_, d_, e_, f_) \
-    { #api, (entry_), XEMU_D3D_HLE_HOOK_REPLACE, 6, { (a_), (b_), (c_), (d_), (e_), (f_) } }
+    ROW(XEMU_D3D_HLE_HOOK_REPLACE, api, entry_, 6, a_, b_, c_, d_, e_, f_)
+#define M0(api, entry_) ROW(XEMU_D3D_HLE_HOOK_NATIVE_THEN_MIRROR, api, entry_, 0, 0)
+#define M1(api, entry_) ROW(XEMU_D3D_HLE_HOOK_NATIVE_THEN_MIRROR, api, entry_, 1, ST)
+#define M2(api, entry_) ROW(XEMU_D3D_HLE_HOOK_NATIVE_THEN_MIRROR, api, entry_, 2, ST, ST)
+#define M3(api, entry_) ROW(XEMU_D3D_HLE_HOOK_NATIVE_THEN_MIRROR, api, entry_, 3, ST, ST, ST)
+#define M4(api, entry_) ROW(XEMU_D3D_HLE_HOOK_NATIVE_THEN_MIRROR, api, entry_, 4, ST, ST, ST, ST)
+#define M5(api, entry_) ROW(XEMU_D3D_HLE_HOOK_NATIVE_THEN_MIRROR, api, entry_, 5, ST, ST, ST, ST, ST)
+#define M6(api, entry_) ROW(XEMU_D3D_HLE_HOOK_NATIVE_THEN_MIRROR, api, entry_, 6, ST, ST, ST, ST, ST, ST)
+#define M7(api, entry_) ROW(XEMU_D3D_HLE_HOOK_NATIVE_THEN_MIRROR, api, entry_, 7, ST, ST, ST, ST, ST, ST, ST)
+#define MA1(api, entry_, a_) ROW(XEMU_D3D_HLE_HOOK_NATIVE_THEN_MIRROR, api, entry_, 1, a_)
+#define MA5(api, entry_, a_, b_, c_, d_, e_) \
+    ROW(XEMU_D3D_HLE_HOOK_NATIVE_THEN_MIRROR, api, entry_, 5, a_, b_, c_, d_, e_)
+#define N0(api) ROW(XEMU_D3D_HLE_HOOK_NATIVE_SAFE, api, NULL, 0, 0)
+#define O0(api) ROW(XEMU_D3D_HLE_HOOK_BOOTSTRAP_ONLY, api, NULL, 0, 0)
+#define O1(api) ROW(XEMU_D3D_HLE_HOOK_BOOTSTRAP_ONLY, api, NULL, 1, ST)
+#define O2(api) ROW(XEMU_D3D_HLE_HOOK_BOOTSTRAP_ONLY, api, NULL, 2, ST, ST)
+#define O6(api) ROW(XEMU_D3D_HLE_HOOK_BOOTSTRAP_ONLY, api, NULL, 6, ST, ST, ST, ST, ST, ST)
 
 /*
  * Canonical API -> reviewed wrapper ABI.  Most targets are ordinary stack
@@ -74,16 +93,30 @@ static void automatic_create_device_compact(void)
  * a wrapper imported before universal runtime discovery existed.
  */
 static const XemuD3DHleBinding bindings[] = {
+    O0(D3D_CommonSetDebugRegisters),
+    O0(D3D_UpdateProjectionViewportTransform),
+    O2(CDevice_InitializeFrameBuffers),
+    O1(CDevice_FreeFrameBuffers),
+    O1(CDevice_SetStateUP),
+    O2(CDevice_SetStateVB),
+    O6(CMiniport_CreateCtxDmaObject),
+    O1(CMiniport_InitHardware),
+    O2(D3D_CommonSetMultiSampleModeAndScale),
+    O1(D3D_DestroyResource),
+    O1(CDevice_KickOff),
+    O2(D3D_MakeRequestedSpace),
     B1(D3DDevice_GetDeviceCaps, d3d_hle_device_get_device_caps),
     B1(D3DDevice_GetDisplayMode, d3d_hle_device_get_display_mode),
     B1(D3DDevice_Reset, d3d_hle_device_reset_std),
     B2(D3DDevice_SetRenderTarget, d3d_hle_device_set_render_target_std),
-    B1(D3DDevice_GetBackBuffer2, d3d_hle_device_get_back_buffer2_std),
+    B3(D3DDevice_SetRenderTargetFast,
+       d3d_hle_device_set_render_target_fast_std),
+    M1(D3DDevice_GetBackBuffer2, d3d_hle_device_get_back_buffer2_std),
     B2(D3DDevice_SetGammaRamp, d3d_hle_device_set_gamma_ramp),
     A1(D3DDevice_GetGammaRamp, d3d_hle_device_get_gamma_ramp, DX),
     B5(D3DDevice_CopyRects, d3d_hle_device_copy_rects),
-    B0(D3DDevice_GetRenderTarget2, d3d_hle_device_get_render_target2),
-    B0(D3DDevice_GetDepthStencilSurface2,
+    M0(D3DDevice_GetRenderTarget2, d3d_hle_device_get_render_target2),
+    M0(D3DDevice_GetDepthStencilSurface2,
        d3d_hle_device_get_depth_stencil_surface2),
     B2(D3DDevice_SetTransform, d3d_hle_device_set_transform_std),
     A2(D3DDevice_GetTransform, d3d_hle_device_get_transform, AX, DX),
@@ -93,7 +126,6 @@ static const XemuD3DHleBinding bindings[] = {
     B2(D3DDevice_SetTexture, d3d_hle_device_set_texture_std),
     A3(D3DDevice_SwitchTexture, d3d_hle_device_switch_texture, CX, DX, ST),
     B2(D3DDevice_SetIndices, d3d_hle_device_set_indices_std),
-    A1(D3DDevice_GetIndices2, d3d_hle_device_get_indices2, DI),
     B0(D3DDevice_AddRef, d3d_hle_device_add_ref),
     B0(D3DDevice_Release, d3d_hle_device_release),
     B0(D3D_KickOffAndWaitForIdle, d3d_hle_kickoff_and_wait_for_idle),
@@ -137,26 +169,35 @@ static const XemuD3DHleBinding bindings[] = {
        d3d_hle_device_set_texture_state_texcoord_index, SI, ST),
     B2(D3DDevice_SetTextureState_BorderColor,
        d3d_hle_device_set_texture_state_border_color_std),
+    B3(D3DDevice_SetTextureState_BumpEnv,
+       d3d_hle_device_set_texture_state_bump_env_std),
+    B2(D3DDevice_SetTextureState_ColorKeyColor,
+       d3d_hle_device_set_texture_state_color_key_std),
+    B2(D3D_SetTileNoWait, d3d_hle_device_set_tile_std),
+    B2(D3DDevice_SetTile, d3d_hle_device_set_tile_std),
+    B2(D3DDevice_GetTile, d3d_hle_device_get_tile_std),
+    B2(D3DDevice_SetPalette, d3d_hle_device_set_palette_std),
     A3(D3DDevice_SetTextureStageStateNotInline,
        d3d_hle_device_set_texture_stage_state_not_inline, AX, DX, CX),
+    A3(D3DDevice_SetTextureStageStateNotInline2,
+       d3d_hle_device_set_texture_stage_state_not_inline, AX, DX, CX),
     B3(D3D_CommonSetRenderTarget, d3d_hle_common_set_render_target),
-    B7(D3DDevice_CreateTexture2, d3d_hle_device_create_texture2),
+    M7(D3DDevice_CreateTexture2, d3d_hle_device_create_texture2),
+    M6(D3DDevice_CreateTexture2, d3d_hle_device_create_texture2),
     B1(D3DBaseTexture_GetLevelCount,
        d3d_hle_base_texture_get_level_count),
-    B3(D3DTexture_GetLevelDesc, d3d_hle_texture_get_level_desc),
-    B2(D3DTexture_GetSurfaceLevel2,
+    B3(Get2DSurfaceDesc, d3d_hle_get_2d_surface_desc),
+    M2(D3DTexture_GetSurfaceLevel2,
        d3d_hle_texture_get_surface_level2),
-    B3(D3DCubeTexture_GetCubeMapSurface2,
+    M3(D3DCubeTexture_GetCubeMapSurface2,
        d3d_hle_cube_texture_get_cube_map_surface2),
-    B3(D3DVolumeTexture_GetLevelDesc,
-       d3d_hle_volume_texture_get_level_desc),
     B1(D3DResource_AddRef, d3d_hle_resource_add_ref),
     B1(D3DResource_Release, d3d_hle_resource_release),
     B1(D3DResource_GetType, d3d_hle_resource_get_type_std),
     B1(D3DResource_IsBusy, d3d_hle_resource_is_busy_std),
     B2(D3DResource_Register, d3d_hle_resource_register_std),
     B2(D3DSurface_GetDesc, d3d_hle_surface_get_desc),
-    B4(D3DSurface_LockRect, d3d_hle_surface_lock_rect),
+    M4(D3DSurface_LockRect, d3d_hle_surface_lock_rect),
     B6(D3DDevice_Clear, d3d_hle_device_clear),
     A5(D3DDevice_UpdateOverlay, d3d_hle_device_update_overlay,
        ST, AX, ST, ST, ST),
@@ -166,14 +207,16 @@ static const XemuD3DHleBinding bindings[] = {
        d3d_hle_device_set_back_buffer_scale),
     A6(D3D_CheckDeviceFormat, d3d_hle_direct3d_check_device_format,
        DX, ST, SI, ST, ST, CX),
-    B1(D3DDevice_CreateVertexBuffer2,
+    M1(D3DDevice_CreateVertexBuffer2,
        d3d_hle_device_create_vertex_buffer2),
-    A1(D3DDevice_CreateIndexBuffer2,
+    MA1(D3DDevice_CreateIndexBuffer2,
        d3d_hle_device_create_index_buffer2, AX),
-    B1(D3DVertexBuffer_Lock2, d3d_hle_vertex_buffer_lock2_std),
+    B2(D3DVertexBuffer_Lock2, d3d_hle_vertex_buffer_lock2_std),
     B1(D3D_SetFence, d3d_hle_set_fence),
     B2(D3D_BlockOnTime, d3d_hle_block_on_time),
-    A5(Lock3DSurface, d3d_hle_lock_3d_surface, ST, ST, ST, AX, ST),
+    B1(D3D_BlockOnResource, d3d_hle_block_on_resource_std),
+    B6(Lock2DSurface, d3d_hle_lock_2d_surface_std),
+    MA5(Lock3DSurface, d3d_hle_lock_3d_surface, ST, ST, ST, AX, ST),
     B3(D3DDevice_SetStreamSource,
        d3d_hle_device_set_stream_source_std),
     A2(D3DDevice_GetStreamSource2,
@@ -184,9 +227,13 @@ static const XemuD3DHleBinding bindings[] = {
        d3d_hle_device_load_vertex_shader_program),
     A2(D3DDevice_SelectVertexShader,
        d3d_hle_device_select_vertex_shader, AX, BX),
-    B4(D3DDevice_CreateVertexShader,
+    A2(D3DDevice_SelectVertexShaderDirect,
+       d3d_hle_device_select_vertex_shader, AX, BX),
+    B1(D3DDevice_SetShaderConstantMode,
+       d3d_hle_device_set_shader_constant_mode_std),
+    M4(D3DDevice_CreateVertexShader,
        d3d_hle_device_create_vertex_shader),
-    A1(D3DDevice_DeleteVertexShader,
+    MA1(D3DDevice_DeleteVertexShader,
        d3d_hle_device_delete_vertex_shader, AX),
     B1(D3DDevice_SetVertexShader, d3d_hle_device_set_vertex_shader),
     A2(D3DDevice_SetVertexShaderConstant1,
@@ -216,10 +263,12 @@ static const XemuD3DHleBinding bindings[] = {
     B3(D3DDevice_SetVertexData2s, d3d_hle_device_set_vertex_data2s),
     B2(D3DDevice_SetVertexDataColor,
        d3d_hle_device_set_vertex_data_color),
+    B5(D3DDevice_SetVertexData4ub,
+       d3d_hle_device_set_vertex_data4ub_std),
     B1(D3DDevice_Begin, d3d_hle_device_begin),
     B0(D3DDevice_End, d3d_hle_device_end),
-    B2(D3DDevice_CreatePixelShader, d3d_hle_device_create_pixel_shader),
-    A1(D3DDevice_DeletePixelShader,
+    M2(D3DDevice_CreatePixelShader, d3d_hle_device_create_pixel_shader),
+    MA1(D3DDevice_DeletePixelShader,
        d3d_hle_device_delete_pixel_shader, AX),
     B1(D3DDevice_SetPixelShader, d3d_hle_device_set_pixel_shader_std),
     B3(D3DDevice_SetPixelShaderConstant,
@@ -254,11 +303,9 @@ static const XemuD3DHleBinding bindings[] = {
        d3d_hle_device_set_render_state_multisample_mask),
     B1(D3DDevice_SetRenderState_SampleAlpha,
        d3d_hle_device_set_render_state_sample_alpha),
-    B5(D3DTexture_LockRect, d3d_hle_texture_lock_rect),
-    B3(D3DCubeTexture_GetCubeMapSurface2,
-       d3d_hle_cube_texture_get_cube_map_surface2),
-    B6(D3DCubeTexture_LockRect, d3d_hle_cube_texture_lock_rect),
-    B5(D3DVolumeTexture_LockBox, d3d_hle_volume_texture_lock_box),
+    M5(D3DTexture_LockRect, d3d_hle_texture_lock_rect),
+    M6(D3DCubeTexture_LockRect, d3d_hle_cube_texture_lock_rect),
+    M5(D3DVolumeTexture_LockBox, d3d_hle_volume_texture_lock_box),
     B3(D3DDevice_GetVisibilityTestResult,
        d3d_hle_device_get_visibility_test_result),
     B1(D3DDevice_SetFlickerFilter, d3d_hle_device_set_flicker_filter),
@@ -273,16 +320,14 @@ static const XemuD3DHleBinding bindings[] = {
     B3(D3DDevice_SetScissors, d3d_hle_device_set_scissors),
     B2(D3DDevice_SetScreenSpaceOffset,
        d3d_hle_device_set_screen_space_offset),
-    B4(D3DDevice_CreateSurface2, d3d_hle_device_create_surface2),
     B2(D3DPalette_Lock2, d3d_hle_palette_lock2),
-    B1(D3DPalette_GetSize, d3d_hle_palette_get_size),
     B2(D3D_SetPushBufferSize, d3d_hle_direct3d_set_push_buffer_size),
-    B6(Direct3D_CreateDevice, d3d_hle_direct3d_create_device_std),
-    B3(Direct3D_CreateDevice, automatic_create_device_compact),
+    M6(Direct3D_CreateDevice, d3d_hle_direct3d_create_device_std),
+    M3(Direct3D_CreateDevice, automatic_create_device_compact),
     /* MakeSpace returns title-owned push-buffer storage. The xemu bridge has
      * no safe synthetic guest allocator, so an automatic profile must leave
      * the allocation and command-stream ownership with the native XDK. */
-    B0(D3DDevice_MakeSpace, NULL),
+    N0(D3DDevice_MakeSpace),
 };
 
 #undef ST
@@ -302,6 +347,7 @@ typedef struct XemuD3DHleScan {
     uint32_t recognized_functions;
     uint32_t unsupported_functions;
     uint32_t duplicate_functions;
+    uint32_t ambiguous_functions;
     uint32_t unsupported_mutating_functions;
     uint32_t unsupported_native_safe_functions;
     uint32_t uncovered_abi_functions;
@@ -310,7 +356,9 @@ typedef struct XemuD3DHleScan {
     uint32_t deferred_texture_state_va;
     uint32_t deferred_render_state_va;
     bool has_swap;
-    bool has_draw;
+    bool has_immediate_begin;
+    bool has_immediate_end;
+    bool has_render_path;
 } XemuD3DHleScan;
 
 static XemuD3DHleScan *active_scan;
@@ -332,21 +380,6 @@ static const XemuD3DHleBinding *find_binding(const char *name, size_t length,
         }
     }
     return NULL;
-}
-
-static size_t canonical_name_length(const char *name)
-{
-    const char *marker = strstr(name, "__LTCG");
-    const char *cursor;
-
-    if (!marker)
-        return strlen(name);
-    cursor = marker;
-    while (cursor > name && isdigit((unsigned char)cursor[-1]))
-        --cursor;
-    if (cursor > name && cursor[-1] == '_')
-        --cursor;
-    return (size_t)(cursor - name);
 }
 
 static bool canonical_name_is(const char *name, size_t length,
@@ -423,7 +456,7 @@ static bool discovery_name_is_native_safe(
         "D3DResource_GetType",
         "D3DDevice_MakeSpace",
         "D3DDevice_IsFencePending",
-        "D3D8_Get2DSurfaceDesc",
+        "Get2DSurfaceDesc",
         "D3DBaseTexture_GetLevelCount",
     };
     static const char *const prefixes[] = {
@@ -434,8 +467,8 @@ static bool discovery_name_is_native_safe(
         "D3DBaseTexture_Get",
         "D3DSurface_Get",
         "D3DVertexBuffer_Get",
-        "D3D_CMiniport_Get",
-        "D3D_CMiniport_Is",
+        "CMiniport_Get",
+        "CMiniport_Is",
         "Direct3D_Check",
     };
     size_t i;
@@ -460,14 +493,19 @@ static void discovery_note_unsupported(
     XemuD3DHleScan *scan, const char *name, size_t length, bool abi,
     const char *reason)
 {
+    bool native_safe = discovery_name_is_native_safe(name, length);
+
     ++scan->unsupported_functions;
     if (abi)
         ++scan->uncovered_abi_functions;
-    if (discovery_name_is_native_safe(name, length))
+    if (native_safe)
         ++scan->unsupported_native_safe_functions;
     else
         ++scan->unsupported_mutating_functions;
-    (void)reason;
+    fprintf(stderr,
+            "[D3D-HLE] uncovered symbol: %.*s class=%s reason=%s\n",
+            (int)length, name, native_safe ? "native-safe" : "mutating",
+            reason ? reason : "unspecified");
 }
 
 static uint8_t convert_param(XbSDBParamType type)
@@ -595,8 +633,10 @@ static void register_symbol(const char *library_str, uint32_t library_flag,
     XemuD3DHleScan *scan = active_scan;
     const XemuD3DHleBinding *binding;
     XemuD3DHleHook *hook;
+    uint8_t source_params[XEMU_D3D_HLE_MAX_ABI_ARGS] = { 0 };
     size_t name_length;
     uint32_t stack_bytes = 0;
+    bool caller_cleanup;
     size_t i;
 
     (void)library_str;
@@ -625,7 +665,7 @@ static void register_symbol(const char *library_str, uint32_t library_flag,
         param_list[0].type == param_void) {
         param_count = 0;
     }
-    name_length = canonical_name_length(symbol_str);
+    name_length = xemu_d3d_hle_canonical_name_length(symbol_str);
     ++scan->recognized_functions;
     if (param_count > XEMU_D3D_HLE_MAX_ABI_ARGS) {
         discovery_note_unsupported(scan, symbol_str, name_length, true,
@@ -645,10 +685,11 @@ static void register_symbol(const char *library_str, uint32_t library_flag,
         return;
     }
     for (i = 0; i < param_count; ++i) {
-        if (param_list[i].type == param_psh)
+        source_params[i] = convert_param(param_list[i].type);
+        if (param_list[i].type == param_psh) {
             stack_bytes += 4u;
-        else if (param_list[i].type == param_psh2 ||
-                 convert_param(param_list[i].type) == XEMU_D3D_ABI_NONE) {
+        } else if (param_list[i].type == param_psh2 ||
+                   source_params[i] == XEMU_D3D_ABI_NONE) {
             discovery_note_unsupported(scan, symbol_str, name_length, true,
                                        "unsupported ABI parameter location");
             discovery_add_observe_hook(scan, symbol_str, name_length, address,
@@ -656,6 +697,7 @@ static void register_symbol(const char *library_str, uint32_t library_flag,
             return;
         }
     }
+    caller_cleanup = call_type == call_cdecl;
     for (i = 0; i < scan->hook_count; ++i) {
         if (scan->hooks[i].address != address)
             continue;
@@ -664,7 +706,24 @@ static void register_symbol(const char *library_str, uint32_t library_flag,
             hook = &scan->hooks[i];
             goto install_bound_hook;
         }
-        ++scan->duplicate_functions;
+        {
+            const XemuD3DHleHook *existing = &scan->hooks[i];
+
+            ++scan->duplicate_functions;
+            if (existing->entry != binding->entry ||
+                existing->policy != binding->policy ||
+                strcmp(existing->name, binding->name) != 0 ||
+                existing->source_param_count != param_count ||
+                existing->source_stack_bytes != stack_bytes ||
+                existing->source_caller_cleanup != caller_cleanup ||
+                memcmp(existing->source_params, source_params,
+                       sizeof(source_params)) != 0) {
+                ++scan->ambiguous_functions;
+                discovery_note_unsupported(
+                    scan, symbol_str, name_length, false,
+                    "duplicate binding ambiguity");
+            }
+        }
         return;
     }
     if (scan->hook_count == G_N_ELEMENTS(scan->hooks)) {
@@ -683,12 +742,11 @@ install_bound_hook:
     hook->observe_class = 0;
     hook->source_param_count = param_count;
     hook->source_stack_bytes = stack_bytes;
-    hook->source_caller_cleanup = call_type == call_cdecl;
+    hook->source_caller_cleanup = caller_cleanup;
     hook->target_param_count = binding->param_count;
     memcpy(hook->target_params, binding->params,
            sizeof(hook->target_params));
-    for (i = 0; i < param_count; ++i)
-        hook->source_params[i] = convert_param(param_list[i].type);
+    memcpy(hook->source_params, source_params, sizeof(hook->source_params));
     set_special(&automatic_profile.special, symbol_str, name_length, address);
     if (canonical_name_is(symbol_str, name_length,
                           "Direct3D_CreateDevice")) {
@@ -697,6 +755,10 @@ install_bound_hook:
     }
     if (canonical_name_is(symbol_str, name_length, "D3DDevice_Swap"))
         scan->has_swap = true;
+    if (canonical_name_is(symbol_str, name_length, "D3DDevice_Begin"))
+        scan->has_immediate_begin = true;
+    if (canonical_name_is(symbol_str, name_length, "D3DDevice_End"))
+        scan->has_immediate_end = true;
     if (canonical_name_is(symbol_str, name_length,
                           "D3DDevice_DrawVertices") ||
         canonical_name_is(symbol_str, name_length,
@@ -705,8 +767,10 @@ install_bound_hook:
                           "D3DDevice_DrawVerticesUP") ||
         canonical_name_is(symbol_str, name_length,
                           "D3DDevice_DrawIndexedVerticesUP")) {
-        scan->has_draw = true;
+        scan->has_render_path = true;
     }
+    if (scan->has_immediate_begin && scan->has_immediate_end)
+        scan->has_render_path = true;
 }
 
 static int compare_hooks(const void *left, const void *right)
@@ -731,8 +795,7 @@ static bool add_lazy_set_state(XemuD3DHleScan *scan, uint8_t *image,
         uint32_t size = section->dwSizeofRaw;
         uint32_t offset;
 
-        if (!(section->dwFlags_value & XBE_SECTION_HEADER_FLAGS_PRELOAD) ||
-            !(section->dwFlags_value & XBE_SECTION_HEADER_FLAGS_EXECUTABLE) ||
+        if (!(section->dwFlags_value & XBE_SECTION_HEADER_FLAGS_EXECUTABLE) ||
             start >= image_end || size > image_end - start)
             continue;
         for (offset = 0; offset + 24u <= size; ++offset) {
@@ -768,6 +831,7 @@ static bool add_lazy_set_state(XemuD3DHleScan *scan, uint8_t *image,
                 .entry = d3d_hle_lazy_set_state,
                 .name = "D3D::LazySetState",
                 .automatic = 1,
+                .policy = XEMU_D3D_HLE_HOOK_REPLACE,
             };
             *dirty_flags_va = dirty;
             return true;
@@ -816,7 +880,7 @@ static bool discovery_section_name_is(
            (length == 8u || name[length] == '\0');
 }
 
-static bool discovery_section_is_scan_candidate(
+static bool discovery_section_is_scan_target(
     XemuD3DHleGuestRead read_guest, const xbe_section_header *section)
 {
     return (section->dwFlags_value &
@@ -826,16 +890,12 @@ static bool discovery_section_is_scan_candidate(
            discovery_section_name_is(read_guest, section, "FLASHROM");
 }
 
-static bool discovery_section_is_named_or_kernel(
-    XemuD3DHleGuestRead read_guest, const xbe_section_header *section,
-    xbaddr kernel_thunk)
+bool xemu_d3d_hle_discovery_is_scan_target(
+    XemuD3DHleGuestRead read_guest, const void *section_header)
 {
-    uint32_t end = section->dwVirtualAddr + section->dwSizeofRaw;
-
-    return discovery_section_name_is(read_guest, section, "D3D") ||
-           discovery_section_name_is(read_guest, section, ".text") ||
-           discovery_section_name_is(read_guest, section, "FLASHROM") ||
-           (kernel_thunk >= section->dwVirtualAddr && kernel_thunk < end);
+    return section_header &&
+           discovery_section_is_scan_target(
+               read_guest, (const xbe_section_header *)section_header);
 }
 
 static uint8_t *discovery_sparse_alloc(size_t size)
@@ -958,7 +1018,7 @@ const XemuD3DHleProfile *xemu_d3d_hle_discover(
         uint32_t size = sections[i].dwSizeofRaw;
         size_t copied;
 
-        if (!size || !discovery_section_is_scan_candidate(
+        if (!size || !discovery_section_is_scan_target(
                 read_guest, &sections[i])) {
             continue;
         }
@@ -980,7 +1040,32 @@ const XemuD3DHleProfile *xemu_d3d_hle_discover(
             read_guest, address, image + address, size);
         section_copied[i] = copied;
         copied_section_bytes += copied;
+        if (!copied) {
+            /* A fully-absent scan-target section (XeUnloadSection'd D3DX
+             * pattern, or not yet loaded) contains no executable code right
+             * now, so its symbols cannot be called and its absence cannot
+             * split the renderer. The loader section-commit hook resets and
+             * rescans the moment it appears. Only PARTIAL sections poison
+             * the scan. */
+            continue;
+        }
         if (copied != size) {
+            uint32_t head = (0x1000u - (address & 0xFFFu)) & 0xFFFu;
+            uint32_t tail = (address + size) & 0xFFFu;
+
+            /* XBE sections are not page-aligned: edge pages are shared with
+             * neighbouring sections and are mapped whenever the NEIGHBOUR is
+             * committed. An uncommitted section's bytes on such a page are
+             * zero-fill, not code. If nothing beyond the shared edge slivers
+             * is mapped, the section is effectively absent (RSC2: va=0055FBA0
+             * copied=1120 == exactly the head sliver) — same skip as
+             * copied==0. Any fully-mapped interior page contributes 0x1000
+             * bytes, so copied < 0x1000 proves no interior page is present. */
+            if (size > 0x1000u && copied < 0x1000u && copied <= head + tail) {
+                section_copied[i] = 0;
+                copied_section_bytes -= copied;
+                continue;
+            }
             ++incomplete_sections;
             missing_section_bytes += size - copied;
         }
@@ -993,13 +1078,32 @@ const XemuD3DHleProfile *xemu_d3d_hle_discover(
         goto out;
     }
     if (incomplete_sections) {
+        /* Symbols living in unavailable pages are invisible to OOVPA
+         * matching, so a partial snapshot self-certifies: the fewer pages
+         * mapped, the cleaner the title looks, and activation would proceed
+         * with GPU-mutating symbols unhooked (RSC2: 86 recognized on a
+         * 61896-byte-short snapshot vs 145 recognized / 17 mutating-uncovered
+         * on the full image). No verdict — activation or refusal — is sound
+         * here. Stay armed and rescan when coverage grows; the resolve
+         * path's "D3D section never fully mapped" timeout still bounds
+         * titles that never page their D3D section in. */
+        if (retryable)
+            *retryable = true;
+        if (error && error_capacity) {
+            g_snprintf(error, error_capacity,
+                       "XBE snapshot incomplete: %zu bytes across %u "
+                       "scan-target section%s unavailable",
+                       missing_section_bytes, incomplete_sections,
+                       incomplete_sections == 1u ? "" : "s");
+        }
         fprintf(stderr,
-                "[D3D-HLE] XBE snapshot: retained %zu mapped bytes; "
-                "%zu unavailable bytes across %u preload section%s "
-                "left zero-filled\n",
+                "[D3D-HLE] XBE snapshot incomplete: %zu mapped bytes; "
+                "%zu unavailable bytes across %u preload section%s; "
+                "deferring discovery until the image is fully mapped\n",
                 copied_section_bytes, missing_section_bytes,
                 incomplete_sections,
                 incomplete_sections == 1u ? "" : "s");
+        goto out;
     }
     libraries.count = XbSDB_GenerateLibraryFilter(snapshot_header, NULL);
     if (!libraries.count) {
@@ -1026,14 +1130,10 @@ const XemuD3DHleProfile *xemu_d3d_hle_discover(
             libraries.count, libraries.count == 1u ? "" : "s");
 
     scan_sections.count = 0;
-    {
-        xbaddr kernel_thunk = XbSDB_GetKernelThunkAddress(snapshot_header);
-        for (i = 0; i < header.dwSections; ++i) {
-            if (section_copied[i] >= sections[i].dwSizeofRaw &&
-                discovery_section_is_named_or_kernel(
-                    read_guest, &sections[i], kernel_thunk))
-                ++scan_sections.count;
-        }
+    for (i = 0; i < header.dwSections; ++i) {
+        if (section_copied[i] >= sections[i].dwSizeofRaw &&
+            discovery_section_is_scan_target(read_guest, &sections[i]))
+            ++scan_sections.count;
     }
     if (!scan_sections.count) {
         set_error(error, error_capacity, "XBE has no D3D-scannable sections");
@@ -1041,14 +1141,13 @@ const XemuD3DHleProfile *xemu_d3d_hle_discover(
     }
     scan_sections.filters = g_new0(XbSDBSection, scan_sections.count);
     {
-        xbaddr kernel_thunk = XbSDB_GetKernelThunkAddress(snapshot_header);
         size_t filter_index = 0;
         for (i = 0; i < header.dwSections; ++i) {
             XbSDBSection *filter;
 
             if (section_copied[i] < sections[i].dwSizeofRaw ||
-                !discovery_section_is_named_or_kernel(
-                    read_guest, &sections[i], kernel_thunk))
+                !discovery_section_is_scan_target(
+                    read_guest, &sections[i]))
                 continue;
             filter = &scan_sections.filters[filter_index++];
             memset(filter, 0, sizeof(*filter));
@@ -1082,7 +1181,7 @@ const XemuD3DHleProfile *xemu_d3d_hle_discover(
                              image_end,
                              &dirty_flags_va);
     if (!automatic_profile.special.create_device || !scan.has_swap ||
-        !scan.has_draw) {
+        !scan.has_render_path) {
         bool loader_snapshot = missing_section_bytes != 0;
 
         if (retryable && loader_snapshot)
@@ -1090,7 +1189,18 @@ const XemuD3DHleProfile *xemu_d3d_hle_discover(
         set_error(error, error_capacity,
                   loader_snapshot
                       ? "D3D core is not available in the loader snapshot yet"
-                      : "D3D scan did not resolve CreateDevice, Swap, and a draw path");
+                      : "D3D scan did not resolve CreateDevice, Swap, and a render path");
+        goto out;
+    }
+    if (!dirty_flags_va || !scan.deferred_texture_state_va) {
+        bool loader_snapshot = missing_section_bytes != 0;
+
+        if (retryable && loader_snapshot)
+            *retryable = true;
+        set_error(error, error_capacity,
+                  loader_snapshot
+                      ? "D3D deferred-state bridge is not available in the loader snapshot yet"
+                      : "D3D scan did not resolve the deferred-state bridge");
         goto out;
     }
 
@@ -1120,6 +1230,7 @@ const XemuD3DHleProfile *xemu_d3d_hle_discover(
     automatic_profile.discovery_unsupported_count =
         scan.unsupported_functions;
     automatic_profile.discovery_duplicate_count = scan.duplicate_functions;
+    automatic_profile.discovery_ambiguous_count = scan.ambiguous_functions;
     automatic_profile.discovery_mutating_uncovered_count =
         scan.unsupported_mutating_functions;
     automatic_profile.discovery_uncovered_abi_count =
@@ -1140,9 +1251,11 @@ const XemuD3DHleProfile *xemu_d3d_hle_discover(
     guest_read = read_guest;
     fprintf(stderr,
             "[D3D-HLE] automatic scan: XDK=%u recognized=%u bound=%zu "
-            "unsupported=%u duplicates=%u core=create/swap/draw lazy=%s\n",
+            "unsupported=%u duplicates=%u ambiguous=%u "
+            "core=create/swap/draw lazy=%s\n",
             scan.build_version, scan.recognized_functions, scan.hook_count,
             scan.unsupported_functions, scan.duplicate_functions,
+            scan.ambiguous_functions,
             dirty_flags_va ? "yes" : "no");
     ok = true;
 out:

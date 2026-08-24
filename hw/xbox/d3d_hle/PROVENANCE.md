@@ -13,8 +13,13 @@ coverage-complete generated dispatch in the local `xrecomp814-PGR2` checkout
 at revision `2193751fa1b2ea05f53315cc3574e388c7669af9`. Its source XBE SHA-256
 is `217e5856d646920968f69b063a242c300de42927ecd1de5ec191c4a88e1de8de`;
 the detector runtime plan reports 94 required / 94 implemented / zero blockers,
-and the generated dispatch contains 99 D3D HLE entries. Xemu's compiled PGR2
-table was checked against all 99 address/wrapper pairs.
+and the generated dispatch contains 99 D3D HLE entries. Xemu's first 99 PGR2
+entries were checked against those address/wrapper pairs. The xemu full-system
+profile adds one reviewed shared wrapper at `0x001C8910` for
+`D3D8_Get2DSurfaceDesc`: original disassembly shows that helper dereferencing
+the native `D3D__pDevice`, which is intentionally absent under direct
+bootstrap, while the shared `d3d_hle_guest_surface_desc` path implements the
+same three-argument descriptor contract without native-device coupling.
 
 MM3 and PGR2 addresses and title identity remain in exact compatibility
 profiles. Other games are detected at runtime with Cxbx-Reloaded's

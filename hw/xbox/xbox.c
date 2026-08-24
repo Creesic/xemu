@@ -255,7 +255,7 @@ void xbox_init_common(MachineState *machine,
 
     /* allocate ram and load rom/bios */
     xbox_memory_init(pcms, system_memory, rom_memory, &ram_memory);
-    xemu_d3d_hle_install(qemu_get_cpu(0), ram_memory);
+    xemu_d3d_hle_install(qemu_get_cpu(0), ram_memory, system_memory);
 
     gsi_state = pc_gsi_create(&x86ms->gsi, pcmc->pci_enabled);
 

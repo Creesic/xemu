@@ -8,6 +8,7 @@
  */
 #include "qemu/osdep.h"
 #include "qemu/thread.h"
+#include "exec/cputlb.h"
 #include "exec/target_page.h"
 #include "exec/tb-flush.h"
 #include "hw/core/cpu.h"
@@ -15,6 +16,8 @@
 #include "cpu.h"
 
 #include <Xbe.h>
+
+#include "qapi/error.h"
 
 #include "d3d8_internal.h"
 #include "d3d_frontend.h"
@@ -27,6 +30,7 @@
 #include "plume/plume_host.h"
 #include "xemu_d3d_hle.h"
 #include "xemu_d3d_hle_discovery.h"
+#include "xemu_d3d_hle_guest_heap.h"
 #include "xemu_d3d_hle_profile.h"
 #include "xemu_d3d_hle_spy.h"
 
@@ -42,6 +46,12 @@ typedef enum XemuD3DHlePendingKind {
     XEMU_D3D_PENDING_VERTEX_SHADER,
     XEMU_D3D_PENDING_PIXEL_SHADER,
 } XemuD3DHlePendingKind;
+
+typedef enum XemuD3DHleLoaderKind {
+    XEMU_D3D_LOADER_NONE,
+    XEMU_D3D_LOADER_LOAD,
+    XEMU_D3D_LOADER_UNLOAD,
+} XemuD3DHleLoaderKind;
 
 typedef struct XemuD3DHlePending {
     XemuD3DHlePendingKind kind;
@@ -102,7 +112,6 @@ typedef struct XemuD3DHleTraceEntry {
 } XemuD3DHleTraceEntry;
 
 uint32_t g_eax, g_ebx, g_ecx, g_edx, g_ebp, g_esi, g_edi, g_esp;
-ptrdiff_t g_xbox_mem_offset;
 uint32_t xrecomp_d3d_hle_dirty_flags_va;
 uint32_t xrecomp_d3d_hle_deferred_texture_state_va;
 uint32_t xrecomp_d3d_hle_fog_state_va;
@@ -110,6 +119,16 @@ uint32_t xrecomp_d3d_hle_fog_state_va;
 static CPUState *s_cpu;
 static uint8_t *s_ram;
 static uint64_t s_ram_size;
+static MemoryRegion *s_synthetic_memory;
+static uint8_t *s_synthetic_ram;
+static bool s_synthetic_region_installed;
+static bool s_synthetic_mapping_installed;
+static uint32_t s_synthetic_page_directory;
+static uint32_t
+    s_synthetic_original_pdes[XEMU_D3D_HLE_SYNTHETIC_PAGE_TABLES];
+static uint32_t
+    s_synthetic_installed_pdes[XEMU_D3D_HLE_SYNTHETIC_PAGE_TABLES];
+static XemuD3DHleGuestHeap s_synthetic_heap;
 static bool s_requested;
 static bool s_environment_override;
 static XemuD3DHleStatus s_status = XEMU_D3D_HLE_STATUS_DISABLED;
@@ -131,9 +150,23 @@ static bool s_header_valid;
 static uint64_t s_header_valid_ms;
 static bool s_loader_resolved;
 static bool s_loader_call_active;
+static XemuD3DHleLoaderKind s_loader_call_kind;
 static bool loader_entry_span_mapped;
+static bool s_loader_section_scan_target;
 static uint32_t s_loader_section_va;
 static uint32_t s_loader_section_size;
+/* Last successful activation, keyed by XBE identity. Same-title section
+ * churn (executable-flagged streamed sections) resets the session after
+ * activation; the title never calls CreateDevice again, so re-verification
+ * must be able to reactivate from these instead of stranding on NV2A. */
+static uint32_t s_reactivate_params_va;
+static uint32_t s_reactivate_title_id;
+static uint32_t s_reactivate_timedate;
+static uint32_t s_reactivate_image_size;
+/* Same-identity resets (scan-target section churn) keep the guest D3D
+ * registry: the title's live handles remain valid and reactivation must
+ * not strand them. Identity changes always perform the full wipe. */
+static bool s_session_reset_preserve_guest;
 static bool s_host_ready;
 static bool s_trace_entries;
 static bool s_trace_dumped;
@@ -173,9 +206,11 @@ static uint32_t s_overlay_height;
 static uint32_t s_overlay_pitch;
 
 extern uintptr_t xemu_get_native_window_handle(void);
+extern uintptr_t xemu_get_d3d_output_window_handle(void);
 
 static void xemu_d3d_hle_dump_trace_ring(void);
 static HRESULT xemu_d3d_hle_activate_host_device(uint32_t parameters_va);
+static HRESULT xemu_d3d_hle_reactivate_host_device(void);
 static bool xemu_d3d_hle_read_identity(
     uint32_t *title_id, uint32_t *timedate, uint32_t *image_size);
 static bool xemu_d3d_hle_update_coverage(void);
@@ -183,6 +218,7 @@ static void xemu_d3d_hle_reset_coverage(void);
 static bool xemu_d3d_hle_try_resolve_kernel_loader(void);
 static void xemu_d3d_hle_queue_discovery(uint32_t pc);
 static void xemu_d3d_hle_queue_session_reset(void);
+static void xemu_d3d_hle_queue_session_reset_ex(bool preserve_guest);
 
 static int xemu_d3d_hle_overlay_provider(
     XgpuPlumeDebugOverlayFrame *frame)
@@ -216,6 +252,22 @@ static int xemu_d3d_hle_overlay_provider(
     return visible ? 1 : 0;
 }
 
+static uint8_t *xemu_d3d_hle_physical_ptr(hwaddr physical, size_t size)
+{
+    if (physical < s_ram_size && size <= s_ram_size - physical)
+        return s_ram + physical;
+    if (s_synthetic_region_installed &&
+        physical >= XEMU_D3D_HLE_SYNTHETIC_PHYS_BASE &&
+        physical - XEMU_D3D_HLE_SYNTHETIC_PHYS_BASE <
+            XEMU_D3D_HLE_SYNTHETIC_REGION_SIZE &&
+        size <= XEMU_D3D_HLE_SYNTHETIC_REGION_SIZE -
+            (physical - XEMU_D3D_HLE_SYNTHETIC_PHYS_BASE)) {
+        return s_synthetic_ram +
+            (physical - XEMU_D3D_HLE_SYNTHETIC_PHYS_BASE);
+    }
+    return NULL;
+}
+
 static bool xemu_d3d_hle_translate(uint32_t va, hwaddr *physical)
 {
     MemTxAttrs attrs;
@@ -228,7 +280,7 @@ static bool xemu_d3d_hle_translate(uint32_t va, hwaddr *physical)
     if (page == (hwaddr)-1)
         return false;
     page += va & ~TARGET_PAGE_MASK;
-    if (page >= s_ram_size)
+    if (!xemu_d3d_hle_physical_ptr(page, 1u))
         return false;
     *physical = page;
     return true;
@@ -237,11 +289,59 @@ static bool xemu_d3d_hle_translate(uint32_t va, hwaddr *physical)
 uint8_t *xbox_guest_ptr(uint32_t va)
 {
     hwaddr physical;
+    uint8_t *host;
     if (!xemu_d3d_hle_translate(va, &physical)) {
-        fprintf(stderr, "[D3D-HLE] unmapped guest pointer %08X\n", va);
+        /* Attribute the fault before the fail-fast: with 85+ hooks live, an
+         * unattributed abort is unactionable (RSC2: bare "unmapped guest
+         * pointer 000001C0" after minutes of FMV). */
+        fprintf(stderr,
+                "[D3D-HLE] unmapped guest pointer %08X "
+                "(active-hook=%s last-hook=%08X:%s hooks=%llu)\n",
+                va,
+                s_active_hook_name ? s_active_hook_name : "none",
+                s_last_hook_pc,
+                s_last_hook_name ? s_last_hook_name : "none",
+                (unsigned long long)s_hook_entry_count);
+        xemu_d3d_hle_dump_trace_ring();
         abort();
     }
-    return s_ram + physical;
+    host = xemu_d3d_hle_physical_ptr(physical, 1u);
+    g_assert(host != NULL);
+    return host;
+}
+
+uint8_t *xbox_guest_phys_ptr(uint32_t physical, size_t size)
+{
+    if (physical >= 0x80000000u && physical < 0x90000000u)
+        physical &= 0x0FFFFFFFu;
+    return xemu_d3d_hle_physical_ptr(physical, size);
+}
+
+bool xbox_guest_host_to_phys(const void *host, uint32_t *physical)
+{
+    uintptr_t address;
+    uintptr_t base;
+
+    if (!host || !physical)
+        return false;
+    address = (uintptr_t)host;
+    base = (uintptr_t)s_ram;
+    if (address >= base && address - base < s_ram_size) {
+        *physical = (uint32_t)(address - base);
+        return true;
+    }
+    if (s_synthetic_region_installed) {
+        base = (uintptr_t)s_synthetic_ram +
+            (XEMU_D3D_HLE_SYNTHETIC_DATA_PHYS_BASE -
+             XEMU_D3D_HLE_SYNTHETIC_PHYS_BASE);
+        if (address >= base &&
+            address - base < XEMU_D3D_HLE_SYNTHETIC_SIZE) {
+            *physical = XEMU_D3D_HLE_SYNTHETIC_DATA_PHYS_BASE +
+                (uint32_t)(address - base);
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool xemu_d3d_hle_read(uint32_t va, void *output, size_t size)
@@ -250,12 +350,14 @@ static bool xemu_d3d_hle_read(uint32_t va, void *output, size_t size)
     while (size) {
         hwaddr physical;
         size_t chunk;
+        const uint8_t *host;
         if (!xemu_d3d_hle_translate(va, &physical))
             return false;
         chunk = MIN(size, TARGET_PAGE_SIZE - (physical & ~TARGET_PAGE_MASK));
-        if (physical + chunk > s_ram_size)
+        host = xemu_d3d_hle_physical_ptr(physical, chunk);
+        if (!host)
             return false;
-        memcpy(out, s_ram + physical, chunk);
+        memcpy(out, host, chunk);
         out += chunk;
         va += (uint32_t)chunk;
         size -= chunk;
@@ -272,6 +374,218 @@ static int xemu_d3d_hle_read_range(
 static bool xemu_d3d_hle_read_u32(uint32_t va, uint32_t *value)
 {
     return xemu_d3d_hle_read(va, value, sizeof(*value));
+}
+
+enum {
+    XEMU_D3D_HLE_X86_PAGE_BYTES = 0x1000u,
+    XEMU_D3D_HLE_X86_PDE_SPAN = 0x400000u,
+    XEMU_D3D_HLE_DIRECT_MAP_PDE = 0x80000000u / 0x400000u,
+    XEMU_D3D_HLE_SYNTHETIC_FIRST_PDE =
+        XEMU_D3D_HLE_SYNTHETIC_VA_BASE / 0x400000u,
+};
+
+G_STATIC_ASSERT(
+    XEMU_D3D_HLE_SYNTHETIC_VA_BASE % XEMU_D3D_HLE_X86_PDE_SPAN == 0u);
+G_STATIC_ASSERT(
+    XEMU_D3D_HLE_SYNTHETIC_DATA_PHYS_BASE %
+        XEMU_D3D_HLE_X86_PDE_SPAN == 0u);
+G_STATIC_ASSERT(
+    XEMU_D3D_HLE_SYNTHETIC_SIZE ==
+        XEMU_D3D_HLE_SYNTHETIC_PAGE_TABLES *
+            XEMU_D3D_HLE_X86_PDE_SPAN);
+G_STATIC_ASSERT(
+    XEMU_D3D_HLE_SYNTHETIC_PAGE_TABLES *
+        XEMU_D3D_HLE_X86_PAGE_BYTES <=
+            XEMU_D3D_HLE_SYNTHETIC_DATA_PHYS_BASE -
+                XEMU_D3D_HLE_SYNTHETIC_PHYS_BASE);
+
+static bool xemu_d3d_hle_read_phys_u32(uint32_t physical, uint32_t *value)
+{
+    const uint8_t *host = xemu_d3d_hle_physical_ptr(
+        physical, sizeof(*value));
+
+    if (!host || !value)
+        return false;
+    memcpy(value, host, sizeof(*value));
+    return true;
+}
+
+static bool xemu_d3d_hle_write_phys_u32(uint32_t physical, uint32_t value)
+{
+    uint8_t *host = xemu_d3d_hle_physical_ptr(
+        physical, sizeof(value));
+
+    if (!host)
+        return false;
+    memcpy(host, &value, sizeof(value));
+    return true;
+}
+
+static void xemu_d3d_hle_unmap_synthetic_guest_heap(void);
+
+static bool xemu_d3d_hle_map_synthetic_guest_heap(void)
+{
+    CPUX86State *env;
+    uint32_t page_directory;
+    uint32_t direct_pde;
+    uint32_t direct_page_table;
+    uint32_t pde_flags;
+    uint32_t pte_flags = 0;
+    unsigned i;
+    unsigned j;
+    hwaddr translated;
+
+    if (s_synthetic_mapping_installed)
+        return true;
+    if (!s_cpu || !s_synthetic_region_installed || !s_synthetic_ram ||
+        !s_synthetic_heap.blocks)
+        return false;
+
+    env = &X86_CPU(s_cpu)->env;
+    if (!(env->cr[0] & CR0_PG_MASK) || (env->cr[4] & CR4_PAE_MASK)) {
+        fprintf(stderr,
+                "[D3D-HLE] synthetic guest heap requires active non-PAE "
+                "32-bit paging\n");
+        return false;
+    }
+    page_directory = (uint32_t)env->cr[3] & 0xFFFFF000u;
+    if (!xemu_d3d_hle_read_phys_u32(
+            page_directory + XEMU_D3D_HLE_DIRECT_MAP_PDE * 4u,
+            &direct_pde) ||
+        !(direct_pde & PG_PRESENT_MASK) ||
+        (direct_pde & PG_PSE_MASK)) {
+        fprintf(stderr,
+                "[D3D-HLE] synthetic guest heap could not identify the "
+                "Xbox cached-RAM page-table template\n");
+        return false;
+    }
+    direct_page_table = direct_pde & 0xFFFFF000u;
+    for (j = 0; j < 1024u; ++j) {
+        uint32_t pte;
+
+        if (!xemu_d3d_hle_read_phys_u32(
+                direct_page_table + j * 4u, &pte))
+            return false;
+        if (pte & PG_PRESENT_MASK) {
+            pte_flags = pte & 0xFFFu;
+            break;
+        }
+    }
+    if (!(pte_flags & PG_PRESENT_MASK))
+        return false;
+    pde_flags = direct_pde & 0xFFFu;
+
+    for (i = 0; i < XEMU_D3D_HLE_SYNTHETIC_PAGE_TABLES; ++i) {
+        uint32_t original;
+        uint32_t pde_address = page_directory +
+            (XEMU_D3D_HLE_SYNTHETIC_FIRST_PDE + i) * 4u;
+
+        if (!xemu_d3d_hle_read_phys_u32(pde_address, &original))
+            return false;
+        if (original & PG_PRESENT_MASK) {
+            fprintf(stderr,
+                    "[D3D-HLE] synthetic guest heap VA conflict at "
+                    "%08X (PDE=%08X)\n",
+                    XEMU_D3D_HLE_SYNTHETIC_VA_BASE +
+                        i * XEMU_D3D_HLE_X86_PDE_SPAN,
+                    original);
+            return false;
+        }
+        s_synthetic_original_pdes[i] = original;
+    }
+
+    memset(s_synthetic_ram, 0, XEMU_D3D_HLE_SYNTHETIC_REGION_SIZE);
+    for (i = 0; i < XEMU_D3D_HLE_SYNTHETIC_PAGE_TABLES; ++i) {
+        uint8_t *page_table = s_synthetic_ram +
+            i * XEMU_D3D_HLE_X86_PAGE_BYTES;
+        uint32_t page_table_physical =
+            XEMU_D3D_HLE_SYNTHETIC_PHYS_BASE +
+            i * XEMU_D3D_HLE_X86_PAGE_BYTES;
+        uint32_t pde = page_table_physical | pde_flags;
+
+        for (j = 0; j < 1024u; ++j) {
+            uint32_t pte = XEMU_D3D_HLE_SYNTHETIC_DATA_PHYS_BASE +
+                i * XEMU_D3D_HLE_X86_PDE_SPAN +
+                j * XEMU_D3D_HLE_X86_PAGE_BYTES;
+            pte |= pte_flags;
+            memcpy(page_table + j * sizeof(pte), &pte, sizeof(pte));
+        }
+        s_synthetic_installed_pdes[i] = pde;
+    }
+
+    s_synthetic_page_directory = page_directory;
+    s_synthetic_mapping_installed = true;
+    for (i = 0; i < XEMU_D3D_HLE_SYNTHETIC_PAGE_TABLES; ++i) {
+        if (!xemu_d3d_hle_write_phys_u32(
+                page_directory +
+                    (XEMU_D3D_HLE_SYNTHETIC_FIRST_PDE + i) * 4u,
+                s_synthetic_installed_pdes[i])) {
+            xemu_d3d_hle_unmap_synthetic_guest_heap();
+            return false;
+        }
+    }
+    tlb_flush(s_cpu);
+    xemu_d3d_hle_guest_heap_reset(&s_synthetic_heap);
+    if (!xemu_d3d_hle_translate(
+            XEMU_D3D_HLE_SYNTHETIC_VA_BASE, &translated) ||
+        translated != XEMU_D3D_HLE_SYNTHETIC_DATA_PHYS_BASE) {
+        xemu_d3d_hle_unmap_synthetic_guest_heap();
+        return false;
+    }
+    fprintf(stderr,
+            "[D3D-HLE] synthetic guest heap mapped: va=%08X..%08X "
+            "phys=%08X..%08X bytes=%u\n",
+            XEMU_D3D_HLE_SYNTHETIC_VA_BASE,
+            XEMU_D3D_HLE_SYNTHETIC_VA_BASE +
+                XEMU_D3D_HLE_SYNTHETIC_SIZE - 1u,
+            XEMU_D3D_HLE_SYNTHETIC_DATA_PHYS_BASE,
+            XEMU_D3D_HLE_SYNTHETIC_DATA_PHYS_BASE +
+                XEMU_D3D_HLE_SYNTHETIC_SIZE - 1u,
+            XEMU_D3D_HLE_SYNTHETIC_SIZE);
+    return true;
+}
+
+static void xemu_d3d_hle_unmap_synthetic_guest_heap(void)
+{
+    unsigned i;
+    bool clear_region = true;
+
+    if (s_synthetic_mapping_installed) {
+        for (i = 0; i < XEMU_D3D_HLE_SYNTHETIC_PAGE_TABLES; ++i) {
+            uint32_t current;
+            uint32_t pde_address = s_synthetic_page_directory +
+                (XEMU_D3D_HLE_SYNTHETIC_FIRST_PDE + i) * 4u;
+
+            if (!xemu_d3d_hle_read_phys_u32(pde_address, &current)) {
+                clear_region = false;
+                continue;
+            }
+            if (current == s_synthetic_original_pdes[i]) {
+                continue;
+            }
+            if ((current & 0xFFFFF000u) ==
+                (s_synthetic_installed_pdes[i] & 0xFFFFF000u)) {
+                (void)xemu_d3d_hle_write_phys_u32(
+                    pde_address, s_synthetic_original_pdes[i]);
+            } else {
+                clear_region = false;
+                fprintf(stderr,
+                        "[D3D-HLE] synthetic guest heap PDE changed by "
+                        "the guest at %08X; refusing to overwrite %08X\n",
+                        pde_address, current);
+            }
+        }
+        tlb_flush(s_cpu);
+    }
+    s_synthetic_mapping_installed = false;
+    s_synthetic_page_directory = 0;
+    memset(s_synthetic_original_pdes, 0,
+           sizeof(s_synthetic_original_pdes));
+    memset(s_synthetic_installed_pdes, 0,
+           sizeof(s_synthetic_installed_pdes));
+    xemu_d3d_hle_guest_heap_reset(&s_synthetic_heap);
+    if (s_synthetic_ram && clear_region)
+        memset(s_synthetic_ram, 0, XEMU_D3D_HLE_SYNTHETIC_REGION_SIZE);
 }
 
 static uint16_t xemu_d3d_hle_pe_u16(const uint8_t *bytes)
@@ -692,6 +1006,8 @@ static const XemuD3DHleProfile *xemu_d3d_hle_select_profile(void)
                     error);
             continue;
         }
+        if (!xemu_d3d_hle_validate_profile(profiles[i]))
+            continue;
         if (profiles[i]->bootstrap == XEMU_D3D_HLE_BOOTSTRAP_DIRECT &&
             !d3d_hle_guest_synthetic_allocator_available()) {
             fprintf(stderr,
@@ -700,8 +1016,7 @@ static const XemuD3DHleProfile *xemu_d3d_hle_select_profile(void)
                     profiles[i]->name);
             continue;
         }
-        if (xemu_d3d_hle_validate_profile(profiles[i]))
-            return profiles[i];
+        return profiles[i];
     }
     return NULL;
 }
@@ -737,16 +1052,29 @@ static bool xemu_d3d_hle_read_identity(
 
 void xemu_d3d_hle_session_reset(const char *why)
 {
-    fprintf(stderr, "[D3D-HLE] session reset begin: %s\n",
-            why && why[0] ? why : "unspecified");
+    bool preserve_guest = s_session_reset_preserve_guest;
+
+    s_session_reset_preserve_guest = false;
+    fprintf(stderr, "[D3D-HLE] session reset begin: %s%s\n",
+            why && why[0] ? why : "unspecified",
+            preserve_guest ? " (guest state preserved)" : "");
     s_host_ready = false;
     qatomic_set(&s_session_reset_queued, false);
     qemu_mutex_lock(&s_overlay_mutex);
     s_overlay_visible = false;
     ++s_overlay_version;
     qemu_mutex_unlock(&s_overlay_mutex);
-    if (s_requested)
+    if (s_requested && !preserve_guest) {
         d3d_hle_guest_reset_session();
+        xbox_HeapSyntheticReset();
+    }
+    if (!preserve_guest) {
+        /* Reactivation records are only valid for a live guest registry. */
+        s_reactivate_params_va = 0;
+        s_reactivate_title_id = 0;
+        s_reactivate_timedate = 0;
+        s_reactivate_image_size = 0;
+    }
     fprintf(stderr, "[D3D-HLE] session reset teardown complete\n");
     g_free(s_bootstrap_deferred);
     s_bootstrap_deferred = NULL;
@@ -768,7 +1096,9 @@ void xemu_d3d_hle_session_reset(const char *why)
     s_header_valid = false;
     s_header_valid_ms = 0;
     s_loader_call_active = false;
+    s_loader_call_kind = XEMU_D3D_LOADER_NONE;
     loader_entry_span_mapped = false;
+    s_loader_section_scan_target = false;
     s_loader_section_va = 0;
     s_loader_section_size = 0;
     if (s_cpu)
@@ -851,6 +1181,25 @@ static bool xemu_d3d_hle_resolve_loaded_xbe(uint32_t pc)
     if (!xemu_d3d_hle_read_u32(0x00010000u, &magic) ||
         magic != 0x48454258u)
         return false;
+    /* A stale pre-reset TB can reach this verdict path without is_entry
+     * ever re-reading identity for the new generation. The verdict owns
+     * identity capture so reactivation and vblank change detection work
+     * regardless of which path got here first. */
+    if (!s_identity_valid) {
+        uint32_t title_id;
+        uint32_t timedate;
+        uint32_t image_size;
+
+        if (xemu_d3d_hle_read_identity(
+                &title_id, &timedate, &image_size)) {
+            s_identity_title_id = title_id;
+            s_identity_timedate = timedate;
+            s_identity_image_size = image_size;
+            s_identity_valid = true;
+            if (!s_generation)
+                s_generation = 1;
+        }
+    }
 
     s_profile_checked = true;
     /* Preserve the two extensively runtime-validated contracts.  Every
@@ -890,14 +1239,17 @@ static bool xemu_d3d_hle_resolve_loaded_xbe(uint32_t pc)
          s_profile->discovery_uncovered_abi_count)) {
         g_snprintf(s_status_detail, sizeof(s_status_detail),
                    "automatic D3D discovery left %u mutating functions "
-                   "and %u ABI holes uncovered",
+                   "%u ambiguous addresses and %u ABI holes uncovered",
                    s_profile->discovery_mutating_uncovered_count,
+                   s_profile->discovery_ambiguous_count,
                    s_profile->discovery_uncovered_abi_count);
         qatomic_set(&s_status, XEMU_D3D_HLE_STATUS_PROFILE_REJECTED);
         fprintf(stderr,
                 "[D3D-HLE] automatic profile refused: mutating=%u "
-                "uncovered-abi=%u total-uncovered=%u; leaving title on NV2A\n",
+                "ambiguous=%u uncovered-abi=%u total-uncovered=%u; "
+                "leaving title on NV2A\n",
                 s_profile->discovery_mutating_uncovered_count,
+                s_profile->discovery_ambiguous_count,
                 s_profile->discovery_uncovered_abi_count,
                 s_profile->discovery_unsupported_count);
         s_profile = NULL;
@@ -924,7 +1276,38 @@ static bool xemu_d3d_hle_resolve_loaded_xbe(uint32_t pc)
         qatomic_set(&s_status, XEMU_D3D_HLE_STATUS_PROFILE_VERIFIED);
         return true;
     }
+    /* The TB-entry gate is evaluated at translation time: any block
+     * translated while no profile was live (initial discovery, or the
+     * session-reset -> re-verify gap) direct-chains into D3D bodies with
+     * no hook gate. Those stale chains would silently starve Plume of
+     * draws after activation. Retranslate everything with the gate live. */
+    queue_tb_flush(s_cpu);
     qatomic_set(&s_status, XEMU_D3D_HLE_STATUS_PROFILE_VERIFIED);
+    /* Same-title reactivation: a post-activation session reset (executable
+     * streamed-section churn) re-verifies this identity, but the guest
+     * created its device long ago and will not call CreateDevice again.
+     * Replay the recorded activation instead of stranding on NV2A. A
+     * different identity must never reuse saved parameters. */
+    if (!qatomic_read(&s_host_ready) && s_reactivate_params_va &&
+        s_identity_valid &&
+        s_reactivate_title_id == s_identity_title_id &&
+        s_reactivate_timedate == s_identity_timedate &&
+        s_reactivate_image_size == s_identity_image_size) {
+        HRESULT result;
+
+        fprintf(stderr,
+                "[D3D-HLE] reactivating %s after same-title session "
+                "reset (parameters=%08X)\n",
+                s_profile->name, s_reactivate_params_va);
+        result = xemu_d3d_hle_reactivate_host_device();
+        if (result != S_OK) {
+            s_reactivate_params_va = 0;
+            fprintf(stderr,
+                    "[D3D-HLE] reactivation failed (HRESULT=%08X); "
+                    "waiting for the title's next CreateDevice\n",
+                    (unsigned)result);
+        }
+    }
     return true;
 }
 
@@ -1197,17 +1580,11 @@ static void xemu_d3d_hle_finish_pending(CPUX86State *env)
     s_cpu->exec_entry_return_pc = 0;
 }
 
-static HRESULT xemu_d3d_hle_activate_host_device(uint32_t parameters_va)
+static HRESULT xemu_d3d_hle_activate_host_device_common(
+    HRESULT device_result, uint32_t parameters_va)
 {
-    HRESULT result;
-
-    fprintf(stderr,
-            "[D3D-HLE] CreateDevice: parameters=%08X window=%p\n",
-            parameters_va, (void *)xemu_get_native_window_handle());
-    result = d3d_hle_guest_start_host_device(
-        parameters_va, xemu_get_native_window_handle());
-    if (result != S_OK)
-        return result;
+    if (device_result != S_OK)
+        return device_result;
     if (!xgpu_plume_register_debug_overlay_provider(
             xemu_d3d_hle_overlay_provider,
             XGPU_PLUME_DEBUG_OVERLAY_LAYER_MENU)) {
@@ -1218,12 +1595,87 @@ static HRESULT xemu_d3d_hle_activate_host_device(uint32_t parameters_va)
     }
     s_host_ready = true;
     qatomic_set(&s_status, XEMU_D3D_HLE_STATUS_ACTIVE);
+    /* Remember how this identity activated so same-title section churn can
+     * reactivate without a second guest CreateDevice. */
+    s_reactivate_params_va = parameters_va;
+    s_reactivate_title_id = s_identity_title_id;
+    s_reactivate_timedate = s_identity_timedate;
+    s_reactivate_image_size = s_identity_image_size;
     fprintf(stderr,
             "[D3D-HLE] %s profile active: guest D3D calls now target "
             "Plume\n"
             "[D3D-HLE] xemu HUD overlay provider registered\n",
             s_profile ? s_profile->name : "reviewed");
     return S_OK;
+}
+
+static HRESULT xemu_d3d_hle_activate_host_device(uint32_t parameters_va)
+{
+    fprintf(stderr,
+            "[D3D-HLE] CreateDevice: parameters=%08X window=%p\n",
+            parameters_va, (void *)xemu_get_d3d_output_window_handle());
+    return xemu_d3d_hle_activate_host_device_common(
+        d3d_hle_guest_start_host_device(
+            parameters_va, xemu_get_d3d_output_window_handle()),
+        parameters_va);
+}
+
+static HRESULT xemu_d3d_hle_reactivate_host_device(void)
+{
+    /* The recorded parameters_va pointed into the guest stack of the
+     * original CreateDevice call and is long dead; restart from the
+     * host-side present-parameter snapshot instead. */
+    return xemu_d3d_hle_activate_host_device_common(
+        d3d_hle_guest_restart_host_device(
+            xemu_get_d3d_output_window_handle()),
+        s_reactivate_params_va);
+}
+
+static bool xemu_d3d_hle_fail_closed_call(
+    CPUX86State *env, const XemuD3DHleHook *hook, uint32_t return_pc,
+    const char *reason)
+{
+    uint32_t stack_bytes;
+
+    if (!env || !hook || !return_pc) {
+        cpu_abort(s_cpu,
+                  "D3D HLE cannot safely reject an ABI failure "
+                  "without a guest return address");
+    }
+    stack_bytes = hook->source_caller_cleanup ? 0u :
+        hook->source_stack_bytes;
+    qatomic_set(&s_host_ready, false);
+    qemu_mutex_lock(&s_overlay_mutex);
+    s_overlay_visible = false;
+    ++s_overlay_version;
+    qemu_mutex_unlock(&s_overlay_mutex);
+    d3d_hle_guest_reset_session();
+    xbox_HeapSyntheticReset();
+    xrecomp_d3d_hle_dirty_flags_va = 0;
+    xrecomp_d3d_hle_deferred_texture_state_va = 0;
+    xrecomp_d3d_hle_fog_state_va = 0;
+    s_profile_valid = false;
+    s_profile = NULL;
+    s_profile_checked = true;
+    s_active_hook_name = NULL;
+    memset(&s_pending, 0, sizeof(s_pending));
+    memset(&s_device_pending, 0, sizeof(s_device_pending));
+    s_device_pending_active = false;
+    s_cpu->exec_entry_return_pc = 0;
+    g_snprintf(s_status_detail, sizeof(s_status_detail),
+               "automatic hook %s failed closed: %s",
+               hook->name ? hook->name : "unknown",
+               reason ? reason : "unspecified");
+    qatomic_set(&s_status, XEMU_D3D_HLE_STATUS_FAILED);
+    fprintf(stderr,
+            "[D3D-HLE] %s; native XDK body suppressed and Plume ownership "
+            "released\n",
+            s_status_detail);
+
+    env->regs[R_EAX] = (uint32_t)E_FAIL;
+    env->regs[R_ESP] = (uint32_t)env->regs[R_ESP] + 4u + stack_bytes;
+    env->eip = return_pc - env->segs[R_CS].base;
+    return true;
 }
 
 static bool xemu_d3d_hle_exec(void *opaque, CPUState *cpu, vaddr linear_pc)
@@ -1245,18 +1697,41 @@ static bool xemu_d3d_hle_exec(void *opaque, CPUState *cpu, vaddr linear_pc)
         if (s_loader_call_active &&
             pc == s_cpu->exec_loader_return_pc) {
             const bool success = (int32_t)env->regs[R_EAX] >= 0;
+            const bool loader_span_mapped_after =
+                s_loader_section_size &&
+                xemu_d3d_hle_span_fully_mapped(
+                    s_loader_section_va, s_loader_section_size);
+            XemuD3DHleLoaderKind completed_kind = s_loader_call_kind;
 
             s_cpu->exec_loader_return_pc = 0;
             s_loader_call_active = false;
-            if (success && !loader_entry_span_mapped &&
-                s_loader_section_size) {
+            s_loader_call_kind = XEMU_D3D_LOADER_NONE;
+            if (success && s_loader_section_size &&
+                s_loader_section_scan_target &&
+                completed_kind == XEMU_D3D_LOADER_UNLOAD &&
+                loader_entry_span_mapped &&
+                !loader_span_mapped_after) {
+                fprintf(stderr,
+                        "[D3D-HLE] section unload: va=%08X size=%X\n",
+                        s_loader_section_va, s_loader_section_size);
+                if (s_profile_checked || s_host_ready) {
+                    /* Same-identity hook churn: guest state stays valid. */
+                    xemu_d3d_hle_queue_session_reset_ex(true);
+                } else {
+                    (void)xemu_d3d_hle_update_coverage();
+                }
+            } else if (success && s_loader_section_size &&
+                       s_loader_section_scan_target &&
+                       completed_kind == XEMU_D3D_LOADER_LOAD &&
+                       !loader_entry_span_mapped &&
+                       loader_span_mapped_after) {
                 fprintf(stderr,
                         "[D3D-HLE] section commit: va=%08X size=%X\n",
                         s_loader_section_va, s_loader_section_size);
-                if (s_host_ready) {
-                    xemu_d3d_hle_queue_session_reset();
-                } else if (!s_profile_checked &&
-                           xemu_d3d_hle_update_coverage()) {
+                if (s_profile_checked || s_host_ready) {
+                    /* Same-identity hook churn: guest state stays valid. */
+                    xemu_d3d_hle_queue_session_reset_ex(true);
+                } else if (xemu_d3d_hle_update_coverage()) {
                     xemu_d3d_hle_queue_discovery(s_loader_section_va);
                 }
             }
@@ -1266,10 +1741,15 @@ static bool xemu_d3d_hle_exec(void *opaque, CPUState *cpu, vaddr linear_pc)
             xbe_section_header section;
             uint32_t section_va = xemu_d3d_hle_stack(env, 1);
 
+            if (pc == s_cpu->exec_loader_pc[0])
+                s_loader_call_kind = XEMU_D3D_LOADER_LOAD;
+            else
+                s_loader_call_kind = XEMU_D3D_LOADER_UNLOAD;
             memset(&section, 0, sizeof(section));
             s_loader_section_va = 0;
             s_loader_section_size = 0;
             loader_entry_span_mapped = false;
+            s_loader_section_scan_target = false;
             if (section_va && xemu_d3d_hle_read(
                     section_va, &section, sizeof(section))) {
                 s_loader_section_va = section.dwVirtualAddr;
@@ -1278,6 +1758,14 @@ static bool xemu_d3d_hle_exec(void *opaque, CPUState *cpu, vaddr linear_pc)
                     s_loader_section_size &&
                     xemu_d3d_hle_span_fully_mapped(
                         s_loader_section_va, s_loader_section_size);
+                /* Streamed data sections (audio/video/track paging) churn
+                 * through the loader constantly on titles like Forza and
+                 * RSC2. Only sections the detector would actually scan can
+                 * change a discovery verdict; everything else must not pay
+                 * the reset/rescan tax. */
+                s_loader_section_scan_target =
+                    xemu_d3d_hle_discovery_is_scan_target(
+                        xemu_d3d_hle_read, &section);
             }
             s_cpu->exec_loader_return_pc = xemu_d3d_hle_stack(env, 0);
             s_loader_call_active = s_cpu->exec_loader_return_pc != 0;
@@ -1536,6 +2024,21 @@ static bool xemu_d3d_hle_exec(void *opaque, CPUState *cpu, vaddr linear_pc)
     if (pc == s_profile->special.resource_release)
         d3d_hle_guest_note_native_resource_release(
             xemu_d3d_hle_public_argument(env, hook, 0));
+    if (hook->automatic &&
+        hook->policy == XEMU_D3D_HLE_HOOK_BOOTSTRAP_ONLY) {
+        return xemu_d3d_hle_fail_closed_call(
+            env, hook, xemu_d3d_hle_stack(env, 0),
+            "bootstrap-only hook executed after activation");
+    }
+    if (hook->automatic &&
+        hook->policy == XEMU_D3D_HLE_HOOK_NATIVE_SAFE)
+        return false;
+    if (hook->automatic &&
+        hook->policy == XEMU_D3D_HLE_HOOK_NATIVE_THEN_MIRROR) {
+        return xemu_d3d_hle_fail_closed_call(
+            env, hook, xemu_d3d_hle_stack(env, 0),
+            "native-then-mirror hook has no reviewed mirror handler");
+    }
     if (!hook->entry)
         return false;
 
@@ -1543,12 +2046,8 @@ static bool xemu_d3d_hle_exec(void *opaque, CPUState *cpu, vaddr linear_pc)
     s_active_hook_name = hook->name;
     if (hook->automatic) {
         if (!xemu_d3d_hle_invoke_discovered(hook)) {
-            s_active_hook_name = NULL;
-            fprintf(stderr,
-                    "[D3D-HLE] ABI marshal failed for %s at %08X; "
-                    "executing the native XDK body\n",
-                    hook->name, pc);
-            return false;
+            return xemu_d3d_hle_fail_closed_call(
+                env, hook, return_pc, "ABI marshalling failed");
         }
     } else {
         hook->entry();
@@ -1600,36 +2099,41 @@ static void xemu_d3d_hle_queue_discovery(uint32_t pc)
 
 static bool xemu_d3d_hle_is_entry(void *opaque, vaddr linear_pc)
 {
-    uint32_t title_id;
-    uint32_t timedate;
-    uint32_t image_size;
-
     (void)opaque;
-    if (xemu_d3d_hle_read_identity(
-            &title_id, &timedate, &image_size)) {
-        if (!s_identity_valid) {
-            s_identity_title_id = title_id;
-            s_identity_timedate = timedate;
-            s_identity_image_size = image_size;
-            s_identity_valid = true;
-            if (!s_generation)
-                s_generation = 1;
-        } else if (s_identity_title_id != title_id ||
-                   s_identity_timedate != timedate ||
-                   s_identity_image_size != image_size) {
-            xemu_d3d_hle_session_reset("XBE identity changed");
-            s_identity_title_id = title_id;
-            s_identity_timedate = timedate;
-            s_identity_image_size = image_size;
-            s_identity_valid = true;
-        }
-    }
-    if (!s_header_valid &&
-        xemu_d3d_hle_pc_is_in_loaded_xbe((uint32_t)linear_pc)) {
-        s_header_valid = true;
-        s_header_valid_ms = xrecomp_host_monotonic_ms();
-    }
     if (!s_profile_checked) {
+        uint32_t title_id;
+        uint32_t timedate;
+        uint32_t image_size;
+
+        /* Identity is read only while discovery is still undecided. After a
+         * verdict (verified, active, or refused) the vblank path owns
+         * identity-change detection: rereading guest XBE headers on every
+         * non-chained TB transition is measurable overhead, and a refused
+         * title would pay it for the whole session. */
+        if (xemu_d3d_hle_read_identity(
+                &title_id, &timedate, &image_size)) {
+            if (!s_identity_valid) {
+                s_identity_title_id = title_id;
+                s_identity_timedate = timedate;
+                s_identity_image_size = image_size;
+                s_identity_valid = true;
+                if (!s_generation)
+                    s_generation = 1;
+            } else if (s_identity_title_id != title_id ||
+                       s_identity_timedate != timedate ||
+                       s_identity_image_size != image_size) {
+                xemu_d3d_hle_session_reset("XBE identity changed");
+                s_identity_title_id = title_id;
+                s_identity_timedate = timedate;
+                s_identity_image_size = image_size;
+                s_identity_valid = true;
+            }
+        }
+        if (!s_header_valid &&
+            xemu_d3d_hle_pc_is_in_loaded_xbe((uint32_t)linear_pc)) {
+            s_header_valid = true;
+            s_header_valid_ms = xrecomp_host_monotonic_ms();
+        }
         if (!xemu_d3d_hle_update_coverage()) {
             uint64_t now = xrecomp_host_monotonic_ms();
             if (s_header_valid &&
@@ -1655,12 +2159,13 @@ static bool xemu_d3d_hle_is_entry(void *opaque, vaddr linear_pc)
     return xemu_d3d_hle_find_any_hook((uint32_t)linear_pc) != NULL;
 }
 
-void xemu_d3d_hle_install(CPUState *cpu, MemoryRegion *ram)
+void xemu_d3d_hle_install(CPUState *cpu, MemoryRegion *ram,
+                          MemoryRegion *system_memory)
 {
     char error[256];
     const char *request = getenv("XEMU_D3D_FRONTEND");
 
-    if (!cpu || !ram)
+    if (!cpu || !ram || !system_memory)
         return;
     s_environment_override = request && request[0];
     if (!s_environment_override) {
@@ -1689,10 +2194,29 @@ void xemu_d3d_hle_install(CPUState *cpu, MemoryRegion *ram)
     s_cpu = cpu;
     s_ram = memory_region_get_ram_ptr(ram);
     s_ram_size = memory_region_size(ram);
+    if (s_ram_size == XBOX_PHYS_RAM) {
+        s_synthetic_memory = g_new0(MemoryRegion, 1);
+        memory_region_init_ram(
+            s_synthetic_memory, NULL, "xbox.d3d-hle-synthetic",
+            XEMU_D3D_HLE_SYNTHETIC_REGION_SIZE, &error_fatal);
+        memory_region_add_subregion(
+            system_memory, XEMU_D3D_HLE_SYNTHETIC_PHYS_BASE,
+            s_synthetic_memory);
+        s_synthetic_ram = memory_region_get_ram_ptr(s_synthetic_memory);
+        s_synthetic_region_installed =
+            xemu_d3d_hle_guest_heap_init(
+                &s_synthetic_heap, XEMU_D3D_HLE_SYNTHETIC_VA_BASE,
+                XEMU_D3D_HLE_SYNTHETIC_SIZE);
+    } else {
+        fprintf(stderr,
+                "[D3D-HLE] synthetic guest heap unavailable with "
+                "%llu-byte Xbox RAM; direct-bootstrap profiles stay "
+                "fail-closed\n",
+                (unsigned long long)s_ram_size);
+    }
     d3d_hle_guest_set_read_range(xemu_d3d_hle_read_range);
     qemu_mutex_init(&s_overlay_mutex);
     s_overlay_initialized = true;
-    g_xbox_mem_offset = (ptrdiff_t)s_ram;
     /* All retail title code lives in the user region.  This wide translation
      * gate is needed once at startup so an arbitrary XBE can trigger runtime
      * discovery; the check itself becomes a binary hook lookup afterwards. */
@@ -1963,17 +2487,25 @@ static void xemu_d3d_hle_session_reset_on_cpu(
     xemu_d3d_hle_session_reset("XBE header or identity changed");
 }
 
-static void xemu_d3d_hle_queue_session_reset(void)
+static void xemu_d3d_hle_queue_session_reset_ex(bool preserve_guest)
 {
     if (!s_cpu)
         return;
     /* Stop every scanout/present path before queueing the CPU0 teardown. The
      * old guest resource addresses may already be unmapped by the loader. */
     qatomic_set(&s_host_ready, false);
+    if (!preserve_guest)
+        s_session_reset_preserve_guest = false;
     if (qatomic_cmpxchg(&s_session_reset_queued, false, true))
         return;
+    s_session_reset_preserve_guest = preserve_guest;
     async_run_on_cpu(s_cpu, xemu_d3d_hle_session_reset_on_cpu,
                      RUN_ON_CPU_NULL);
+}
+
+static void xemu_d3d_hle_queue_session_reset(void)
+{
+    xemu_d3d_hle_queue_session_reset_ex(false);
 }
 
 static void xemu_d3d_hle_spy_vblank_on_cpu(CPUState *cpu, run_on_cpu_data data)
@@ -2007,12 +2539,30 @@ void xemu_d3d_hle_vblank(uint32_t pcrtc_start)
         return;
     (void)xemu_d3d_hle_try_resolve_kernel_loader();
     if (qatomic_read(&s_host_ready)) {
-        if (!xemu_d3d_hle_read_identity(
-                &title_id, &timedate, &image_size) ||
-            (s_identity_valid &&
-             (s_identity_title_id != title_id ||
-              s_identity_timedate != timedate ||
-              s_identity_image_size != image_size))) {
+        /* Loader section churn can leave the XBE header page transiently
+         * unmapped; a failed identity read alone is not a title change. Only
+         * a decoded DIFFERENT identity may tear down the live host session:
+         * a spurious full reset wipes the guest D3D registry while the title
+         * still holds live shader/resource handles. */
+        if (xemu_d3d_hle_read_identity(
+                &title_id, &timedate, &image_size) &&
+            s_identity_valid &&
+            (s_identity_title_id != title_id ||
+             s_identity_timedate != timedate ||
+             s_identity_image_size != image_size)) {
+            xemu_d3d_hle_queue_session_reset();
+            return;
+        }
+    } else if (s_profile_checked && s_identity_valid) {
+        /* Refused/verified-idle titles no longer pay per-TB identity reads;
+         * detect the next title swap here instead. A transiently unreadable
+         * header is not a change: with no live host session there is nothing
+         * unsafe to stop, so only a decoded different identity resets. */
+        if (xemu_d3d_hle_read_identity(
+                &title_id, &timedate, &image_size) &&
+            (s_identity_title_id != title_id ||
+             s_identity_timedate != timedate ||
+             s_identity_image_size != image_size)) {
             xemu_d3d_hle_queue_session_reset();
             return;
         }
@@ -2072,18 +2622,53 @@ void xemu_d3d_hle_publish_overlay(const void *pixels, uint32_t x, uint32_t y,
     qemu_mutex_unlock(&s_overlay_mutex);
 }
 
-/* The xemu bridge retains guest allocation and lifetime routines. */
+bool xbox_HeapSyntheticAvailable(void)
+{
+    return xemu_d3d_hle_map_synthetic_guest_heap();
+}
+
+void xbox_HeapSyntheticReset(void)
+{
+    xemu_d3d_hle_unmap_synthetic_guest_heap();
+}
+
+/* Direct-bootstrap HLE owns this private, page-table-backed guest VA arena.
+ * It is outside retail RAM and is mapped only for a matching reviewed profile;
+ * native XDK allocations continue to use the kernel's real 64 MiB allocator. */
 uint32_t xbox_HeapAllocRange(uint32_t bytes, uint32_t alignment,
                             uint32_t low, uint32_t high)
 {
-    (void)bytes; (void)alignment; (void)low; (void)high;
-    fprintf(stderr,
-            "[D3D-HLE] unexpected synthetic guest allocation in %s\n",
-            s_active_hook_name ? s_active_hook_name : "host mirror setup");
-    return 0;
+    uint32_t address;
+
+    if (!bytes || !alignment || low > XEMU_D3D_HLE_SYNTHETIC_VA_BASE ||
+        high < XEMU_D3D_HLE_SYNTHETIC_VA_BASE +
+                   XEMU_D3D_HLE_SYNTHETIC_SIZE - 1u ||
+        !xbox_HeapSyntheticAvailable()) {
+        return 0;
+    }
+    address = xemu_d3d_hle_guest_heap_alloc(
+        &s_synthetic_heap, bytes, alignment);
+    if (!address) {
+        fprintf(stderr,
+                "[D3D-HLE] synthetic guest heap exhausted in %s "
+                "(bytes=%u alignment=%u)\n",
+                s_active_hook_name ? s_active_hook_name : "host mirror setup",
+                bytes, alignment);
+    }
+    return address;
 }
 
 void xbox_HeapFree(uint32_t address)
 {
-    (void)address;
+    if (address >= XEMU_D3D_HLE_SYNTHETIC_DATA_PHYS_BASE &&
+        address < XEMU_D3D_HLE_SYNTHETIC_DATA_PHYS_BASE +
+                      XEMU_D3D_HLE_SYNTHETIC_SIZE) {
+        address = XEMU_D3D_HLE_SYNTHETIC_VA_BASE +
+            (address - XEMU_D3D_HLE_SYNTHETIC_DATA_PHYS_BASE);
+    }
+    if (address >= XEMU_D3D_HLE_SYNTHETIC_VA_BASE &&
+        address < XEMU_D3D_HLE_SYNTHETIC_VA_BASE +
+                      XEMU_D3D_HLE_SYNTHETIC_SIZE) {
+        (void)xemu_d3d_hle_guest_heap_free(&s_synthetic_heap, address);
+    }
 }

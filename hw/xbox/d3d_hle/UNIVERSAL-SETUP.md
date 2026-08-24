@@ -680,8 +680,15 @@ and `Failed`.
 `!s_host_ready || !s_overlay_initialized`. After teardown,
 `s_overlay_visible = false`.
 
-`xbox_HeapAllocRange` logs and returns 0. `xbox_guest_ptr` is the
-abort path.
+Reviewed direct-bootstrap profiles may request the session-owned synthetic
+guest heap. On a 64 MiB retail machine, xemu maps a private 60 MiB VA window
+at `0x84400000..0x87FFFFFF` to host backing at physical
+`0x04400000..0x07FFFFFF`. Fifteen page tables live in the otherwise-unmapped
+`0x04000000` backing region. Mapping requires active non-PAE paging, clones
+the live cached-RAM PDE/PTE attributes, refuses any occupied target PDE, and
+is removed after guest-resource teardown on session reset. Other profiles
+continue to use native Xbox allocations; the synthetic region is not a
+replacement for the kernel heap.
 
 ### Mapping-driven rescan
 
@@ -1130,6 +1137,8 @@ void d3d_hle_guest_teardown_host_device(void);
 void xgpu_plume_teardown_output(void); /* new; PR 1 */
 XemuD3DHleStatusClass xemu_d3d_hle_status_class(void);
 bool xemu_d3d_hle_try_resolve_kernel_loader(void);
+bool xbox_HeapSyntheticAvailable(void);
+void xbox_HeapSyntheticReset(void);
 ```
 
 `xemu_d3d_hle_vblank` always peeks when requested; present path still
@@ -1210,7 +1219,9 @@ Rejected. CreateDevice stays the compact-row case.
 ## Security & Privacy Considerations
 
 - Do not execute untrusted guest as host. Wrappers only from
-  `bindings[]`. `xbox_HeapAllocRange` logs and returns 0.
+  `bindings[]`. The synthetic heap is enabled only after an exact reviewed
+  profile fingerprint matches, fails closed on page-table conflicts, and
+  never overlays the 64 MiB retail RAM region.
 - Snapshot bounds: existing image/section/header caps. Copy only
   translated pages. Fallible `xemu_d3d_hle_read` for new code.
 - TCG: after PR 5, user-space gate is the hook table only; loader
@@ -1275,7 +1286,7 @@ PR that makes it meaningful.
 - MM3 (`0x4D53002A`, `BOOTSTRAP_MIRROR_NATIVE`) still reaches
   `profile active`.
 - PGR2 (`0x4D53004B`, `BOOTSTRAP_DIRECT`, `d3d_hle_device_make_space`)
-  still matches.
+  still matches, maps its private guest heap, and reaches `profile active`.
 - Unset env ⇒ `DISABLED`.
 - Non-Windows stub ⇒ `UNAVAILABLE`.
 

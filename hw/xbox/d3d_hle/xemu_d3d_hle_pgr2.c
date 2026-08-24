@@ -8,7 +8,7 @@
 
 #define HLE(address_, entry_) { (address_), (entry_), #entry_ }
 
-enum { XEMU_D3D_HLE_PGR2_HOOK_COUNT = 99 };
+enum { XEMU_D3D_HLE_PGR2_HOOK_COUNT = 100 };
 
 static const XemuD3DHleHook pgr2_hooks[] = {
     HLE(0x001BFD00u, d3d_hle_device_create_vertex_shader),
@@ -110,6 +110,7 @@ static const XemuD3DHleHook pgr2_hooks[] = {
     HLE(0x001C5E90u, d3d_hle_block_on_time),
     HLE(0x001C6140u, d3d_hle_device_make_space),
     HLE(0x001C78E0u, d3d_hle_lazy_set_state),
+    HLE(0x001C8910u, d3d_hle_get_2d_surface_desc),
 };
 
 G_STATIC_ASSERT(G_N_ELEMENTS(pgr2_hooks) == XEMU_D3D_HLE_PGR2_HOOK_COUNT);

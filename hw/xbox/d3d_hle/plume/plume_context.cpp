@@ -94,6 +94,15 @@ bool PlumeContext::acquire(uint32_t *outSwapIndex)
     if (!m_inited || !outSwapIndex)
         return false;
 
+    /* Follow live output-window resizes (windowed<->fullscreen, drags)
+     * up front. Waiting for acquireTexture to fail leaves the swapchain
+     * presenting at a stale extent through DWM scaling. */
+    if (m_swapChain->needsResize()) {
+        if (!m_swapChain->resize())
+            return false;
+        rebuildFramebuffers();
+    }
+
     uint32_t idx = 0;
     if (!m_swapChain->acquireTexture(m_acquireSem.get(), &idx)) {
         m_swapChain->resize();
