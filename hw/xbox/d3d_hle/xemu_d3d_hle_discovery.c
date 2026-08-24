@@ -357,9 +357,10 @@ static const XemuD3DHleBinding bindings[] = {
     B2(D3D_SetPushBufferSize, d3d_hle_direct3d_set_push_buffer_size),
     M6(Direct3D_CreateDevice, d3d_hle_direct3d_create_device_std),
     M3(Direct3D_CreateDevice, automatic_create_device_compact),
-    /* MakeSpace returns push-buffer storage. The scratch window the push
-     * slice owns is a safe destination, so the 0-arg form now routes there
-     * with the rest of the family rather than staying native. */
+    /* MakeSpace must not stay native once the push family is bound: a native
+     * MakeSpace after attach hands the caller the XDK buffer while
+     * BeginPush/BeginStateBig own the scratch, splitting ownership of the
+     * same command stream. The 0-arg form routes to the same window. */
     B0(D3DDevice_MakeSpace, d3d_hle_device_make_space),
 };
 

@@ -5747,6 +5747,11 @@ void d3d_hle_guest_begin_state_big(uint32_t count)
 {
     uint32_t va = d3d_hle_guest_reserve_push(count);
 
+    /* ponytail: this drains and rewinds to the window start, where native
+     * appends at the existing pPut. Only correct because reserve_push drains
+     * first, so nothing pending is dropped. Forza calls this ~10M times a
+     * run and will feel the rewind; revisit once the unmodeled-method log
+     * says what actually has to be replayed. */
     d3d_hle_guest_retarget_push_cursor(va, g_hle_push_scratch_bytes);
 }
 
@@ -5756,6 +5761,11 @@ void d3d_hle_guest_make_requested_space(
     uint32_t va;
 
     (void)maximum;
+    /* ponytail: MakeRequestedSpace's arguments are BYTES (the recon body
+     * passes Count*4 + 0x204), but reserve_push takes a dword count and
+     * scales by 4 again, so this over-allocates by ~4x. Harmless headroom.
+     * Do NOT shrink it without a byte-vs-dword test proving which unit each
+     * caller actually passes. */
     va = d3d_hle_guest_reserve_push(requested);
     d3d_hle_guest_retarget_push_cursor(va, g_hle_push_scratch_bytes);
 }
