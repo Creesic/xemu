@@ -18,10 +18,29 @@ lined up with its census VA, so the scan is trustworthy:
 | PGR2 `0x4D53004B` | `001C6150` | `001C6150` | `default.xbe` |
 | Sega GT Online `0x53450021` | `0020A120` | `0020A120` | `default.xbe` |
 | Spider-Man 2 `0x4156002B` | `003C4970` | `003C4970` | `default.xbe` |
-| Forza `0x4D53006E` | `003BE090` | **`003BDD90`** | `Forza.xbe` |
+| Forza `0x4D53006E` | `003BE090` | `003BDD90` | `Extracted/Forza.xbe` |
 
-The Forza census VA is stale/misattributed — worth re-checking how the spy
-reports that address before anyone trusts `003BE090` again.
+The Forza row is **a build difference, not a spy defect**. Census `va=` is
+`hook->address` from XbSDB, that PC took 10,148,881 hits, and the OOVPA
+matches at offset 0 (`8B 0D` = `mov ecx,[pDevice]`), so the runtime is
+naming a live entry. Re-running the signature scan across every Forza image
+with title id `4D53006E` confirms it:
+
+```
+Extracted/Forza.xbe          MATCH at 003BDD90
+uAll/default.xbe             MATCH at 003BE090
+uAll/forza.xbe               MATCH at 003BE090
+uXBLA/forza.xbe              MATCH at 003BE090
+u/default.xbe                MATCH at 003BE090
+UpdaterTest-.../Forza.xbe    MATCH at 003BDD90
+```
+
+The updated builds place the function at `003BE090`; the un-updated
+`Extracted/Forza.xbe` places it at `003BDD90`. The 0x300 delta is the shift
+between those two builds, not a virtual-vs-raw slip — the Forza.xbe section
+table resolves `003BE090` cleanly (D3D section, delta `0x67B0`, inside
+`rsize=0x10628`). **Trust the runtime hook address.** Any future
+disassembly of Forza must use the same image the census ran against.
 
 ## The body (identical in all four titles)
 
@@ -66,8 +85,12 @@ No register ABI, no `ecx`/`edx` inputs.
 **What `unknown1` is.** It is **`Count`, a pushbuffer slot count in
 dwords** — the number of 32-bit words the caller is about to write. It is
 scaled by 4 everywhere it appears (`lea edx,[eax+esi*4]`,
-`lea ecx,[esi*4+0x204]`). The XbSDB `TODO: Update unknown parameter` can be
-closed: the canonical XDK name for this is `Count`/`dwCount`.
+`lea ecx,[esi*4+0x204]`). The XbSDB `TODO: Update unknown parameter` at
+`D3D8_OOVPA.c:234` is answered: the parameter is `Count`.
+
+That file is vendored third-party, so the name is recorded here rather than
+patched upstream-side; anyone syncing XbSDB can carry the rename with this
+note as evidence. Our own binding must call the argument `Count`.
 
 **Are the four bodies the same family.** Yes — identical instruction
 sequence, one function, one XDK revision family.
@@ -108,5 +131,11 @@ implementation to port.
 ## Recommendation
 
 Fold BeginStateBig into the BeginPush commit as the reservation half of one
-push-buffer slice, with `MakeRequestedSpace` bound alongside it. Keep it
-refusing until then.
+push-buffer slice, with `MakeRequestedSpace` bound alongside it as part of
+the same machine (PGR2's exact table already points `0x001C6140` at it).
+Keep it refusing until then.
+
+The remaining refuse set is one commit, not more recon: BeginPush (both
+arities) / EndPush / KickPushBuffer / BeginStateBig / MakeRequestedSpace.
+That set is what still blocks Forza, CoD BRO and Spider-Man 2; PGR2 and
+Sega GT are waiting only on the reservation half of the same thing.
