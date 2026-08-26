@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cstdint>
+#include <future>
 #include <map>
 #include <memory>
 #include <string>
@@ -137,14 +138,15 @@ public:
                                  const XgpuPlumeCachedIndexedDraw &draw);
     void meshCacheInvalidateVa(uint32_t resource_data_va);
     bool queueHostFrame(PlumeContext &ctx, const void *pixels, uint32_t w,
-                        uint32_t h, uint32_t pitch, uint64_t version);
+                        uint32_t h, uint32_t pitch, uint32_t format,
+                        uint64_t version);
     bool queueHostOverlay(PlumeContext &ctx,
                           const XgpuPlumeDebugOverlayFrame &frame,
                           uint32_t slot);
     bool queueHostOutputOverlay(PlumeContext &ctx,
                                 const XgpuPlumeDebugOverlayFrame &frame,
                                 uint32_t slot);
-    /* Re-blit the last host RGBA frame when the game presents with no draws
+    /* Re-blit the last host frame when the game presents with no draws
      * (FMV path: host player paints, then guest Present would otherwise clear). */
     void ensureStickyHostFrame(PlumeContext &ctx);
     /* Scale a native Xbox scanout surface into a wider host output. This is
@@ -314,6 +316,9 @@ private:
         std::unique_ptr<::plume::RenderTexture> tex;
         std::unique_ptr<::plume::RenderTextureView> view;
         std::unique_ptr<::plume::RenderDescriptorSet> descSet;
+        std::unique_ptr<::plume::RenderBuffer> hostUpload;
+        size_t hostUploadBytes = 0;
+        std::vector<uint8_t> hostConverted;
         uint32_t w = 0, h = 0, d = 1, levels = 1, dimension = 2;
         uint32_t fmt = 0, bytes = 0, cube = 0;
         uint32_t unnormalizedCoords = 0;
@@ -331,6 +336,7 @@ private:
          * instead of baked literals; snapshot m_combinerConst at record. */
         bool combinerCB = false;
         ShaderCompileRetryState compileRetry;
+        std::future<ShaderCompileResult> compileFuture;
         std::unique_ptr<::plume::RenderShader> shader;
         /* Opt-in live HLSL override. The runtime seeds this path with the
          * generated shader, then recompiles only after its timestamp changes. */
@@ -352,6 +358,7 @@ private:
         std::array<uint16_t, XGPU_PLUME_VERTEX_ATTRIBUTE_COUNT> offset = {};
         bool hasDeclaration = false;
         bool ok = false;
+        std::future<ShaderCompileResult> compileFuture;
         std::unique_ptr<::plume::RenderShader> shader;
     };
 
@@ -648,7 +655,8 @@ public:
     /* Render owner: create/upload every texture payload the recording
      * carries and publish them into the versioned store, before the
      * recording's draws are replayed. */
-    void consumeTextureUploads(PlumeContext &ctx, FrameRecording &recording);
+    void consumeTextureUploads(PlumeContext &ctx, FrameRecording &recording,
+                               ::plume::RenderCommandList *cmdList);
     void consumeSurfaceBindings(PlumeContext &ctx, FrameRecording &recording);
     void consumeVertexPrograms(PlumeContext &ctx, FrameRecording &recording);
     /* Owner boundary used before present-only composites inspect the surface
@@ -742,7 +750,8 @@ private:
      * needs no completion barrier. */
     std::unordered_map<uint32_t, RecordedTextureBinding> m_guestTextureShadow;
     void uploadRecordedTexture(PlumeContext &ctx,
-                               RecordedTextureUpload &&upload);
+                               RecordedTextureUpload &&upload,
+                               ::plume::RenderCommandList *cmdList);
     bool applySurfaceBinding(
         PlumeContext &ctx,
         const SurfaceBindingCommand &command);
@@ -795,6 +804,7 @@ private:
     struct GuestVertexProgram {
         uint16_t inputsRead = 0;
         bool ok = false;
+        std::future<ShaderCompileResult> compileFuture;
     };
     std::unordered_map<uint64_t, GuestVertexProgram> m_guestVertexPrograms;
     ShaderTarget m_recordShaderTarget = ShaderTarget::DXIL;
@@ -802,8 +812,8 @@ private:
     uint16_t m_curVertexInputs = 0;   /* inputsRead of the latched program */
 
 public:
-    /* Guest recorder: translate/compile portable bytecode and enqueue an owned
-     * program command. Only replay creates the RHI shader object. */
+    /* Guest recorder: queue portable bytecode compilation and use the CPU
+     * fallback until it completes. Only replay creates the RHI shader object. */
     int setVertexProgram(const uint32_t *microcode, uint32_t length,
                          const uint32_t *vertexFormat);
     /* Defer an indexed programmable draw (GPU vertex transform). Returns false

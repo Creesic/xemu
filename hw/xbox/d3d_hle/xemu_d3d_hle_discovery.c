@@ -82,10 +82,7 @@ static void automatic_create_device_compact(void)
 #define MA5(api, entry_, a_, b_, c_, d_, e_) \
     ROW(XEMU_D3D_HLE_HOOK_NATIVE_THEN_MIRROR, api, entry_, 5, a_, b_, c_, d_, e_)
 #define N0(api) ROW(XEMU_D3D_HLE_HOOK_NATIVE_SAFE, api, NULL, 0, 0)
-#define O0(api) ROW(XEMU_D3D_HLE_HOOK_BOOTSTRAP_ONLY, api, NULL, 0, 0)
-#define O1(api) ROW(XEMU_D3D_HLE_HOOK_BOOTSTRAP_ONLY, api, NULL, 1, ST)
-#define O2(api) ROW(XEMU_D3D_HLE_HOOK_BOOTSTRAP_ONLY, api, NULL, 2, ST, ST)
-#define O6(api) ROW(XEMU_D3D_HLE_HOOK_BOOTSTRAP_ONLY, api, NULL, 6, ST, ST, ST, ST, ST, ST)
+#define N2(api) ROW(XEMU_D3D_HLE_HOOK_NATIVE_SAFE, api, NULL, 2, ST, ST)
 
 /*
  * Canonical API -> reviewed wrapper ABI.  Most targets are ordinary stack
@@ -93,17 +90,20 @@ static void automatic_create_device_compact(void)
  * a wrapper imported before universal runtime discovery existed.
  */
 static const XemuD3DHleBinding bindings[] = {
-    O0(D3D_CommonSetDebugRegisters),
-    O0(D3D_UpdateProjectionViewportTransform),
-    O2(CDevice_InitializeFrameBuffers),
-    O1(CDevice_FreeFrameBuffers),
-    O1(CDevice_SetStateUP),
-    O2(CDevice_SetStateVB),
-    O6(CMiniport_CreateCtxDmaObject),
-    O1(CMiniport_InitHardware),
-    O2(D3D_CommonSetMultiSampleModeAndScale),
-    O1(D3D_DestroyResource),
-    O1(CDevice_KickOff),
+    /* These native helpers only program NV2A state. Public HLE entry points
+     * already own the corresponding Plume state after activation, so a
+     * direct or nested helper call must not fall back to the native GPU. */
+    B0(D3D_CommonSetDebugRegisters, d3d_hle_noop_std_0),
+    B0(D3D_UpdateProjectionViewportTransform, d3d_hle_noop_std_0),
+    B2(CDevice_InitializeFrameBuffers, d3d_hle_noop_std_2),
+    B1(CDevice_FreeFrameBuffers, d3d_hle_noop_std_1),
+    B1(CDevice_SetStateUP, d3d_hle_noop_std_1),
+    B2(CDevice_SetStateVB, d3d_hle_noop_std_2),
+    B6(CMiniport_CreateCtxDmaObject, d3d_hle_noop_std_6),
+    B1(CMiniport_InitHardware, d3d_hle_noop_std_1),
+    B2(D3D_CommonSetMultiSampleModeAndScale, d3d_hle_noop_std_2),
+    B1(D3D_DestroyResource, d3d_hle_destroy_resource_std),
+    B1(CDevice_KickOff, d3d_hle_cdevice_kickoff_std),
     B1(D3DDevice_GetDeviceCaps, d3d_hle_device_get_device_caps),
     B1(D3DDevice_GetDisplayMode, d3d_hle_device_get_display_mode),
     B1(D3DDevice_Reset, d3d_hle_device_reset_std),
@@ -159,11 +159,21 @@ static const XemuD3DHleBinding bindings[] = {
     B1(D3DDevice_BeginPush, d3d_hle_device_begin_push_std),
     B2(D3DDevice_BeginPush, d3d_hle_device_begin_push2_std),
     B1(D3DDevice_EndPush, d3d_hle_device_end_push_std),
+    B0(D3DDevice_EndPushBuffer, d3d_hle_device_end_push_buffer_std),
     B0(D3DDevice_KickPushBuffer, d3d_hle_device_kick_push_buffer_std),
     B1(D3DDevice_BeginStateBig, d3d_hle_device_begin_state_big_std),
     B2(D3D_MakeRequestedSpace, d3d_hle_make_requested_space_std),
-    B0(D3DDevice_BlockUntilVerticalBlank,
-       d3d_hle_device_block_until_vertical_blank),
+    /* Forza refused attach on these symbols after the push family bound.
+     * Create* manufacture guest objects the same way CreateSurface2 does;
+     * AllocContiguousMemory is Mm, not GPU. PersistDisplay and SetStipple
+     * stay unbound until their state semantics are implemented. */
+    B1(D3DDevice_CreatePalette2, d3d_hle_device_create_palette2_std),
+    B4(D3DDevice_CreateImageSurface,
+       d3d_hle_device_create_image_surface_std),
+    B4(D3D_CreateStandAloneSurface,
+       d3d_hle_device_create_image_surface_std),
+    N2(D3D_AllocContiguousMemory),
+    N0(D3DDevice_BlockUntilVerticalBlank),
     B1(D3DDevice_SetRenderState_FogColor,
        d3d_hle_device_set_render_state_fog_color),
     B1(D3DDevice_SetRenderState_CullMode,

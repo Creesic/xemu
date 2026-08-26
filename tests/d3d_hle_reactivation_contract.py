@@ -59,4 +59,19 @@ assert resolve_body.index("xemu_d3d_hle_read_identity(") < resolve_body.index(
     "s_profile_checked = true"
 )
 
+# Completing native bootstrap can re-enter the same automatic CreateDevice
+# hook once at the same guest call boundary. Only that exact one-shot replay
+# may return the already-completed S_OK; a later/different call stays on the
+# normal native-mirror fail-closed path.
+assert "s_create_device_reentry_expected" in HLE
+assert "s_create_device_reentry_return_pc" in HLE
+assert "s_create_device_reentry_parameters_va" in HLE
+assert "s_create_device_reentry_output_va" in HLE
+assert "s_create_device_reentry_hook_count" in HLE
+assert "bool exact_reentry" in HLE
+assert "s_create_device_reentry_hook_count <= 64u" in HLE
+assert "s_create_device_reentry_expected = false" in HLE
+assert "suppressed duplicate automatic" in HLE
+assert "xemu_d3d_hle_return_hook(" in HLE
+
 print("d3d_hle_reactivation_contract: OK")

@@ -182,6 +182,14 @@ static const char *s_last_hook_name;
 static XemuD3DHlePending s_pending;
 static XemuD3DHlePending s_device_pending;
 static bool s_device_pending_active;
+/* The first automatic native CreateDevice returns through a TCG boundary
+ * that can re-enter the same hook once. Suppress only that exact replay;
+ * any later or different CreateDevice call still fails closed. */
+static bool s_create_device_reentry_expected;
+static uint32_t s_create_device_reentry_return_pc;
+static uint32_t s_create_device_reentry_parameters_va;
+static uint32_t s_create_device_reentry_output_va;
+static uint64_t s_create_device_reentry_hook_count;
 static XemuD3DHleDeferred *s_bootstrap_deferred;
 static size_t s_bootstrap_deferred_count;
 static size_t s_bootstrap_deferred_capacity;
@@ -1084,6 +1092,7 @@ void xemu_d3d_hle_session_reset(const char *why)
     memset(&s_pending, 0, sizeof(s_pending));
     memset(&s_device_pending, 0, sizeof(s_device_pending));
     s_device_pending_active = false;
+    s_create_device_reentry_expected = false;
     if (xemu_d3d_hle_spy_enabled())
         xemu_d3d_hle_spy_dump("reset");
     xemu_d3d_hle_spy_reset();
@@ -1370,12 +1379,23 @@ static void xemu_d3d_hle_begin_pending(CPUX86State *env,
     }
     if (kind == XEMU_D3D_PENDING_DEVICE) {
         unsigned parameters_arg = s_profile->create_device_parameters_arg;
+        unsigned output_arg = parameters_arg + 1u;
 
-        if (hook && hook->automatic)
+        if (hook && hook->automatic) {
             parameters_arg = hook->source_param_count == 3u ? 1u : 4u;
+            output_arg = hook->source_param_count == 3u ? 2u : 5u;
+        }
         if (parameters_arg < G_N_ELEMENTS(s_pending.args)) {
             s_pending.device_parameters_va =
                 s_pending.args[parameters_arg];
+        }
+        if (hook && hook->automatic &&
+            output_arg < G_N_ELEMENTS(s_pending.args)) {
+            s_create_device_reentry_expected = false;
+            s_create_device_reentry_return_pc = s_pending.return_pc;
+            s_create_device_reentry_parameters_va =
+                s_pending.device_parameters_va;
+            s_create_device_reentry_output_va = s_pending.args[output_arg];
         }
     }
 
@@ -1575,10 +1595,14 @@ static void xemu_d3d_hle_finish_pending(CPUX86State *env)
                 (unsigned)completed.kind, (unsigned)host_result);
     }
     if (completed.kind == XEMU_D3D_PENDING_DEVICE &&
-        host_result == S_OK)
+        host_result == S_OK) {
+        s_create_device_reentry_expected = true;
+        s_create_device_reentry_hook_count = s_hook_entry_count;
         xemu_d3d_hle_replay_bootstrap();
-    else if (completed.kind == XEMU_D3D_PENDING_DEVICE)
+    } else if (completed.kind == XEMU_D3D_PENDING_DEVICE) {
+        s_create_device_reentry_expected = false;
         s_bootstrap_deferred_count = 0;
+    }
     memset(&s_pending, 0, sizeof(s_pending));
     s_cpu->exec_entry_return_pc = 0;
 }
@@ -1634,19 +1658,28 @@ static HRESULT xemu_d3d_hle_reactivate_host_device(void)
         s_reactivate_params_va);
 }
 
+static bool xemu_d3d_hle_return_hook(CPUX86State *env,
+                                     const XemuD3DHleHook *hook,
+                                     uint32_t return_pc, uint32_t result)
+{
+    uint32_t stack_bytes = hook->source_caller_cleanup ? 0u :
+        hook->source_stack_bytes;
+
+    env->regs[R_EAX] = result;
+    env->regs[R_ESP] = (uint32_t)env->regs[R_ESP] + 4u + stack_bytes;
+    env->eip = return_pc - env->segs[R_CS].base;
+    return true;
+}
+
 static bool xemu_d3d_hle_fail_closed_call(
     CPUX86State *env, const XemuD3DHleHook *hook, uint32_t return_pc,
     const char *reason)
 {
-    uint32_t stack_bytes;
-
     if (!env || !hook || !return_pc) {
         cpu_abort(s_cpu,
                   "D3D HLE cannot safely reject an ABI failure "
                   "without a guest return address");
     }
-    stack_bytes = hook->source_caller_cleanup ? 0u :
-        hook->source_stack_bytes;
     qatomic_set(&s_host_ready, false);
     qemu_mutex_lock(&s_overlay_mutex);
     s_overlay_visible = false;
@@ -1665,6 +1698,7 @@ static bool xemu_d3d_hle_fail_closed_call(
     memset(&s_pending, 0, sizeof(s_pending));
     memset(&s_device_pending, 0, sizeof(s_device_pending));
     s_device_pending_active = false;
+    s_create_device_reentry_expected = false;
     s_cpu->exec_entry_return_pc = 0;
     g_snprintf(s_status_detail, sizeof(s_status_detail),
                "automatic hook %s failed closed: %s",
@@ -1676,10 +1710,8 @@ static bool xemu_d3d_hle_fail_closed_call(
             "released\n",
             s_status_detail);
 
-    env->regs[R_EAX] = (uint32_t)E_FAIL;
-    env->regs[R_ESP] = (uint32_t)env->regs[R_ESP] + 4u + stack_bytes;
-    env->eip = return_pc - env->segs[R_CS].base;
-    return true;
+    return xemu_d3d_hle_return_hook(
+        env, hook, return_pc, (uint32_t)E_FAIL);
 }
 
 static bool xemu_d3d_hle_exec(void *opaque, CPUState *cpu, vaddr linear_pc)
@@ -1689,6 +1721,7 @@ static bool xemu_d3d_hle_exec(void *opaque, CPUState *cpu, vaddr linear_pc)
     uint32_t pc = (uint32_t)linear_pc;
     const XemuD3DHleHook *hook;
     uint32_t return_pc;
+    bool is_create_device;
 
     (void)opaque;
     if (!s_requested)
@@ -1795,6 +1828,9 @@ static bool xemu_d3d_hle_exec(void *opaque, CPUState *cpu, vaddr linear_pc)
     hook = xemu_d3d_hle_profile_find_hook(s_profile, pc);
     if (!hook)
         return false;
+    is_create_device = pc == s_profile->special.create_device ||
+        (hook->automatic &&
+         strcmp(hook->name, "Direct3D_CreateDevice") == 0);
 
     ++s_hook_entry_count;
     s_last_hook_pc = pc;
@@ -1830,6 +1866,31 @@ static bool xemu_d3d_hle_exec(void *opaque, CPUState *cpu, vaddr linear_pc)
                 xgpu_plume_f2_present(1, "spy-swap", 0, 0);
         }
         return false;
+    }
+
+    if (s_create_device_reentry_expected && is_create_device) {
+        unsigned parameters_arg = hook->source_param_count == 3u ? 1u : 4u;
+        unsigned output_arg = hook->source_param_count == 3u ? 2u : 5u;
+        uint32_t current_return_pc = xemu_d3d_hle_stack(env, 0);
+        bool exact_reentry = s_host_ready && hook->automatic &&
+            s_hook_entry_count - s_create_device_reentry_hook_count <= 64u &&
+            current_return_pc == s_create_device_reentry_return_pc &&
+            xemu_d3d_hle_public_argument(env, hook, parameters_arg) ==
+                s_create_device_reentry_parameters_va &&
+            xemu_d3d_hle_public_argument(env, hook, output_arg) ==
+                s_create_device_reentry_output_va;
+
+        s_create_device_reentry_expected = false;
+        if (exact_reentry) {
+            fprintf(stderr,
+                    "[D3D-HLE] suppressed duplicate automatic "
+                    "CreateDevice interception after native bootstrap\n");
+            return xemu_d3d_hle_return_hook(
+                env, hook, current_return_pc, (uint32_t)S_OK);
+        }
+    } else if (s_create_device_reentry_expected &&
+               s_hook_entry_count - s_create_device_reentry_hook_count > 64u) {
+        s_create_device_reentry_expected = false;
     }
 
     if (!s_host_ready &&
@@ -1914,10 +1975,6 @@ static bool xemu_d3d_hle_exec(void *opaque, CPUState *cpu, vaddr linear_pc)
 
     if (!s_host_ready) {
         HRESULT result;
-        bool is_create_device =
-            pc == s_profile->special.create_device ||
-            (hook->automatic &&
-             strcmp(hook->name, "Direct3D_CreateDevice") == 0);
 
         if (!is_create_device)
             return false;
@@ -2018,18 +2075,6 @@ static bool xemu_d3d_hle_exec(void *opaque, CPUState *cpu, vaddr linear_pc)
         d3d_hle_guest_unregister_pixel_shader(
             xemu_d3d_hle_public_argument(env, hook, 0));
         return false;
-    }
-    if (pc == s_profile->special.switch_texture &&
-        !d3d_hle_guest_adopt_switch_texture(
-            xemu_d3d_hle_public_argument(env, hook, 0),
-            xemu_d3d_hle_public_argument(env, hook, 1),
-            xemu_d3d_hle_public_argument(env, hook, 2))) {
-        fprintf(stderr,
-                "[D3D-HLE] SwitchTexture caller did not expose a valid "
-                "PixelContainer: stage=%08X data=%08X format=%08X\n",
-                xemu_d3d_hle_public_argument(env, hook, 0),
-                xemu_d3d_hle_public_argument(env, hook, 1),
-                xemu_d3d_hle_public_argument(env, hook, 2));
     }
     if (pc == s_profile->special.resource_release)
         d3d_hle_guest_note_native_resource_release(

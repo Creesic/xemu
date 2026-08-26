@@ -63,6 +63,7 @@ public:
     uint32_t height() const;
 
 private:
+    bool resizeSwapChain();
     bool m_inited = false;
     bool m_failed = false;
 

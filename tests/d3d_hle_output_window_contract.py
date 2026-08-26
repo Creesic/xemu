@@ -39,5 +39,18 @@ acquire_start = CONTEXT.index("bool PlumeContext::acquire")
 acquire_end = CONTEXT.index("\n}", acquire_start)
 acquire_body = CONTEXT[acquire_start:acquire_end]
 assert "needsResize()" in acquire_body
+assert "resizeSwapChain()" in acquire_body
+
+# Resize owns a queue-idle boundary after DXGI Present before it releases the
+# old back buffers. The D3D12 debug layer otherwise raises error #921 while a
+# live window drag is in progress.
+resize_start = CONTEXT.index("bool PlumeContext::resizeSwapChain()")
+resize_end = CONTEXT.index("\n}", resize_start)
+resize_body = CONTEXT[resize_start:resize_end]
+marker = resize_body.index("executeCommandLists")
+wait = resize_body.index("waitForCommandFence")
+release = resize_body.index("m_framebuffers.clear()")
+resize = resize_body.index("m_swapChain->resize()")
+assert marker < wait < release < resize
 
 print("d3d_hle_output_window_contract: OK")

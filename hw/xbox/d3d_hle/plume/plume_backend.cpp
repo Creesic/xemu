@@ -158,20 +158,21 @@ static bool ascii_equal_ignore_case(const char *left, const char *right)
 
 /* Pipelined present (2026-08-04 blocked-time work): defer the present fence
  * wait to the start of the next present so the GPU tail overlaps guest CPU
- * work instead of blocking submitAndPresent. Default off; presents that
- * record surface downloads or an F2 capture, and runs with the async-present
- * worker, always take the synchronous path. */
+ * work instead of blocking submitAndPresent. Default on; F2 captures and the
+ * async-present worker keep their synchronous path, while ordinary downloads
+ * are retired with the deferred present. Set the environment value to
+ * 0/false/no/off to restore synchronous presents. */
 static bool plume_present_pipeline_enabled()
 {
     static const bool enabled = []() {
         const char *value =
             std::getenv("XRECOMP_PLUME_PRESENT_PIPELINE");
         if (!value || !*value)
-            return false;
-        return std::strcmp(value, "1") == 0 ||
-               ascii_equal_ignore_case(value, "true") ||
-               ascii_equal_ignore_case(value, "yes") ||
-               ascii_equal_ignore_case(value, "on");
+            return true;
+        return std::strcmp(value, "0") != 0 &&
+               !ascii_equal_ignore_case(value, "false") &&
+               !ascii_equal_ignore_case(value, "no") &&
+               !ascii_equal_ignore_case(value, "off");
     }();
     return enabled && !xgpu::plume::plume_render_worker_enabled();
 }
@@ -440,6 +441,7 @@ static void plume_reset_guest_session_state()
 {
     /* Stop the optional worker before touching owner-state/RHI objects. */
     xgpu::plume::plume_render_worker_sync();
+    xgpu::plume::waitForShaderCompiles();
     plume_retire_pending_present();
     plume_wait_ring_drain();
     g_draw.releaseSubmittedResources();
@@ -1453,6 +1455,14 @@ void xgpu_plume_mesh_cache_invalidate_va(uint32_t resource_data_va)
 int xgpu_plume_present_host_frame(const void *pixels, uint32_t w, uint32_t h,
                                   uint32_t pitch)
 {
+    return xgpu_plume_present_host_frame_format(
+        pixels, w, h, pitch, 0xFFFFFFFFu);
+}
+
+int xgpu_plume_present_host_frame_format(const void *pixels, uint32_t w,
+                                         uint32_t h, uint32_t pitch,
+                                         uint32_t format)
+{
     /* Owner-state/RHI entry: finish any in-flight worker job first. */
     xgpu::plume::plume_render_worker_sync();
     static uint64_t version;
@@ -1462,14 +1472,16 @@ int xgpu_plume_present_host_frame(const void *pixels, uint32_t w, uint32_t h,
         return 0;
     uint64_t perf_record_t0 = xgpu_plume_perf_begin();
     bool recorded =
-        g_draw.queueHostFrame(g_ctx, pixels, w, h, pitch, ++version);
+        g_draw.queueHostFrame(g_ctx, pixels, w, h, pitch, format, ++version);
     xgpu_plume_perf_end(XGPU_PLUME_PERF_RECORD, perf_record_t0);
     if (!recorded)
         return 0;
     g_frame_dirty = true;
 
     if (!logged) {
-        fprintf(stderr, "[PLUME] host RGBA frame path active (%ux%u)\n", w, h);
+        fprintf(stderr,
+                "[PLUME] host frame path active (%ux%u format=%08X)\n",
+                w, h, format);
         logged = true;
     }
     g_pending_present_reason = PLUME_PRESENT_HOST_FRAME;

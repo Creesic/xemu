@@ -3,6 +3,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = (ROOT / "hw/xbox/d3d_hle/d3d_hle_device_switch_texture.c").read_text()
+FRONTEND = (ROOT / "hw/xbox/d3d_hle/xemu_d3d_hle.c").read_text()
 HEADER = (ROOT / "hw/xbox/d3d_hle/d3d_hle_guest.h").read_text()
 GUEST = (ROOT / "hw/xbox/d3d_hle/d3d_hle_guest.c").read_text()
 
@@ -10,6 +11,7 @@ assert "extern uint32_t g_esi;" in WRAPPER
 assert "d3d_hle_device_switch_texture_gen_unused();" in WRAPPER
 assert "d3d_hle_guest_adopt_switch_texture(g_esi, g_edx, format);" in WRAPPER
 assert "d3d_hle_guest_switch_texture(g_ecx, g_edx, format);" in WRAPPER
+assert "d3d_hle_guest_adopt_switch_texture(" not in FRONTEND
 assert "d3d_hle_guest_adopt_switch_texture(" in HEADER
 
 start = GUEST.index("int d3d_hle_guest_adopt_switch_texture(")

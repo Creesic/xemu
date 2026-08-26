@@ -23,6 +23,8 @@ struct PlumeViewportTransform {
 ::plume::RenderBlendDesc plume_blend_desc_from_d3d(
     const XgpuPlumeRenderState &state);
 
+::plume::RenderColor plume_blend_factor_from_xgpu(uint32_t color);
+
 ::plume::RenderFormat plume_depth_format_from_xgpu(uint32_t zetaFormat,
                                                     uint32_t zetaFloat);
 

@@ -31,6 +31,7 @@
 #include "plume_wait_stats.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -228,6 +229,24 @@ ShaderCompileResult compileForContext(PlumeContext &ctx, const char *source,
         shaderTargetForRenderFormat(
             ctx.iface()->getCapabilities().shaderFormat),
         source, entryPoint, profile);
+}
+
+std::future<ShaderCompileResult> queueShaderCompile(
+    ShaderTarget target, const std::string &source, const char *profile)
+{
+    ShaderCompileRequest request;
+    request.source = source.c_str();
+    request.entryPoint = "main";
+    request.profile = profile;
+    request.target = target;
+    return compileShaderAsync(request);
+}
+
+bool shaderCompileReady(std::future<ShaderCompileResult> &future)
+{
+    return future.valid() &&
+           future.wait_for(std::chrono::seconds(0)) ==
+               std::future_status::ready;
 }
 
 void f2_dump_linear_r5g6b5(uint32_t guest, const void *pixels,
@@ -1239,12 +1258,18 @@ bool PlumeDraw::initPipelines(PlumeContext &ctx)
             PlumePixelShader fallback;
             fallback.hlsl = plumeFixedFallbackPixelShaderHlsl();
             fallback.ok = true;
+            fallback.compileFuture = queueShaderCompile(
+                m_recordShaderTarget, fallback.hlsl, "ps_6_0");
             m_fixedFallbackPS = m_psNext++;
             m_psReg.emplace(m_fixedFallbackPS, std::move(fallback));
 
             PlumePixelShader fallbackW;
             fallbackW.hlsl = plumeFixedFallbackWPixelShaderHlsl();
             fallbackW.ok = !fallbackW.hlsl.empty();
+            if (fallbackW.ok) {
+                fallbackW.compileFuture = queueShaderCompile(
+                    m_recordShaderTarget, fallbackW.hlsl, "ps_6_0");
+            }
             m_fixedFallbackPSW = m_psNext++;
             m_psReg.emplace(m_fixedFallbackPSW, std::move(fallbackW));
         }
@@ -1650,7 +1675,7 @@ void PlumeDraw::setTexture(uint32_t stage, uint32_t guest, const void *pixels,
     requested.version = version;
     requested.cube = cube;
     requested.unnormalized_coords = unnormalizedCoords;
-    if (bindTextureIfCached(requested))
+    if (guest != kHostFrameGuest && bindTextureIfCached(requested))
         return;
 
     /* Gate 3: the guest snapshots the payload and latches value state
@@ -1678,7 +1703,8 @@ void PlumeDraw::setTexture(uint32_t stage, uint32_t guest, const void *pixels,
  * simply leaves the binding unresolvable, so affected draws sample the
  * white fallback exactly like an unsupported format. */
 void PlumeDraw::uploadRecordedTexture(PlumeContext &ctx,
-                                      RecordedTextureUpload &&upload)
+                                      RecordedTextureUpload &&upload,
+                                      RenderCommandList *cmdList)
 {
     const RecordedTextureBinding &rb = upload.binding;
     const uint32_t guest = rb.guest;
@@ -1695,17 +1721,35 @@ void PlumeDraw::uploadRecordedTexture(PlumeContext &ctx,
     const uint32_t dimensionality = rb.dimensionality;
     const uint32_t cube = rb.cube;
     const uint32_t unnormalizedCoords = rb.unnormalizedCoords;
-    (void)guest;
+    const bool hostFrame = guest == kHostFrameGuest;
     RenderFormat pf;
     if (!plume_map_texfmt(format, pf))
         return;
+    auto *hostCurrent = hostFrame ? m_textures.current(guest) : nullptr;
+    const bool reuseHostTexture = hostCurrent &&
+        hostCurrent->resource.tex && hostCurrent->resource.view &&
+        hostCurrent->resource.descSet && hostCurrent->resource.w == w &&
+        hostCurrent->resource.h == h && hostCurrent->resource.d == depth &&
+        hostCurrent->resource.levels == textureLevels &&
+        hostCurrent->resource.dimension == dimensionality &&
+        hostCurrent->resource.fmt == format &&
+        hostCurrent->resource.cube == cube;
+    PlumeTex fresh;
+    PlumeTex &t = reuseHostTexture ? hostCurrent->resource : fresh;
+    t.w = w; t.h = h; t.d = depth; t.levels = textureLevels;
+    t.dimension = dimensionality; t.fmt = format; t.bytes = bytes;
+    t.cube = cube;
+    t.unnormalizedCoords = unnormalizedCoords;
+    t.version = version;
     /* Deferred-failure semantics: nothing to clear on the guest; the
      * binding just never resolves. */
     auto clear_stage = [&]() {};
     const void *uploadPixels = pixels;
     uint32_t uploadPitch = pitch;
     uint32_t uploadBytes = bytes;
-    std::vector<uint8_t> converted;
+    std::vector<uint8_t> convertedStorage;
+    std::vector<uint8_t> &converted =
+        hostFrame ? t.hostConverted : convertedStorage;
     if (format == 0x11) {
         uint64_t sourceOffset = 0;
         uint64_t convertedBytes64 = 0;
@@ -1828,13 +1872,6 @@ void PlumeDraw::uploadRecordedTexture(PlumeContext &ctx,
                    format, pixels, bytes, converted)) {
         uploadPixels = converted.data();
     }
-
-    PlumeTex t;
-    t.w = w; t.h = h; t.d = depth; t.levels = textureLevels;
-    t.dimension = dimensionality; t.fmt = format; t.bytes = bytes;
-    t.cube = cube;
-    t.unnormalizedCoords = unnormalizedCoords;
-    t.version = version;
 
     if (cube) {
         /* NV2A cubemap: 6 consecutive faces (+X,-X,+Y,-Y,+Z,-Z), each face a
@@ -2057,27 +2094,39 @@ void PlumeDraw::uploadRecordedTexture(PlumeContext &ctx,
             clear_stage();
             return;
         }
-        t.tex = ctx.device()->createTexture(
-            RenderTextureDesc::Texture2D(w, h, textureLevels, pf));
-        if (!t.tex) { clear_stage(); return; }
-        RenderTextureViewDesc viewDesc = RenderTextureViewDesc::Texture2D(pf);
-        if (format == 0x19 || format == 0x1F) {
-            /* A8 / LIN_A8: alpha-only; RGB sample as 1.0. */
-            viewDesc.componentMapping = RenderComponentMapping(
-                RenderSwizzle::ONE, RenderSwizzle::ONE,
-                RenderSwizzle::ONE, RenderSwizzle::R);
-        } else if (format == 0x35) {
-            viewDesc.componentMapping = RenderComponentMapping(
-                RenderSwizzle::R, RenderSwizzle::R,
-                RenderSwizzle::R, RenderSwizzle::ONE);
+        if (!reuseHostTexture) {
+            t.tex = ctx.device()->createTexture(
+                RenderTextureDesc::Texture2D(w, h, textureLevels, pf));
+            if (!t.tex) { clear_stage(); return; }
+            RenderTextureViewDesc viewDesc =
+                RenderTextureViewDesc::Texture2D(pf);
+            if (format == 0x19 || format == 0x1F) {
+                /* A8 / LIN_A8: alpha-only; RGB sample as 1.0. */
+                viewDesc.componentMapping = RenderComponentMapping(
+                    RenderSwizzle::ONE, RenderSwizzle::ONE,
+                    RenderSwizzle::ONE, RenderSwizzle::R);
+            } else if (format == 0x35) {
+                viewDesc.componentMapping = RenderComponentMapping(
+                    RenderSwizzle::R, RenderSwizzle::R,
+                    RenderSwizzle::R, RenderSwizzle::ONE);
+            }
+            t.view = t.tex->createTextureView(viewDesc);
+            if (!t.view) { clear_stage(); return; }
         }
-        t.view = t.tex->createTextureView(viewDesc);
-        if (!t.view) { clear_stage(); return; }
 
         std::unique_ptr<RenderBuffer> staging =
-            ctx.device()->createBuffer(RenderBufferDesc::UploadBuffer(stagingBytes));
-        if (!staging) { clear_stage(); return; }
-        uint8_t *dst = (uint8_t *)staging->map();
+            hostFrame ? nullptr : ctx.device()->createBuffer(
+                RenderBufferDesc::UploadBuffer(stagingBytes));
+        if (hostFrame &&
+            (!t.hostUpload || t.hostUploadBytes < stagingBytes)) {
+            t.hostUpload = ctx.device()->createBuffer(
+                RenderBufferDesc::UploadBuffer(stagingBytes));
+            t.hostUploadBytes = t.hostUpload ? stagingBytes : 0;
+        }
+        RenderBuffer *stagingBuffer =
+            hostFrame ? t.hostUpload.get() : staging.get();
+        if (!stagingBuffer) { clear_stage(); return; }
+        uint8_t *dst = (uint8_t *)stagingBuffer->map();
         if (!dst) { clear_stage(); return; }
         const uint8_t *src = (const uint8_t *)uploadPixels;
         std::memset(dst, 0, stagingBytes);
@@ -2092,17 +2141,19 @@ void PlumeDraw::uploadRecordedTexture(PlumeContext &ctx,
                             copyPitch);
             }
         }
-        staging->unmap();
+        stagingBuffer->unmap();
 
-        RenderCommandList *up = ctx.uploadCmd();
-        up->begin();
+        RenderCommandList *up = hostFrame ? cmdList : ctx.uploadCmd();
+        if (!up) { clear_stage(); return; }
+        if (!hostFrame)
+            up->begin();
         up->barriers(RenderBarrierStage::COPY,
                      RenderTextureBarrier(t.tex.get(), RenderTextureLayout::COPY_DEST));
         for (uint32_t level = 0; level < mips.size(); level++) {
             const TextureMip &mip = mips[level];
             RenderTextureCopyLocation srcLoc =
                 RenderTextureCopyLocation::PlacedFootprint(
-                    staging.get(), pf, mip.width, mip.height, 1,
+                    stagingBuffer, pf, mip.width, mip.height, 1,
                     mip.rowWidth, mip.uploadOffset);
             RenderTextureCopyLocation dstLoc =
                 RenderTextureCopyLocation::Subresource(t.tex.get(), level, 0);
@@ -2110,12 +2161,15 @@ void PlumeDraw::uploadRecordedTexture(PlumeContext &ctx,
         }
         up->barriers(RenderBarrierStage::GRAPHICS,
                      RenderTextureBarrier(t.tex.get(), RenderTextureLayout::SHADER_READ));
-        up->end();
-        const RenderCommandList *cl = up;
-        ctx.queue()->executeCommandLists(&cl, 1, nullptr, 0, nullptr, 0, ctx.fence());
-        uint64_t wait_t0 = xgpu_plume_wait_stats_begin();
-        ctx.queue()->waitForCommandFence(ctx.fence());
-        xgpu_plume_wait_stats_end(XGPU_PLUME_WAIT_TEX_UPLOAD, wait_t0);
+        if (!hostFrame) {
+            up->end();
+            const RenderCommandList *cl = up;
+            ctx.queue()->executeCommandLists(
+                &cl, 1, nullptr, 0, nullptr, 0, ctx.fence());
+            uint64_t wait_t0 = xgpu_plume_wait_stats_begin();
+            ctx.queue()->waitForCommandFence(ctx.fence());
+            xgpu_plume_wait_stats_end(XGPU_PLUME_WAIT_TEX_UPLOAD, wait_t0);
+        }
     }
 
     const RenderSampler *immutableTexSampler = m_texSampler.get();
@@ -2124,18 +2178,26 @@ void PlumeDraw::uploadRecordedTexture(PlumeContext &ctx,
         RenderDescriptorRange(RenderDescriptorRangeType::SAMPLER, 1, 1,
                               &immutableTexSampler),
     };
-    RenderDescriptorSetDesc dsd(ranges, 2);
-    t.descSet = ctx.device()->createDescriptorSet(dsd);
-    t.descSet->setTexture(0, t.tex.get(), RenderTextureLayout::SHADER_READ, t.view.get());
+    if (!reuseHostTexture) {
+        RenderDescriptorSetDesc dsd(ranges, 2);
+        t.descSet = ctx.device()->createDescriptorSet(dsd);
+        if (!t.descSet) { clear_stage(); return; }
+        t.descSet->setTexture(
+            0, t.tex.get(), RenderTextureLayout::SHADER_READ, t.view.get());
+    }
 
-    (void)m_textures.replace(rb, std::move(t));
+    if (reuseHostTexture)
+        hostCurrent->binding = rb;
+    else
+        (void)m_textures.replace(rb, std::move(fresh));
 }
 
 void PlumeDraw::consumeTextureUploads(PlumeContext &ctx,
-                                      FrameRecording &recording)
+                                      FrameRecording &recording,
+                                      RenderCommandList *cmdList)
 {
     for (RecordedTextureUpload &upload : recording.textureUploads)
-        uploadRecordedTexture(ctx, std::move(upload));
+        uploadRecordedTexture(ctx, std::move(upload), cmdList);
     recording.textureUploads.clear();
 }
 
@@ -3235,9 +3297,13 @@ template <class Draw>
         if (ps.bytecode.empty()) {
             if (!ps.compileRetry.shouldAttempt())
                 return nullptr;
-            XRECOMP_TRACY_ZONE_SCOPED("Plume Compile Pixel Shader");
-            ShaderCompileResult compiled =
-                compileForContext(ctx, ps.hlsl.c_str(), "main", "ps_6_0");
+            if (!ps.compileFuture.valid()) {
+                ps.compileFuture = queueShaderCompile(
+                    m_recordShaderTarget, ps.hlsl, "ps_6_0");
+            }
+            if (!shaderCompileReady(ps.compileFuture))
+                return nullptr;
+            ShaderCompileResult compiled = ps.compileFuture.get();
             if (!compiled.ok) {
                 /*
                  * Translation validity and a runtime compiler failure are
@@ -3248,6 +3314,8 @@ template <class Draw>
                  */
                 ps.compileRetry.noteFailure();
                 ps.diagnostics = compiled.diagnostics;
+                std::fprintf(stderr, "[PLUME] shader compile failed: %s\n",
+                             ps.diagnostics.c_str());
                 return nullptr;
             }
             ps.compileRetry.noteSuccess();
@@ -3328,6 +3396,7 @@ void PlumeDraw::pollPixelShaderOverrides(PlumeContext &ctx)
         ps.hlsl = std::move(source);
         ps.compileRetry.noteSourceChange();
         ps.compileRetry.noteSuccess();
+        ps.compileFuture = {};
         ps.bytecode = std::move(compiled.bytecode);
         ps.entryPoint = std::move(compiled.entryPoint);
         ps.target = compiled.target;
@@ -3351,12 +3420,18 @@ void PlumeDraw::pollPixelShaderOverrides(PlumeContext &ctx)
     PlumeVertexShader &vs = it->second;
     if (!vs.shader) {
         if (vs.bytecode.empty()) {
-            XRECOMP_TRACY_ZONE_SCOPED("Plume Compile Vertex Shader");
-            ShaderCompileResult compiled =
-                compileForContext(ctx, vs.hlsl.c_str(), "main", "vs_6_0");
+            if (!vs.compileFuture.valid()) {
+                vs.compileFuture = queueShaderCompile(
+                    m_recordShaderTarget, vs.hlsl, "vs_6_0");
+            }
+            if (!shaderCompileReady(vs.compileFuture))
+                return nullptr;
+            ShaderCompileResult compiled = vs.compileFuture.get();
             if (!compiled.ok) {
                 vs.diagnostics = compiled.diagnostics;
                 vs.ok = false;
+                std::fprintf(stderr, "[PLUME] shader compile failed: %s\n",
+                             vs.diagnostics.c_str());
                 return nullptr;
             }
             vs.diagnostics.clear();
@@ -4495,9 +4570,12 @@ XgpuPlumeGpuDrawResult PlumeDraw::recordProgIndexedDraw(
 }
 
 bool PlumeDraw::queueHostFrame(PlumeContext &ctx, const void *pixels, uint32_t w,
-                               uint32_t h, uint32_t pitch, uint64_t version)
+                               uint32_t h, uint32_t pitch, uint32_t format,
+                               uint64_t version)
 {
     if (!pixels || !w || !h || !pitch)
+        return false;
+    if (format != kHostFrameFormat && format != 0x24u && format != 0x25u)
         return false;
 
     const uint64_t byteCount = (uint64_t)pitch * h;
@@ -4505,7 +4583,7 @@ bool PlumeDraw::queueHostFrame(PlumeContext &ctx, const void *pixels, uint32_t w
         return false;
 
     setTexture(0, kHostFrameGuest, pixels, w, h, pitch,
-               (uint32_t)byteCount, kHostFrameFormat, version);
+               (uint32_t)byteCount, format, version);
     if (!m_curTextureStage[0].valid())
         return false;
 
@@ -4879,10 +4957,30 @@ int PlumeDraw::setVertexProgram(const uint32_t *microcode, uint32_t length,
     }
     auto it = m_guestVertexPrograms.find(key);
     if (it != m_guestVertexPrograms.end()) {
-        m_curVertexInputs = it->second.inputsRead;
-        if (it->second.ok)
+        GuestVertexProgram &guestProgram = it->second;
+        m_curVertexInputs = guestProgram.inputsRead;
+        if (!guestProgram.ok &&
+            shaderCompileReady(guestProgram.compileFuture)) {
+            ShaderCompileResult compiled =
+                guestProgram.compileFuture.get();
+            if (compiled.ok) {
+                VertexProgramCommand command;
+                command.key = key;
+                command.inputsRead = guestProgram.inputsRead;
+                command.target = compiled.target;
+                command.entryPoint = std::move(compiled.entryPoint);
+                command.bytecode = std::move(compiled.bytecode);
+                m_rec.vertexPrograms.push_back(std::move(command));
+                guestProgram.ok = true;
+            } else {
+                std::fprintf(stderr,
+                             "[PLUME] shader compile failed: %s\n",
+                             compiled.diagnostics.c_str());
+            }
+        }
+        if (guestProgram.ok)
             m_curVertexProgramKey = key;
-        return it->second.ok ? 1 : 0;
+        return guestProgram.ok ? 1 : 0;
     }
 
     GuestVertexProgram guestProgram;
@@ -4893,25 +4991,12 @@ int PlumeDraw::setVertexProgram(const uint32_t *microcode, uint32_t length,
     static char hlsl[96 * 1024];
     int n = d3d8_vsh_generate_hlsl(&prog, vertexFormat, hlsl, (int)sizeof(hlsl));
     if (n > 0) {
-        XRECOMP_TRACY_ZONE_SCOPED("Plume Compile Vertex Shader");
-        ShaderCompileResult compiled =
-            compileForTarget(m_recordShaderTarget, hlsl, "main", "vs_6_0");
-        if (compiled.ok) {
-            VertexProgramCommand command;
-            command.key = key;
-            command.inputsRead = prog.inputs_read;
-            command.target = compiled.target;
-            command.entryPoint = std::move(compiled.entryPoint);
-            command.bytecode = std::move(compiled.bytecode);
-            m_rec.vertexPrograms.push_back(std::move(command));
-            guestProgram.ok = true;
-        }
+        guestProgram.compileFuture = queueShaderCompile(
+            m_recordShaderTarget, std::string(hlsl, static_cast<size_t>(n)),
+            "vs_6_0");
     }
-    const bool ok = guestProgram.ok;
-    m_guestVertexPrograms.emplace(key, guestProgram);
-    if (ok)
-        m_curVertexProgramKey = key;
-    return ok ? 1 : 0;
+    m_guestVertexPrograms.emplace(key, std::move(guestProgram));
+    return 0;
 }
 
 void PlumeDraw::consumeVertexPrograms(PlumeContext &ctx,
@@ -4959,6 +5044,10 @@ uint32_t PlumeDraw::createPixelShader(const char *text)
         tr.hlsl.find("cbuffer CombinerConsts") != std::string::npos ||
         tr.hlsl.find("cbuffer CombinerCB") != std::string::npos;
     ps.ok = !tr.hlsl.empty();
+    if (ps.ok && m_pipelinesReady) {
+        ps.compileFuture = queueShaderCompile(
+            m_recordShaderTarget, ps.hlsl, "ps_6_0");
+    }
 
     uint32_t h = m_psNext++;
     (void)seed_live_pixel_shader(
@@ -5021,6 +5110,8 @@ bool PlumeDraw::registerVertexShader(
         shader.hasDeclaration = true;
     }
     shader.ok = true;
+    shader.compileFuture = queueShaderCompile(
+        m_recordShaderTarget, shader.hlsl, "vs_6_0");
     m_vsReg[handle] = std::move(shader);
     m_progPsos.clear();
     return true;
@@ -5451,7 +5542,7 @@ void PlumeDraw::replayRecording(
     /* Materialize logical surface generations before write publication or
      * draw replay, then publish texture payloads before resolving bindings. */
     consumeSurfaceBindings(ctx, rec);
-    consumeTextureUploads(ctx, rec);
+    consumeTextureUploads(ctx, rec, cl);
     consumeVertexPrograms(ctx, rec);
     /* Surface cache serials are render-owned. Apply the guest's recorded
      * write intent here before any early replay rejection, preserving the
@@ -6081,6 +6172,8 @@ void PlumeDraw::replayRecording(
         cl->setPipeline(pso);
         cl->setGraphicsPushConstants(0, &pushConstants);
         cl->setGraphicsDescriptorSet(set, 0);
+        cl->setBlendFactor(
+            plume_blend_factor_from_xgpu(pd.renderState.blend_color));
         RenderVertexBufferView vbv(
             RenderBufferReference(sub.rawVbuf.get(), pd.vbufOffset), pd.vbufBytes);
         RenderInputSlot vslot(0, pd.stride);
@@ -6549,6 +6642,8 @@ void PlumeDraw::replayRecording(
             cl->setPipeline(pso);
             cl->setGraphicsPushConstants(0, &pushConstants);
         }
+        cl->setBlendFactor(
+            plume_blend_factor_from_xgpu(d.renderState.blend_color));
         cl->setVertexBuffers(0, &view, 1, &slot);
         if (d.indexCount) {
             ::plume::RenderBuffer *geomIb = sub.ibuf.get();

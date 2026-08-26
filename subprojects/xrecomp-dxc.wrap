@@ -1,0 +1,7 @@
+[wrap-file]
+directory = xrecomp-dxc-1.9.2602.24
+source_url = https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2602.24/dxc_2026_05_27.zip
+source_filename = dxc_2026_05_27.zip
+source_hash = cf658aacf070d3045e31b8f1f8a696c2945f37c1095019481ef7c513368db3b4
+lead_directory_missing = true
+patch_directory = xrecomp-dxc

@@ -26,6 +26,7 @@ from pathlib import Path
 
 SRC = Path(__file__).resolve().parents[1] / \
     "hw/xbox/d3d_hle/plume/plume_draw.cpp"
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def extract_function(text, marker):
@@ -77,6 +78,36 @@ def main():
     assert "convert_uyvy_to_rgb" in upload, (
         "UYVY conversion must call the pgraph oracle convert_uyvy_to_rgb"
     )
+
+    guest = (ROOT / "hw/xbox/d3d_hle/d3d_hle_guest.c").read_text(
+        encoding="utf-8", errors="replace")
+    overlay = extract_function(guest, "HRESULT d3d_hle_guest_update_overlay")
+    assert "xgpu_plume_present_host_frame_format" in overlay
+    assert "surface->format" in overlay
+    assert "malloc" not in overlay and "free(" not in overlay
+    assert "convert_yuy2_to_rgb" not in overlay
+
+    queue = extract_function(text, "bool PlumeDraw::queueHostFrame")
+    assert "uint32_t format" in queue
+    assert "(uint32_t)byteCount, format, version" in queue
+    assert "guest != kHostFrameGuest && bindTextureIfCached" in text
+
+    # Movie resources and upload storage persist; their copy is recorded on
+    # the already-active present command list instead of a separately fenced
+    # upload submission.
+    assert "reuseHostTexture" in upload
+    assert "t.hostUpload" in upload and "t.hostConverted" in upload
+    assert "hostFrame ? cmdList : ctx.uploadCmd()" in upload
+    host_submit = upload[upload.index("hostFrame ? cmdList"):]
+    assert "if (!hostFrame)" in host_submit
+
+    backend = (ROOT / "hw/xbox/d3d_hle/plume/plume_backend.cpp").read_text(
+        encoding="utf-8", errors="replace")
+    pipeline = extract_function(
+        backend, "static bool plume_present_pipeline_enabled")
+    assert "if (!value || !*value)\n            return true;" in pipeline
+    assert 'ascii_equal_ignore_case(value, "false")' in pipeline
+    assert "xgpu_plume_present_host_frame_format" in backend
     print("d3d_hle_yuv_texture_contract: OK")
 
 

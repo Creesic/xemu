@@ -19,6 +19,31 @@ specific_ss.add(files(
 	))
 
 if host_os == 'windows'
+  xrecomp_dxc_release_tag = 'v1.9.2602.24'
+  xrecomp_dxc_archive_url = 'https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2602.24/dxc_2026_05_27.zip'
+  xrecomp_dxc_archive_sha256 = 'cf658aacf070d3045e31b8f1f8a696c2945f37c1095019481ef7c513368db3b4'
+  xrecomp_dxc = subproject('xrecomp-dxc', required: true)
+  xrecomp_dxc_root = xrecomp_dxc.get_variable('xrecomp_dxc_root')
+  xrecomp_dxc_arch = xrecomp_dxc.get_variable('xrecomp_dxc_arch')
+  xrecomp_dxc_payloads = xrecomp_dxc.get_variable('xrecomp_dxc_payloads')
+  xrecomp_dxc_generated = meson.current_build_dir() / 'd3d_hle' / 'plume'
+  run_command(
+    python,
+    files('../../scripts/xemu-prepare-embedded-dxc.py'),
+    '--root', xrecomp_dxc_root,
+    '--arch', xrecomp_dxc_arch,
+    '--manifest-template', files('d3d_hle/plume/plume_embedded_dxc_manifest.h.in'),
+    '--resource-template', files('d3d_hle/plume/plume_embedded_dxc.rc.in'),
+    '--output-dir', xrecomp_dxc_generated,
+    '--release-tag', xrecomp_dxc_release_tag,
+    '--archive-url', xrecomp_dxc_archive_url,
+    '--archive-sha256', xrecomp_dxc_archive_sha256,
+    check: true,
+  )
+  xrecomp_dxc_resource = import('windows').compile_resources(
+    xrecomp_dxc_generated / 'plume_embedded_dxc.rc',
+    depend_files: xrecomp_dxc_payloads,
+  )
   xemu_plume_d3d12_source = custom_target(
     'xemu-plume-d3d12.cpp',
     input: files('../../thirdparty/plume/plume_d3d12.cpp'),
@@ -44,7 +69,7 @@ if host_os == 'windows'
       '-DPLUME_D3D12_ENABLED=1',
       '-DWIN32_LEAN_AND_MEAN',
       '-DNOMINMAX',
-      '-DXEMU_D3D_HLE_NO_DXC_LIBRARY=1',
+      '-DXRECOMP_DXC_EMBEDDED=1',
       '-D_CRT_SECURE_NO_WARNINGS',
       '-DXRECOMP_D3D_HLE_CONFIG_AVAILABLE=1',
       '-DXRECOMP_D3D_HLE_PLAN_READY=1',
@@ -57,6 +82,7 @@ if host_os == 'windows'
       cc.find_library('d3d12', required: true),
       cc.find_library('dxgi', required: true),
       cc.find_library('dxguid', required: true),
+      cc.find_library('bcrypt', required: true),
     ],
   )
   specific_ss.add(files(
@@ -111,6 +137,7 @@ if host_os == 'windows'
     'd3d_hle/d3d8_vsh.c',
     'd3d_hle/xps_translate.cpp',
     'd3d_hle/plume/plume_shader_compiler.cpp',
+    'd3d_hle/plume/plume_embedded_dxc_win32.cpp',
     'd3d_hle/plume/plume_backend.cpp',
     'd3d_hle/plume/plume_render_worker.cpp',
     'd3d_hle/plume/plume_backend_factory.cpp',
@@ -135,7 +162,7 @@ if host_os == 'windows'
     '../../thirdparty/xbsymbol-database/src/lib/libXbSymbolDatabase.c',
     '../../thirdparty/xbsymbol-database/src/OOVPADatabase/D3D8_OOVPA.c',
     '../../thirdparty/xbsymbol-database/src/OOVPADatabase/D3D8LTCG_OOVPA.c',
-  ), xemu_plume_d3d12_source, xemu_d3d_hle_dep)
+  ), xemu_plume_d3d12_source, xrecomp_dxc_resource, xemu_d3d_hle_dep)
 else
   specific_ss.add(files('d3d_hle/xemu_d3d_hle_disabled.c'))
 endif

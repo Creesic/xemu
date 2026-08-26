@@ -4,6 +4,7 @@
 #include "plume_render_interface_types.h"
 
 #include <cstdint>
+#include <future>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,9 @@ std::vector<std::string> buildDxcArguments(
     const std::string &inputPath,
     const std::string &outputPath);
 ShaderCompileResult compileShader(const ShaderCompileRequest &request);
+std::future<ShaderCompileResult> compileShaderAsync(
+    const ShaderCompileRequest &request);
+void waitForShaderCompiles();
 
 ShaderTarget shaderTargetForRenderFormat(::plume::RenderShaderFormat format);
 ::plume::RenderShaderFormat renderShaderFormatForTarget(ShaderTarget target);

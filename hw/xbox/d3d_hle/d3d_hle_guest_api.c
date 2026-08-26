@@ -200,14 +200,6 @@ void d3d_hle_device_release(void)
     RET(d3d_hle_guest_device_release());
 }
 
-extern void d3d_hle_device_block_until_vertical_blank_gen_unused(void);
-void d3d_hle_device_block_until_vertical_blank(void)
-{
-    HLE_FALLBACK(d3d_hle_device_block_until_vertical_blank);
-    d3d_hle_guest_stdcall_return(0);
-    d3d_hle_guest_block_until_vertical_blank();
-}
-
 #define DEFINE_STACK_STATE_WRAPPER(symbol, state_value)                    \
     extern void symbol##_gen_unused(void);                                  \
     void symbol(void)                                                       \
@@ -608,14 +600,21 @@ void d3d_hle_device_draw_vertices_up(void)
 extern void d3d_hle_device_draw_indexed_vertices_up_gen_unused(void);
 void d3d_hle_device_draw_indexed_vertices_up(void)
 {
-    uint32_t a[5];
-    unsigned i;
+    uint32_t primitive_type;
+    uint32_t vertex_count;
+    uint32_t indices_va;
+    uint32_t vertices_va;
+    uint32_t stride;
+
     HLE_FALLBACK(d3d_hle_device_draw_indexed_vertices_up);
-    for (i = 0; i < 5; ++i)
-        a[i] = d3d_hle_guest_stack_u32(i);
-    d3d_hle_guest_stdcall_return(20);
+    primitive_type = d3d_hle_guest_stack_u32(0);
+    vertex_count = g_eax;
+    indices_va = d3d_hle_guest_stack_u32(1);
+    vertices_va = d3d_hle_guest_stack_u32(2);
+    stride = d3d_hle_guest_stack_u32(3);
+    d3d_hle_guest_stdcall_return(16);
     d3d_hle_guest_draw_indexed_vertices_up(
-        a[0], a[1], a[2], a[3], a[4]);
+        primitive_type, vertex_count, indices_va, vertices_va, stride);
 }
 
 extern void d3d_hle_device_set_vertex_data4f_gen_unused(void);
@@ -966,6 +965,14 @@ DEFINE_STD_WRAPPER(d3d_hle_device_set_vertex_data4ub_std, 5,
         a[0], a[1], a[2], a[3], a[4]))
 
 /* Spy-census called holes: shared automatic-attach wrappers. */
+DEFINE_STD_WRAPPER(d3d_hle_noop_std_0, 0, RET(S_OK))
+DEFINE_STD_WRAPPER(d3d_hle_noop_std_1, 1, RET(S_OK))
+DEFINE_STD_WRAPPER(d3d_hle_noop_std_2, 2, RET(S_OK))
+DEFINE_STD_WRAPPER(d3d_hle_noop_std_6, 6, RET(S_OK))
+DEFINE_STD_WRAPPER(d3d_hle_destroy_resource_std, 1,
+    d3d_hle_guest_destroy_resource_by_va(a[0]))
+DEFINE_STD_WRAPPER(d3d_hle_cdevice_kickoff_std, 1,
+    d3d_hle_guest_kick_push_buffer())
 DEFINE_STD_WRAPPER(d3d_hle_device_set_render_state_not_inline_std, 2,
     d3d_hle_guest_set_render_state((D3DRENDERSTATETYPE)a[0], a[1]))
 DEFINE_STD_WRAPPER(d3d_hle_device_block_on_fence_std, 1,
@@ -1010,10 +1017,16 @@ DEFINE_STD_WRAPPER(d3d_hle_device_end_push_std, 1,
     d3d_hle_guest_end_push(a[0]))
 DEFINE_STD_WRAPPER(d3d_hle_device_kick_push_buffer_std, 0,
     d3d_hle_guest_kick_push_buffer())
+DEFINE_STD_WRAPPER(d3d_hle_device_end_push_buffer_std, 0,
+    (d3d_hle_guest_kick_push_buffer(), RET(S_OK)))
 DEFINE_STD_WRAPPER(d3d_hle_device_begin_state_big_std, 1,
     d3d_hle_guest_begin_state_big(a[0]))
 DEFINE_STD_WRAPPER(d3d_hle_make_requested_space_std, 2,
     d3d_hle_guest_make_requested_space(a[0], a[1]))
+DEFINE_STD_WRAPPER(d3d_hle_device_create_palette2_std, 1,
+    RET(d3d_hle_guest_create_palette2(a[0])))
+DEFINE_STD_WRAPPER(d3d_hle_device_create_image_surface_std, 4,
+    RET(d3d_hle_guest_create_image_surface(a[0], a[1], a[2], a[3])))
 
 /* BeginPush(Count) returns the write pointer in eax. */
 extern void d3d_hle_device_begin_push_std_gen_unused(void);

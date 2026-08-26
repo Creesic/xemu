@@ -73,6 +73,8 @@ enum {
 };
 
 enum {
+    /* Internal normalized slot for NV097_SET_BLEND_COLOR. */
+    XRECOMP_D3DRS_BLEND_COLOR = 199,
     /*
      * Internal state slots used to carry Xbox polygon-offset floats through
      * the D3D8 compatibility device into Plume. They occupy the two unused
@@ -124,6 +126,7 @@ uint32_t d3d_hle_guest_create_texture2(
 uint32_t d3d_hle_guest_texture_get_surface_level2(
     uint32_t texture_va, uint32_t level);
 uint32_t d3d_hle_guest_resource_release(uint32_t resource_va);
+void d3d_hle_guest_destroy_resource_by_va(uint32_t resource_va);
 void d3d_hle_guest_note_native_resource_release(uint32_t resource_va);
 void d3d_hle_guest_surface_lock_rect(
     uint32_t surface_va, uint32_t locked_rect_va, uint32_t rect_va,
@@ -171,7 +174,6 @@ bool d3d_hle_guest_synthetic_allocator_available(void);
 void d3d_hle_guest_reset_session(void);
 void d3d_hle_guest_reset_registry(void);
 void d3d_hle_guest_teardown_host_device(void);
-void d3d_hle_guest_block_until_vertical_blank(void);
 int d3d_hle_guest_vblank_scanout(void);
 uint32_t d3d_hle_guest_base_texture_get_level_count(uint32_t texture_va);
 uint32_t d3d_hle_guest_cube_get_surface(
@@ -225,7 +227,7 @@ void d3d_hle_guest_set_xbox_texture_stage_state(
 void d3d_hle_guest_set_tile(uint32_t index, uint32_t tile_va);
 void d3d_hle_guest_get_tile(uint32_t index, uint32_t tile_va);
 void d3d_hle_guest_lock_2d_surface(
-    uint32_t texture_va, uint32_t face, uint32_t level,
+    uint32_t pixel_container_va, uint32_t face, uint32_t level,
     uint32_t locked_rect_va, uint32_t rect_va, uint32_t flags);
 void d3d_hle_guest_lock_3d_surface(
     uint32_t texture_va, uint32_t level, uint32_t locked_box_va,
@@ -277,6 +279,9 @@ uint32_t d3d_hle_guest_palette_lock2(uint32_t palette_va, uint32_t flags);
 uint32_t d3d_hle_guest_resource_add_ref(uint32_t resource_va);
 uint32_t d3d_hle_guest_create_surface2(
     uint32_t width, uint32_t height, uint32_t usage, uint32_t format);
+HRESULT d3d_hle_guest_create_image_surface(
+    uint32_t width, uint32_t height, uint32_t format, uint32_t out_va);
+uint32_t d3d_hle_guest_create_palette2(uint32_t size);
 void d3d_hle_guest_delete_pixel_shader(uint32_t shader_handle);
 HRESULT d3d_hle_guest_set_pixel_shader(uint32_t shader_handle);
 void d3d_hle_guest_set_pixel_shader_constant(
@@ -339,7 +344,6 @@ void d3d_hle_device_set_texture(void);
 void d3d_hle_device_get_indices2(void);
 void d3d_hle_device_add_ref(void);
 void d3d_hle_device_release(void);
-void d3d_hle_device_block_until_vertical_blank(void);
 void d3d_hle_device_set_render_state_stencil_enable(void);
 void d3d_hle_device_set_render_state_texture_factor(void);
 void d3d_hle_device_set_render_state_dxt1_noise_enable(void);
@@ -470,6 +474,15 @@ void d3d_hle_device_set_pixel_shader_std(void);
 void d3d_hle_device_set_pixel_shader_constant_std(void);
 void d3d_hle_device_reset_std(void);
 void d3d_hle_device_set_render_target_fast_std(void);
+void d3d_hle_device_create_palette2_std(void);
+void d3d_hle_device_create_image_surface_std(void);
+void d3d_hle_device_end_push_buffer_std(void);
+void d3d_hle_cdevice_kickoff_std(void);
+void d3d_hle_destroy_resource_std(void);
+void d3d_hle_noop_std_0(void);
+void d3d_hle_noop_std_1(void);
+void d3d_hle_noop_std_2(void);
+void d3d_hle_noop_std_6(void);
 
 #ifdef __cplusplus
 }

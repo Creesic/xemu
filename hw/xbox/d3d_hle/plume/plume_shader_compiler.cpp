@@ -3,9 +3,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -13,6 +16,8 @@
 #include <mutex>
 #include <sstream>
 #include <system_error>
+#include <thread>
+#include <utility>
 
 #if defined(_WIN32)
 #include <process.h>
@@ -51,6 +56,120 @@ namespace plume {
 namespace {
 
 std::atomic<uint64_t> g_shaderCompileCounter{0};
+
+struct ShaderCompileJob {
+    ShaderTarget target = ShaderTarget::DXIL;
+    std::string source;
+    std::string entryPoint;
+    std::string profile;
+    std::promise<ShaderCompileResult> promise;
+};
+
+/* A single compiler worker keeps expensive cache misses off replay without
+ * spawning one DXC thread per newly-streamed material. */
+class ShaderCompilerQueue {
+public:
+    ShaderCompilerQueue() : m_worker(&ShaderCompilerQueue::run, this) {}
+
+    ~ShaderCompilerQueue()
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_stopping = true;
+        }
+        m_ready.notify_one();
+        if (m_worker.joinable())
+            m_worker.join();
+    }
+
+    std::future<ShaderCompileResult> submit(
+        const ShaderCompileRequest &request)
+    {
+        ShaderCompileJob job;
+        job.target = request.target;
+        if (request.source)
+            job.source = request.source;
+        if (request.entryPoint)
+            job.entryPoint = request.entryPoint;
+        if (request.profile)
+            job.profile = request.profile;
+        std::future<ShaderCompileResult> future = job.promise.get_future();
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_jobs.push_back(std::move(job));
+        }
+        m_ready.notify_one();
+        return future;
+    }
+
+    void wait()
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_idle.wait(lock, [this]() {
+            return m_jobs.empty() && !m_busy;
+        });
+    }
+
+private:
+    void run()
+    {
+        for (;;) {
+            ShaderCompileJob job;
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_ready.wait(lock, [this]() {
+                    return m_stopping || !m_jobs.empty();
+                });
+                if (m_stopping && m_jobs.empty())
+                    return;
+                job = std::move(m_jobs.front());
+                m_jobs.pop_front();
+                m_busy = true;
+            }
+
+            ShaderCompileResult result;
+            try {
+                ShaderCompileRequest request;
+                request.source = job.source.c_str();
+                request.entryPoint = job.entryPoint.c_str();
+                request.profile = job.profile.c_str();
+                request.target = job.target;
+                result = compileShader(request);
+            } catch (const std::exception &error) {
+                result.target = job.target;
+                result.entryPoint = job.entryPoint;
+                result.diagnostics =
+                    std::string("Shader compile worker failed: ") +
+                    error.what();
+            } catch (...) {
+                result.target = job.target;
+                result.entryPoint = job.entryPoint;
+                result.diagnostics = "Shader compile worker failed";
+            }
+            job.promise.set_value(std::move(result));
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_busy = false;
+                if (m_jobs.empty())
+                    m_idle.notify_all();
+            }
+        }
+    }
+
+    std::mutex m_mutex;
+    std::condition_variable m_ready;
+    std::condition_variable m_idle;
+    std::deque<ShaderCompileJob> m_jobs;
+    bool m_busy = false;
+    bool m_stopping = false;
+    std::thread m_worker;
+};
+
+ShaderCompilerQueue &shaderCompilerQueue()
+{
+    static ShaderCompilerQueue queue;
+    return queue;
+}
 
 class TemporaryShaderFiles {
 public:
@@ -200,6 +319,65 @@ int runTool(const std::string &executable,
             const std::vector<std::string> &arguments,
             const std::filesystem::path &diagnosticsPath)
 {
+#if defined(_WIN32)
+    auto quoteArgument = [](const std::wstring &argument) {
+        std::wstring quoted = L"\"";
+        size_t backslashes = 0;
+        for (const wchar_t ch : argument) {
+            if (ch == L'\\') {
+                ++backslashes;
+            } else {
+                quoted.append(backslashes * (ch == L'\"' ? 2 : 1), L'\\');
+                backslashes = 0;
+                if (ch == L'\"')
+                    quoted += L'\\';
+                quoted += ch;
+            }
+        }
+        quoted.append(backslashes * 2, L'\\');
+        quoted += L'\"';
+        return quoted;
+    };
+
+    std::wstring command = quoteArgument(
+        std::filesystem::path(executable).wstring());
+    for (const std::string &argument : arguments) {
+        command += L' ';
+        command += quoteArgument(std::filesystem::path(argument).wstring());
+    }
+
+    SECURITY_ATTRIBUTES security = {};
+    security.nLength = sizeof(security);
+    security.bInheritHandle = TRUE;
+    HANDLE diagnostics = CreateFileW(
+        diagnosticsPath.c_str(), GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, &security, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (diagnostics == INVALID_HANDLE_VALUE)
+        return -1;
+
+    STARTUPINFOW startup = {};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = diagnostics;
+    startup.hStdError = diagnostics;
+    PROCESS_INFORMATION process = {};
+    const BOOL created = CreateProcessW(
+        nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
+        nullptr, nullptr, &startup, &process);
+    CloseHandle(diagnostics);
+    if (!created)
+        return -1;
+
+    const DWORD wait = WaitForSingleObject(process.hProcess, INFINITE);
+    DWORD exitCode = static_cast<DWORD>(-1);
+    if (wait == WAIT_OBJECT_0)
+        GetExitCodeProcess(process.hProcess, &exitCode);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return static_cast<int>(exitCode);
+#else
     std::string command = quoteShellArgument(executable);
     if (command.empty())
         return -1;
@@ -216,10 +394,8 @@ int runTool(const std::string &executable,
     if (quotedDiagnostics.empty())
         return -1;
     command += " > " + quotedDiagnostics + " 2>&1";
-#if defined(_WIN32)
-    command = "\"" + command + "\"";
-#endif
     return std::system(command.c_str());
+#endif
 }
 
 std::vector<uint8_t> readBinaryFile(const std::filesystem::path &path)
@@ -319,6 +495,21 @@ std::filesystem::path dxcLibraryForExecutable(const std::string &executable)
 {
 #if defined(_WIN32)
     std::filesystem::path path(executable);
+    if (!path.has_parent_path()) {
+        const std::wstring name = path.wstring();
+        const DWORD required = SearchPathW(
+            nullptr, name.c_str(), nullptr, 0, nullptr, nullptr);
+        if (required) {
+            std::wstring resolved(required, L'\0');
+            const DWORD length = SearchPathW(
+                nullptr, name.c_str(), nullptr,
+                static_cast<DWORD>(resolved.size()), resolved.data(), nullptr);
+            if (length && length < resolved.size()) {
+                resolved.resize(length);
+                path = resolved;
+            }
+        }
+    }
     if (!path.has_parent_path())
         return {};
     std::error_code error;
@@ -882,6 +1073,17 @@ ShaderCompileResult compileShader(const ShaderCompileRequest &request)
     result.ok = true;
     result.diagnostics = diagnostics.str();
     return result;
+}
+
+std::future<ShaderCompileResult> compileShaderAsync(
+    const ShaderCompileRequest &request)
+{
+    return shaderCompilerQueue().submit(request);
+}
+
+void waitForShaderCompiles()
+{
+    shaderCompilerQueue().wait();
 }
 
 ShaderTarget shaderTargetForRenderFormat(::plume::RenderShaderFormat format)

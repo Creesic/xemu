@@ -18,6 +18,10 @@ static RenderBlend plume_blend_from_d3d(uint32_t blend)
     case 9: return RenderBlend::DEST_COLOR;
     case 10: return RenderBlend::INV_DEST_COLOR;
     case 11: return RenderBlend::SRC_ALPHA_SAT;
+    case 12: return RenderBlend::BLEND_FACTOR;
+    case 13: return RenderBlend::INV_BLEND_FACTOR;
+    case 14: return RenderBlend::BLEND_FACTOR_ALPHA;
+    case 15: return RenderBlend::INV_BLEND_FACTOR_ALPHA;
     default: return RenderBlend::ONE;
     }
 }
@@ -58,6 +62,15 @@ RenderBlendDesc plume_blend_desc_from_d3d(const XgpuPlumeRenderState &state)
     blend.renderTargetWriteMask =
         static_cast<uint8_t>(state.color_write_mask & 0xFu);
     return blend;
+}
+
+RenderColor plume_blend_factor_from_xgpu(uint32_t color)
+{
+    constexpr float scale = 1.0f / 255.0f;
+    return RenderColor(float((color >> 16) & 0xFFu) * scale,
+                       float((color >> 8) & 0xFFu) * scale,
+                       float(color & 0xFFu) * scale,
+                       float((color >> 24) & 0xFFu) * scale);
 }
 
 RenderFormat plume_depth_format_from_xgpu(uint32_t zetaFormat,
@@ -150,6 +163,7 @@ uint64_t plume_render_state_key(const XgpuPlumeRenderState &state)
         state.depth_enable, state.z_perspective,
         state.depth_write, state.depth_func,
         state.blend_enable, state.src_blend, state.dst_blend, state.blend_op,
+        state.blend_color,
         state.cull_mode, state.color_write_mask,
         state.zeta_format, state.zeta_float,
         state.stencil_enable, state.stencil_func, state.stencil_ref,

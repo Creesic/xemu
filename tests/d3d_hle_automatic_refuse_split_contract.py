@@ -7,6 +7,9 @@ HLE_C = (ROOT / "hw/xbox/d3d_hle/xemu_d3d_hle.c").read_text()
 
 assert "discovery_unsupported_count" in PROFILE_H
 assert "automatic_profile.discovery_unsupported_count" in DISCOVERY_C
+assert "bootstrap_only_functions" not in DISCOVERY_C
+assert "XEMU_D3D_HLE_HOOK_BOOTSTRAP_ONLY, api" not in DISCOVERY_C
+assert "automatic_profile.reviewed_blocker_count = scan.unsupported_functions" in DISCOVERY_C
 
 resolve_start = HLE_C.index("static bool xemu_d3d_hle_resolve_loaded_xbe")
 resolve_end = HLE_C.index("static const XemuD3DHleHook *xemu_d3d_hle_find_any_hook", resolve_start)

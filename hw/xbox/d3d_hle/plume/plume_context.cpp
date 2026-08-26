@@ -98,20 +98,36 @@ bool PlumeContext::acquire(uint32_t *outSwapIndex)
      * up front. Waiting for acquireTexture to fail leaves the swapchain
      * presenting at a stale extent through DWM scaling. */
     if (m_swapChain->needsResize()) {
-        if (!m_swapChain->resize())
+        if (!resizeSwapChain())
             return false;
-        rebuildFramebuffers();
     }
 
     uint32_t idx = 0;
     if (!m_swapChain->acquireTexture(m_acquireSem.get(), &idx)) {
-        m_swapChain->resize();
-        rebuildFramebuffers();
+        resizeSwapChain();
         return false;
     }
 
     *outSwapIndex = idx;
     return true;
+}
+
+bool PlumeContext::resizeSwapChain()
+{
+    /* The present fence is queued before DXGI Present. Submit a marker after
+     * Present and wait it before releasing the old back buffers. */
+    waitPendingPresent();
+    m_uploadCmd->begin();
+    m_uploadCmd->end();
+    const ::plume::RenderCommandList *marker = m_uploadCmd.get();
+    m_queue->executeCommandLists(&marker, 1, nullptr, 0, nullptr, 0,
+                                 m_fence.get());
+    m_queue->waitForCommandFence(m_fence.get());
+
+    m_framebuffers.clear();
+    const bool resized = m_swapChain->resize();
+    rebuildFramebuffers();
+    return resized;
 }
 
 void PlumeContext::rebuildFramebuffers()

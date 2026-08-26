@@ -26,9 +26,9 @@ bindings = [
     )
 ]
 bindings.extend(
-    (name, 0, "NULL")
-    for name in re.findall(
-        r"\bN0\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)", binding_body
+    (name, int(arity), "NULL")
+    for arity, name in re.findall(
+        r"\bN(\d)\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)", binding_body
     )
 )
 bindings.extend(
@@ -82,6 +82,14 @@ required = {
         3,
         "d3d_hle_device_set_render_target_fast_std",
     ),
+    ("D3DDevice_CreatePalette2", 1, "d3d_hle_device_create_palette2_std"),
+    (
+        "D3DDevice_CreateImageSurface",
+        4,
+        "d3d_hle_device_create_image_surface_std",
+    ),
+    ("D3D_AllocContiguousMemory", 2, "NULL"),
+    ("D3DDevice_BlockUntilVerticalBlank", 0, "NULL"),
 }
 missing_required = sorted(required - set(bindings))
 assert not missing_required, f"reviewed shared bindings missing: {missing_required}"

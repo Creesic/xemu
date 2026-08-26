@@ -134,6 +134,7 @@ typedef struct XgpuPlumeRenderState {
     uint32_t src_blend;
     uint32_t dst_blend;
     uint32_t blend_op;
+    uint32_t blend_color;
     uint32_t alpha_test_enable;
     uint32_t alpha_func;
     uint32_t alpha_ref;
@@ -305,7 +306,10 @@ void xgpu_plume_clear_depth_stencil(uint32_t clear_depth,
                                     const XgpuRect *rect);
 int xgpu_plume_present_host_frame(const void *pixels, uint32_t w, uint32_t h,
                                   uint32_t pitch);
-/* Stop retaining the last host RGBA frame across otherwise-empty guest
+int xgpu_plume_present_host_frame_format(const void *pixels, uint32_t w,
+                                         uint32_t h, uint32_t pitch,
+                                         uint32_t format);
+/* Stop retaining the last host frame across otherwise-empty guest
  * presents. Overlay frontends call this when their host-frame sequence ends
  * so an already-rendered guest scanout can become visible immediately. */
 void xgpu_plume_retire_host_frame(void);

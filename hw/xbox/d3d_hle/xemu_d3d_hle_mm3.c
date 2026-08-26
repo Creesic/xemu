@@ -49,7 +49,7 @@ static const XemuD3DHleHook mm3_hooks[] = {
     PASS(0x00340750u, "AddRef"),
     PASS(0x00340770u, "Release"),
     HLE(0x003407B0u, d3d_hle_kickoff_and_wait_for_idle),
-    HLE(0x003407D0u, d3d_hle_device_block_until_vertical_blank),
+    PASS(0x003407D0u, "BlockUntilVerticalBlank"),
     HLE(0x00340D30u, d3d_hle_device_set_render_state_fog_color),
     HLE(0x00340D90u, d3d_hle_device_set_render_state_cull_mode),
     HLE(0x00340EB0u, d3d_hle_device_set_render_state_z_enable),

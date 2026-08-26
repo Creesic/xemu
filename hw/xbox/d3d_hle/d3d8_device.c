@@ -1220,6 +1220,7 @@ static XgpuPlumeRenderState snapshot_render_state(void)
     state.src_blend = rs[D3DRS_SRCBLEND];
     state.dst_blend = rs[D3DRS_DESTBLEND];
     state.blend_op = rs[D3DRS_BLENDOP] ? rs[D3DRS_BLENDOP] : 1;
+    state.blend_color = rs[XRECOMP_D3DRS_BLEND_COLOR];
     state.alpha_test_enable = rs[D3DRS_ALPHATESTENABLE] != 0;
     state.alpha_func = rs[D3DRS_ALPHAFUNC];
     state.alpha_ref = rs[D3DRS_ALPHAREF] & 0xFFu;
