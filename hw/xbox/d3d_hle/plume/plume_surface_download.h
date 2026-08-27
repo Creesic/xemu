@@ -8,13 +8,13 @@
  * Plume renders color targets as BGRA8 even when the HLE D3D surface exposed
  * to the guest is narrower. Native PGRAPH surfaces use NV097 color-format
  * values (7/8 for the supported 32-bit targets); HLE surfaces retain their
- * Xbox D3DFORMAT value (0 for L8).
+ * Xbox D3DFORMAT value (0 for L8, 0x19 for A8).
  */
 static inline uint32_t xgpu_plume_guest_color_row_bytes(
     uint32_t guest_format, uint32_t width)
 {
-    if (guest_format == 0u)
-        return width; /* Xbox D3DFMT_L8 */
+    if (guest_format == 0u || guest_format == 0x19u)
+        return width; /* Xbox D3DFMT_L8 / D3DFMT_A8 */
     if (guest_format == 7u || guest_format == 8u) {
         if (width > UINT32_MAX / 4u)
             return 0;
@@ -41,7 +41,7 @@ static inline int xgpu_plume_pack_guest_color_surface(
         uint8_t *dst = guest + (size_t)row * guest_pitch;
         uint32_t x;
 
-        if (guest_format != 0u) {
+        if (guest_format != 0u && guest_format != 0x19u) {
             for (x = 0; x < guest_row_bytes; ++x)
                 dst[x] = src[x];
             continue;

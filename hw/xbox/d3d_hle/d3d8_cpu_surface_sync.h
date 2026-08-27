@@ -90,7 +90,8 @@ extern "C" {
 #endif
 
 void d3d8_PgraphMarkCpuSurfaceLock(uint32_t guest_address,
-                                   uint32_t lock_flags);
+                                   uint32_t lock_flags,
+                                   int preserve_scanout);
 
 #ifdef __cplusplus
 }

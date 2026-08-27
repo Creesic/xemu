@@ -80,8 +80,10 @@ public:
                            const XgpuRect *rect);
     bool setSurfaceTexture(uint32_t stage, uint32_t guest,
                            uint32_t unnormalizedCoords);
-    bool blitSurface(PlumeContext &ctx, uint32_t dstGuest, uint32_t srcGuest,
-                     uint32_t width, uint32_t height);
+    bool blitSurface(PlumeContext &ctx,
+                     const XgpuSurfaceBinding &destination,
+                     uint32_t dstGuest, uint32_t srcResource,
+                     uint32_t srcGuest);
     bool ensureColorSurface(PlumeContext &ctx, uint64_t generation,
                             uint32_t width, uint32_t height);
     bool downloadColorSurface(PlumeContext &ctx, uint32_t guest, void *pixels,
@@ -250,7 +252,7 @@ public:
      * caller must fence before the guest may read them back. */
     bool pendingDownloads() const { return !m_pendingDownloads.empty(); }
 
-    uint32_t createPixelShader(const char *text);
+    uint32_t createPixelShader(const char *text, uint32_t cubeTextureMask);
     void setActivePS(uint32_t handle);
     void setPSConst(uint32_t start, const float *values, uint32_t count);
     void setCombinerConsts(const float *values); /* 16 float4 */
@@ -335,6 +337,7 @@ private:
         /* Shader reads combiner constants from the per-draw CB (b8)
          * instead of baked literals; snapshot m_combinerConst at record. */
         bool combinerCB = false;
+        uint8_t cubeTextureMask = 0;
         ShaderCompileRetryState compileRetry;
         std::future<ShaderCompileResult> compileFuture;
         std::unique_ptr<::plume::RenderShader> shader;
@@ -377,6 +380,7 @@ private:
         uint32_t guestAddr = 0;
         uint32_t guestPitch = 0;
         uint32_t guestFormat = 0;
+        uint32_t guestLayout = XGPU_SURFACE_PITCH;
         std::unique_ptr<::plume::RenderBuffer> downloadBuffer;
         ::plume::RenderTextureLayout layout = ::plume::RenderTextureLayout::UNKNOWN;
         ::plume::RenderTextureLayout snapshotLayout = ::plume::RenderTextureLayout::UNKNOWN;
@@ -776,6 +780,8 @@ private:
     uint8_t m_curSamplerStateValid[4] = {};
     std::unique_ptr<::plume::RenderTexture> m_whiteTex;
     std::unique_ptr<::plume::RenderTextureView> m_whiteView;
+    std::unique_ptr<::plume::RenderTexture> m_whiteCubeTex;
+    std::unique_ptr<::plume::RenderTextureView> m_whiteCubeView;
     std::unordered_map<uint64_t, std::unique_ptr<::plume::RenderPipeline>> m_progPsos;
     /* Live-reload replacements can race up to three asynchronous WAIT
      * submissions. Retain superseded GPU objects for the process lifetime so

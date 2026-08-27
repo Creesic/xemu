@@ -337,7 +337,8 @@ void xgpu_plume_set_sampler(uint32_t stage, uint32_t address, uint32_t filter,
                             uint32_t border_color);
 
 /* Programmable pixel shaders (Xbox assembly or direct portable HLSL). */
-uint32_t xgpu_plume_create_pixel_shader(const char *text);
+uint32_t xgpu_plume_create_pixel_shader(const char *text,
+                                        uint32_t cube_texture_mask);
 /* GPU vertex-transform path: translate an NV2A vertex program (transform
  * microcode, 4 dwords/instruction) to a Plume vertex shader (cached). Returns
  * nonzero if a GPU VS is available for this program, 0 if the caller must fall
@@ -371,10 +372,12 @@ typedef struct XgpuProgIndexedDraw {
 XgpuPlumeGpuDrawResult
 xgpu_plume_record_prog_indexed_draw(const XgpuProgIndexedDraw *desc);
 
-/* 2D-engine blit: copy the current contents of the src guest surface into
- * (a possibly newly created) dst guest surface, ordered with the draw queue. */
-void xgpu_plume_blit_surface(uint32_t dst_guest, uint32_t src_guest,
-                             uint32_t width, uint32_t height);
+/* 2D-engine blit: copy the current contents of src_resource into the distinct
+ * destination surface, ordered with the draw queue. Resource identity and
+ * guest-memory aliases deliberately remain separate. */
+int xgpu_plume_blit_surface(const XgpuSurfaceBinding *destination,
+                            uint32_t dst_guest, uint32_t src_resource,
+                            uint32_t src_guest);
 /* Nonzero when the guest offset has a hosted Plume surface generation. */
 int xgpu_plume_surface_known(uint32_t guest);
 /* Nonzero when recorded or in-flight color work could leave guest memory

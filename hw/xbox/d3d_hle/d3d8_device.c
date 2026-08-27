@@ -191,6 +191,17 @@ static UINT panel_height(void)
     return g_device_state.height ? g_device_state.height : D3D8_PANEL_HEIGHT;
 }
 
+static PgraphHostSurface *pgraph_fallback_surface(void)
+{
+    if (g_pgraph_present_surface)
+        return g_pgraph_present_surface;
+    if (g_pgraph_current_surface &&
+        g_pgraph_current_surface->width == panel_width() &&
+        g_pgraph_current_surface->height == panel_height())
+        return g_pgraph_current_surface;
+    return NULL;
+}
+
 static void present_with_reason(uint32_t reason)
 {
     /* PCRTC fallback presents must not make the guest-present stream look
@@ -206,14 +217,27 @@ static void present_device_backbuffer_with_reason(uint32_t reason)
     if (g_device_state.back_buffer) {
         if (g_device_state.front_buffer &&
             g_device_state.front_buffer != g_device_state.back_buffer) {
+            XgpuSurfaceBinding destination;
             /* Model the front/back flip without rotating guest-visible COM
              * objects: preserve the frame being presented in the dedicated
              * front-buffer surface before the host swapchain advances. */
+            memset(&destination, 0, sizeof(destination));
+            destination.color_resource =
+                g_device_state.front_buffer->resource_id;
+            destination.width = g_device_state.front_buffer->width;
+            destination.height = g_device_state.front_buffer->height;
+            destination.image_width = destination.width;
+            destination.image_height = destination.height;
+            destination.color_pitch = g_device_state.front_buffer->pitch;
+            destination.color_format =
+                (uint32_t)g_device_state.front_buffer->format;
+            destination.layout = XGPU_SURFACE_PITCH;
+            destination.sample_count = 1;
             xgpu_plume_blit_surface(
-                g_device_state.front_buffer->resource_id,
+                &destination,
+                g_device_state.front_buffer->guest_address,
                 g_device_state.back_buffer->resource_id,
-                g_device_state.back_buffer->width,
-                g_device_state.back_buffer->height);
+                g_device_state.back_buffer->guest_address);
         }
         xgpu_plume_set_present_surface(
             g_device_state.back_buffer->resource_id);
@@ -324,7 +348,8 @@ static PgraphHostSurface *find_surface_within(uint32_t address)
 }
 
 void d3d8_PgraphMarkCpuSurfaceLock(uint32_t guest_address,
-                                   uint32_t lock_flags)
+                                   uint32_t lock_flags,
+                                   int preserve_scanout)
 {
     PgraphHostSurface *surface;
     uint32_t offset;
@@ -338,41 +363,59 @@ void d3d8_PgraphMarkCpuSurfaceLock(uint32_t guest_address,
         surface = find_surface_within(offset);
     if (surface) {
         size_t active_row_bytes = (size_t)surface->width * 4u;
-        size_t span = 0;
+        size_t span;
+        BYTE *pixels = NULL;
+        BOOL inherited = FALSE;
 
-        if (d3d8_cpu_surface_lock_needs_readback(
-                lock_flags, xgpu_plume_surface_known(surface->offset)) &&
-            surface->layout == XGPU_SURFACE_PITCH &&
+        if (surface->layout == XGPU_SURFACE_PITCH &&
             d3d8_cpu_surface_format_is_32bpp(surface->format) &&
             surface->width && surface->height &&
             active_row_bytes <= surface->pitch &&
             (size_t)(surface->height - 1u) <=
                 (SIZE_MAX - active_row_bytes) / surface->pitch) {
-            BYTE *pixels;
-
             span = (size_t)(surface->height - 1u) * surface->pitch +
                    active_row_bytes;
             pixels = xbox_guest_phys_ptr(surface->offset, span);
-            if (pixels) {
-                D3D8CpuSurfaceFingerprint current;
+        }
 
-                if (xgpu_plume_download_color_surface(
+        /* COPY swap chains preserve the displayed frame when the title moves
+         * its writable CPU backbuffer to another full-panel allocation. Read
+         * that frame straight into guest memory before the partial CPU update;
+         * the ordinary vblank upload below remains the sole GPU owner change. */
+        if (pixels && preserve_scanout && g_pgraph_present_surface &&
+            surface != g_pgraph_present_surface &&
+            surface->width == panel_width() &&
+            surface->height == panel_height() &&
+            g_pgraph_present_surface->width == surface->width &&
+            g_pgraph_present_surface->height == surface->height &&
+            xgpu_plume_download_color_surface(
+                g_pgraph_present_surface->offset, pixels, surface->width,
+                surface->height, surface->pitch)) {
+            g_pgraph_present_surface = surface;
+            inherited = TRUE;
+        }
+
+        if (pixels && !inherited &&
+            d3d8_cpu_surface_lock_needs_readback(
+                lock_flags, xgpu_plume_surface_known(surface->offset))) {
+            inherited = xgpu_plume_download_color_surface(
                         surface->offset, pixels, surface->width,
-                        surface->height, surface->pitch)) {
-                    current = d3d8_cpu_surface_fingerprint(
-                        pixels, surface->width, surface->height,
-                        surface->pitch);
-                    surface->cpu_hash = current.hash;
-                    surface->cpu_hash_valid = TRUE;
-                }
-            }
+                        surface->height, surface->pitch) != 0;
+        }
+        if (inherited) {
+            D3D8CpuSurfaceFingerprint current =
+                d3d8_cpu_surface_fingerprint(
+                    pixels, surface->width, surface->height, surface->pitch);
+            surface->cpu_hash = current.hash;
+            surface->cpu_hash_valid = TRUE;
         }
         surface->cpu_lock_dirty = TRUE;
     }
 
 }
 
-static int sync_cpu_surface(PgraphHostSurface *surface)
+static int sync_cpu_surface(PgraphHostSurface *surface,
+                            int allow_initial_upload)
 {
     const BYTE *pixels;
     D3D8CpuSurfaceFingerprint current;
@@ -420,6 +463,16 @@ static int sync_cpu_surface(PgraphHostSurface *surface)
 
     current = d3d8_cpu_surface_fingerprint(
         pixels, surface->width, surface->height, surface->pitch);
+    /* Binding a render target establishes GPU ownership. Nonzero bytes in a
+     * newly reused allocation are not proof of a CPU write; uploading them
+     * here restores stale color or packed depth over the new target. A
+     * present/texture read may still seed an otherwise untouched surface. */
+    if (!surface->cpu_hash_valid && !surface->cpu_lock_dirty &&
+        !allow_initial_upload) {
+        surface->cpu_hash = current.hash;
+        surface->cpu_hash_valid = TRUE;
+        return 0;
+    }
     needs_upload = d3d8_cpu_surface_needs_upload(
         surface->cpu_hash_valid, surface->cpu_hash, current,
         surface->cpu_lock_dirty);
@@ -438,6 +491,93 @@ static int sync_cpu_surface(PgraphHostSurface *surface)
     surface->cpu_hash = current.hash;
     surface->cpu_hash_valid = TRUE;
     surface->cpu_lock_dirty = FALSE;
+    return 1;
+}
+
+static void prepare_draw(void)
+{
+    uint32_t color_write_mask =
+        g_device_state.render_states[D3DRS_COLORWRITEENABLE] & 0xFu;
+
+    /* A CPU lock may complete between draw batches while the render target
+     * remains bound. Consume it before recording the next GPU write; waiting
+     * until Present would restore the older CPU snapshot over later draws.
+     * A fresh target also needs its guest bytes when the draw preserves any
+     * channel: MM3 keeps its screen-space light mask in destination alpha
+     * while clearing and drawing RGB only. */
+    sync_cpu_surface(g_pgraph_current_surface,
+                     color_write_mask != 0xFu);
+    (void)d3d8_vsh_prepare_draw(g_device_state.vertex_shader);
+    (void)d3d8_combiners_prepare_draw();
+}
+
+static void rebaseline_cpu_surfaces_after_gpu_download(uint32_t start,
+                                                       uint64_t bytes)
+{
+    uint64_t want_end = (uint64_t)start + (bytes ? bytes : 1u);
+    UINT i;
+
+    for (i = 0; i < g_pgraph_surface_count; ++i) {
+        PgraphHostSurface *surface = &g_pgraph_surfaces[i];
+        size_t active_row_bytes;
+        uint64_t span;
+        uint64_t end;
+        BYTE *pixels;
+
+        if (!surface->offset || surface->layout != XGPU_SURFACE_PITCH ||
+            !d3d8_cpu_surface_format_is_32bpp(surface->format) ||
+            !surface->width || !surface->height || !surface->pitch)
+            continue;
+        active_row_bytes = (size_t)surface->width * 4u;
+        if (active_row_bytes > surface->pitch)
+            continue;
+        span = (uint64_t)(surface->height - 1u) * surface->pitch +
+               active_row_bytes;
+        end = (uint64_t)surface->offset + span;
+        if (end <= (uint64_t)start || (uint64_t)surface->offset >= want_end)
+            continue;
+        pixels = xbox_guest_phys_ptr(surface->offset, (size_t)span);
+        if (!pixels)
+            continue;
+        D3D8CpuSurfaceFingerprint current = d3d8_cpu_surface_fingerprint(
+            pixels, surface->width, surface->height, surface->pitch);
+        surface->cpu_hash = current.hash;
+        surface->cpu_hash_valid = TRUE;
+        surface->cpu_hash_epoch = g_cpu_surface_epoch;
+    }
+}
+
+static int download_color_surface_to_guest(PgraphHostSurface *surface)
+{
+    UINT image_width;
+    UINT image_height;
+    size_t active_row_bytes;
+    size_t span;
+    BYTE *pixels;
+
+    if (!surface || !surface->offset ||
+        surface->layout != XGPU_SURFACE_PITCH ||
+        !d3d8_cpu_surface_format_is_32bpp(surface->format) ||
+        !surface->width || !surface->height || !surface->pitch ||
+        !xgpu_plume_surface_known(surface->offset))
+        return 0;
+
+    image_width = surface->image_width ? surface->image_width : surface->width;
+    image_height = surface->image_height ? surface->image_height
+                                         : surface->height;
+    active_row_bytes = (size_t)image_width * 4u;
+    if (active_row_bytes > surface->pitch ||
+        (size_t)(image_height - 1u) >
+            (SIZE_MAX - active_row_bytes) / surface->pitch)
+        return 0;
+    span = (size_t)(image_height - 1u) * surface->pitch + active_row_bytes;
+    pixels = xbox_guest_phys_ptr(surface->offset, span);
+    if (!pixels || !xgpu_plume_download_color_surface(
+                       surface->offset, pixels, image_width, image_height,
+                       surface->pitch))
+        return 0;
+
+    rebaseline_cpu_surfaces_after_gpu_download(surface->offset, span);
     return 1;
 }
 
@@ -485,6 +625,12 @@ int d3d8_PgraphSetRenderTarget(const XgpuSurfaceBinding *binding)
         surface->image_height != image_height ||
         surface->format != binding->color_format ||
         surface->layout != binding->layout;
+    /* Xbox render-target storage is guest VRAM. Before rebinding one address
+     * with different geometry, preserve the old host generation in that
+     * backing memory so channels excluded by the new target's first write do
+     * not come from stale RAM. */
+    if (metadata_changed && surface->offset == offset)
+        (void)download_color_surface_to_guest(surface);
     surface->offset = offset;
     surface->width = binding->width;
     surface->height = binding->height;
@@ -528,10 +674,7 @@ int d3d8_PgraphSetRenderTarget(const XgpuSurfaceBinding *binding)
     }
 
     g_pgraph_current_surface = surface;
-    if (surface->width == panel_width() && surface->height == panel_height())
-        g_pgraph_present_surface = surface;
     xgpu_plume_set_render_target(binding);
-    sync_cpu_surface(surface);
     return 1;
 }
 
@@ -554,7 +697,7 @@ int d3d8_PgraphBindSurfaceTextureStage(
         if (texture_format != UINT32_MAX &&
             surface->format != texture_format)
             return 0;
-        sync_cpu_surface(surface);
+        sync_cpu_surface(surface, 1);
     } else if (texture_format != UINT32_MAX) {
         /*
          * Hosted handles (notably the device backbuffer) may be known to
@@ -569,8 +712,9 @@ int d3d8_PgraphBindSurfaceTextureStage(
     return 1;
 }
 
-/* Resolve every rendered colour surface overlapping [start, start+bytes) back
- * into guest memory.
+/* Resolve rendered surfaces overlapping [start, start+bytes) back into guest
+ * memory. A zeta-only resolve must not overwrite an aliased depth allocation
+ * with colour data before the packed Z24S8 download below.
  *
  * A guest texture can alias rendered memory and read a range that spans more
  * than one surface. MM3 samples a 1280x480 Y16 texture at 0x0076C000 whose
@@ -581,20 +725,20 @@ int d3d8_PgraphBindSurfaceTextureStage(
  * bytes and the stage samples as zero.
  *
  * Returns the number of surfaces refreshed. */
-int d3d8_PgraphDownloadSurfaceRange(uint32_t start, uint32_t bytes)
+int d3d8_PgraphDownloadSurfaceRange(uint32_t start, uint32_t bytes,
+                                    int zeta_only)
 {
     uint64_t want_end = (uint64_t)start + (bytes ? bytes : 1u);
     int refreshed = 0;
     UINT i;
 
-    for (i = 0; i < g_pgraph_surface_count; ++i) {
+    for (i = 0; !zeta_only && i < g_pgraph_surface_count; ++i) {
         PgraphHostSurface *surface = &g_pgraph_surfaces[i];
         size_t active_row_bytes;
         uint64_t span;
         uint64_t end;
         UINT image_width;
         UINT image_height;
-        BYTE *pixels;
 
         if (!surface->offset || surface->layout != XGPU_SURFACE_PITCH ||
             !d3d8_cpu_surface_format_is_32bpp(surface->format) ||
@@ -618,12 +762,7 @@ int d3d8_PgraphDownloadSurfaceRange(uint32_t start, uint32_t bytes)
         /* Overlap test against the requested range. */
         if (end <= (uint64_t)start || (uint64_t)surface->offset >= want_end)
             continue;
-        pixels = xbox_guest_phys_ptr(surface->offset, (size_t)span);
-        if (!pixels)
-            continue;
-        if (xgpu_plume_download_color_surface(surface->offset, pixels,
-                                              image_width, image_height,
-                                              surface->pitch))
+        if (download_color_surface_to_guest(surface))
             refreshed++;
     }
 
@@ -649,8 +788,13 @@ int d3d8_PgraphDownloadSurfaceRange(uint32_t start, uint32_t bytes)
         if (!pixels)
             continue;
         if (xgpu_plume_download_zeta_surface(zeta->offset, pixels, zeta->width,
-                                             zeta->height, zeta->pitch))
+                                             zeta->height, zeta->pitch)) {
+            /* This guest-memory mutation belongs to the GPU depth owner, not
+             * the CPU. Re-baseline overlapping color surfaces so their next
+             * sync cannot upload packed Z24S8 as BGRA. */
+            rebaseline_cpu_surfaces_after_gpu_download(zeta->offset, span);
             refreshed++;
+        }
     }
     return refreshed;
 }
@@ -747,25 +891,27 @@ int d3d8_PgraphPresentSurface(uint32_t offset)
     surface = find_surface(offset);
     if (!surface && offset)
         surface = find_surface_within(offset);
-    if ((!surface || surface->width != panel_width() ||
-         surface->height != panel_height()) && g_pgraph_present_surface)
-        surface = g_pgraph_present_surface;
+    if (surface && surface->width == panel_width() &&
+        surface->height == panel_height())
+        g_pgraph_present_surface = surface;
+    if (!surface || surface->width != panel_width() ||
+        surface->height != panel_height())
+        surface = pgraph_fallback_surface();
     xgpu_plume_f2_log(
         "pgraph scanout request=%08X resolved=%08X dims=%ux%u "
         "plume-known=%u fallback=%u",
         offset, surface ? surface->offset : 0,
         surface ? surface->width : 0, surface ? surface->height : 0,
         offset && xgpu_plume_surface_known(offset),
-        surface && surface == g_pgraph_present_surface &&
-            surface->offset != offset);
+        surface && surface->offset != offset);
     if (offset && xgpu_plume_surface_known(offset)) {
-        sync_cpu_surface(find_surface(offset));
+        sync_cpu_surface(find_surface(offset), 1);
         xgpu_plume_set_present_surface(offset);
         return 1;
     }
     if (!surface)
         return 0;
-    sync_cpu_surface(surface);
+    sync_cpu_surface(surface, 1);
     xgpu_plume_set_present_surface(surface->offset);
     return 1;
 }
@@ -795,10 +941,10 @@ int d3d8_PgraphRefreshSurface(uint32_t offset)
     surface = find_surface(offset);
     if (!surface && offset)
         surface = find_surface_within(offset);
-    if ((!surface || surface->width != panel_width() ||
-         surface->height != panel_height()) && g_pgraph_present_surface)
-        surface = g_pgraph_present_surface;
-    if (!surface || !sync_cpu_surface(surface))
+    if (!surface || surface->width != panel_width() ||
+        surface->height != panel_height())
+        surface = pgraph_fallback_surface();
+    if (!surface || !sync_cpu_surface(surface, 1))
         return 0;
 
     xgpu_plume_f2_log(
@@ -1482,8 +1628,7 @@ static HRESULT submit_draw(D3DPRIMITIVETYPE type, UINT primitive_count,
     }
     XRECOMP_CPU_RECORDER_ZONE_BEGIN(
         cpu_compat_prepare_zone, "D3D Compat Prepare Draw");
-    (void)d3d8_vsh_prepare_draw(g_device_state.vertex_shader);
-    (void)d3d8_combiners_prepare_draw();
+    prepare_draw();
     XRECOMP_CPU_RECORDER_ZONE_END(cpu_compat_prepare_zone);
     if (!d3d8_vsh_is_programmable(g_device_state.vertex_shader)) {
         const DWORD position =
@@ -1589,8 +1734,7 @@ static HRESULT submit_persistent_indexed_draw(
         return S_FALSE;
     draw_vertices = vertices + (size_t)vertex_offset;
 
-    (void)d3d8_vsh_prepare_draw(g_device_state.vertex_shader);
-    (void)d3d8_combiners_prepare_draw();
+    prepare_draw();
     if (!d3d8_vsh_is_programmable(g_device_state.vertex_shader)) {
         const DWORD position =
             g_device_state.vertex_shader & D3DFVF_POSITION_MASK;
@@ -1712,8 +1856,7 @@ static HRESULT submit_native_indexed_draw(
         normalized[i] = (uint32_t)indices16[i] - range.minimum;
     draw_vertices = vertices + (size_t)vertex_offset;
 
-    (void)d3d8_vsh_prepare_draw(g_device_state.vertex_shader);
-    (void)d3d8_combiners_prepare_draw();
+    prepare_draw();
     if (!d3d8_vsh_is_programmable(g_device_state.vertex_shader)) {
         const DWORD position =
             g_device_state.vertex_shader & D3DFVF_POSITION_MASK;
@@ -1944,6 +2087,13 @@ static void clear_rects(DWORD count, const D3DRECT *rects, DWORD flags,
         (color & 0xff) / 255.0f,
         ((color >> 24) & 0xff) / 255.0f,
     };
+    color_write_mask &= 0xFu;
+    if ((flags & D3DCLEAR_TARGET) && color_write_mask &&
+        (color_write_mask != 0xFu || (count && rects))) {
+        /* Preserve channels or pixels excluded by a partial clear. Binding a
+         * target alone still does not seed recycled guest allocations. */
+        sync_cpu_surface(g_pgraph_current_surface, 1);
+    }
     for (i = 0; i < rect_count; ++i) {
         XgpuRect rect;
         const XgpuRect *rect_ptr = NULL;

@@ -18,6 +18,12 @@ descriptor refreshes) must use d3d_hle_guest_try_read_u32 and treat an
 unreadable header as "not this resource" — never the aborting
 d3d_hle_guest_read_u32/xbox_guest_ptr fail-fast, which is reserved for
 dereferencing state the guest just handed us.
+
+MM3 gameplay2 also proved that caller-owned surface headers are mutable: three
+logically distinct 640x480/320x240 offscreen targets collapsed onto the stale
+256x256 descriptor cached at first adoption. The same tolerant refresh must
+therefore cover surfaces, including their Parent field, before SetRenderTarget
+keys the hosted image.
 """
 
 import sys
@@ -71,6 +77,17 @@ def main():
             f"{name} must revalidate via the tolerant "
             "d3d_hle_guest_try_read_u32 and reject unreadable slots"
         )
+
+    refresh = extract_function(text, "d3d_hle_guest_refresh_external_resource")
+    assert "resource->kind != D3D_HLE_RESOURCE_TEXTURE &&" in refresh
+    assert "resource->kind != D3D_HLE_RESOURCE_SURFACE" in refresh, (
+        "reused caller-owned surfaces must refresh their live descriptor"
+    )
+    assert "resource->object_va + 20u, &parent_va" in refresh, (
+        "surface refresh must read the live Parent field tolerantly"
+    )
+    assert "resource->parent_va == parent_va" in refresh
+    assert "resource->parent_va = parent_va" in refresh
     print("d3d_hle_registry_walk_tolerant_reads_contract: OK")
 
 

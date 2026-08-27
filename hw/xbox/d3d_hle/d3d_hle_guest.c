@@ -18,6 +18,7 @@
 #include "xemu_d3d_hle.h"
 #include "xgpu_renderer.h"
 #include "kernel/xbox_memory_layout.h"
+#include "qemu/fast-hash.h"
 
 #include <limits.h>
 #include <math.h>
@@ -52,7 +53,8 @@ int d3d8_PgraphSetRenderTarget(const XgpuSurfaceBinding *binding);
 int d3d8_PgraphBindSurfaceTextureStage(
     uint32_t stage, uint32_t offset, uint32_t unnormalized_coords,
     uint32_t texture_format);
-int d3d8_PgraphDownloadSurfaceRange(uint32_t start, uint32_t bytes);
+int d3d8_PgraphDownloadSurfaceRange(uint32_t start, uint32_t bytes,
+                                    int zeta_only);
 #if !defined(XRECOMP_D3D_HLE_TEST_NO_FALLBACKS)
 void d3d_hle_guest_materialize_deferred_fixed_state(void);
 void d3d_hle_guest_materialize_deferred_fog_state(void);
@@ -124,6 +126,7 @@ d3d_hle_guest_fatal(const char *operation, HRESULT result);
 static uint32_t d3d_hle_guest_level_bytes(
     uint32_t width, uint32_t height, uint32_t depth, uint32_t format,
     uint32_t *pitch_out);
+static int d3d_hle_guest_format_is_compressed(uint32_t format);
 static uint32_t d3d_hle_guest_size_pitch(uint32_t size);
 static uint32_t d3d_hle_guest_level_storage_bytes(
     uint32_t width, uint32_t height, uint32_t depth, uint32_t format,
@@ -171,6 +174,7 @@ typedef struct D3DHleGuestResource {
     void *host_object;
     uint64_t version;
     uint64_t uploaded_version;
+    uint64_t uploaded_content_hash;
     uint64_t content_serial;
     uint64_t cpu_scanout_hash;
     uint32_t cpu_scanout_hash_valid;
@@ -331,6 +335,7 @@ static void d3d_hle_guest_refresh_external_resource(
     uint32_t bytes = 0;
     uint32_t level;
     uint32_t linear_pitch;
+    uint32_t parent_va;
 
     if (!resource || resource->owned_object)
         return;
@@ -353,14 +358,13 @@ static void d3d_hle_guest_refresh_external_resource(
     }
 
     /*
-     * XGSetTextureHeader-style callers reuse a caller-owned
-     * D3DPixelContainer object for unrelated allocations. Resource_Register
-     * only relocates Data; Format and Size are ordinary guest fields and may
-     * have changed since this object was first adopted. Treating the cached
-     * descriptor as immutable can turn, for example, a 512x256 A8 mip chain
-     * into a 640x480 LIN_A8R8G8B8 upload and consume the following texture.
+     * Caller-owned pixel-container and surface headers are mutable. Games
+     * reuse them for unrelated allocations while the HLE registry record is
+     * still live, so Data, Format, Size, and a surface's Parent must be read
+     * from the current guest header rather than the first adoption.
      */
-    if (resource->kind != D3D_HLE_RESOURCE_TEXTURE)
+    if (resource->kind != D3D_HLE_RESOURCE_TEXTURE &&
+        resource->kind != D3D_HLE_RESOURCE_SURFACE)
         return;
 
     if (!d3d_hle_guest_try_read_u32(
@@ -370,10 +374,17 @@ static void d3d_hle_guest_refresh_external_resource(
         !d3d_hle_guest_try_read_u32(
             resource->object_va + 16u, &size))
         return;
+    parent_va = resource->parent_va;
+    if (resource->kind == D3D_HLE_RESOURCE_SURFACE &&
+        !d3d_hle_guest_try_read_u32(
+            resource->object_va + 20u, &parent_va))
+        return;
     data_va &= 0x0FFFFFFFu;
     format = (format_word >> 8) & 0xFFu;
     levels = (format_word >> 16) & 0xFu;
     if (!levels)
+        levels = 1u;
+    if (resource->kind == D3D_HLE_RESOURCE_SURFACE)
         levels = 1u;
     if (size) {
         width = (size & 0xFFFu) + 1u;
@@ -400,7 +411,8 @@ static void d3d_hle_guest_refresh_external_resource(
         if (level_height > 1u) level_height >>= 1;
         if (level_depth > 1u) level_depth >>= 1;
     }
-    if (format_word & 0x4u) {
+    if (resource->kind == D3D_HLE_RESOURCE_TEXTURE &&
+        (format_word & 0x4u)) {
         bytes = (bytes + 127u) & ~127u;
         if (bytes > UINT32_MAX / 6u)
             d3d_hle_guest_fatal(
@@ -415,7 +427,8 @@ static void d3d_hle_guest_refresh_external_resource(
         resource->depth == depth &&
         resource->levels == levels &&
         resource->format == format &&
-        resource->size == size)
+        resource->size == size &&
+        resource->parent_va == parent_va)
         return;
 
     resource->data_va = data_va;
@@ -426,14 +439,16 @@ static void d3d_hle_guest_refresh_external_resource(
     resource->levels = levels;
     resource->format = format;
     resource->size = size;
+    resource->parent_va = parent_va;
     resource->version = ++g_hle_texture_version;
     D3D_HLE_F2_LOG(
-        "hle texture-header-refresh obj=%08X data=%08X "
-        "%ux%u d=%u lv=%u fmt=%02X word=%08X size=%08X bytes=%u",
-        resource->object_va, resource->data_va,
+        "hle resource-header-refresh kind=%u obj=%08X data=%08X "
+        "%ux%u d=%u lv=%u fmt=%02X word=%08X size=%08X bytes=%u "
+        "parent=%08X",
+        resource->kind, resource->object_va, resource->data_va,
         resource->width, resource->height, resource->depth,
         resource->levels, resource->format, format_word,
-        resource->size, resource->data_bytes);
+        resource->size, resource->data_bytes, resource->parent_va);
 }
 
 static void d3d_hle_guest_prepare_fixed_state(void)
@@ -592,7 +607,8 @@ static uint32_t d3d_hle_guest_texture_surface_key(
     uint32_t memory_key = 0;
     XRECOMP_CPU_RECORDER_ZONE_BEGIN(
         cpu_texture_surface_key_zone, "D3D HLE Texture Surface Lookup");
-    if (!texture || texture->depth != 1u || texture->levels != 1u) {
+    if (!texture || texture->depth != 1u || texture->levels != 1u ||
+        d3d_hle_guest_format_is_compressed(texture->format)) {
         XRECOMP_CPU_RECORDER_ZONE_END(cpu_texture_surface_key_zone);
         return 0;
     }
@@ -645,6 +661,12 @@ static uint32_t d3d_hle_guest_texture_surface_key(
     memory_key = texture->data_va;
     XRECOMP_CPU_RECORDER_ZONE_END(cpu_texture_surface_key_zone);
     return memory_key;
+}
+
+static uint32_t d3d_hle_guest_surface_resource(
+    const D3DHleGuestResource *surface)
+{
+    return surface->host_handle ? surface->host_handle : surface->object_va;
 }
 
 static void d3d_hle_guest_rebind_surface_textures(void)
@@ -1770,8 +1792,9 @@ void d3d_hle_guest_draw_indexed_vertices(
             return;
         }
     }
-    indices =
-        (const uint16_t *)xbox_guest_ptr(resolved_indices_va);
+    indices = (const uint16_t *)d3d_hle_guest_snapshot_range(
+        0, resolved_indices_va,
+        (size_t)index_count * sizeof(*indices));
 #if !defined(XRECOMP_D3D_HLE_TEST_NO_FALLBACKS)
     if (xgpu_plume_f2_active()) {
         uint32_t min_index = UINT32_MAX;
@@ -2504,7 +2527,10 @@ static void d3d_hle_guest_finish_surface_cpu_lock(
         surface->version = g_hle_texture_version;
         texture->version = g_hle_texture_version;
         if (!surface->host_object && surface->data_va)
-            d3d8_PgraphMarkCpuSurfaceLock(surface->data_va, flags);
+            d3d8_PgraphMarkCpuSurfaceLock(
+                surface->data_va, flags,
+                g_hle_present_snapshot_valid &&
+                g_hle_present_snapshot.SwapEffect == D3DSWAPEFFECT_COPY);
         if (surface->host_object &&
             surface->object_va == g_hle_back_buffer) {
             if (!surface->cpu_scanout_active)
@@ -2700,6 +2726,7 @@ void d3d_hle_guest_switch_texture(
     uint32_t resolved_nonzero_bytes = 0;
     int surface_bound = 0;
     int texture_cache_hit = 0;
+    uint64_t content_hash;
     XRECOMP_CPU_RECORDER_ZONE_BEGIN(
         cpu_hle_switch_texture_zone, "D3D HLE Switch Texture");
     if (method < NV097_SET_TEXTURE_OFFSET ||
@@ -2709,7 +2736,10 @@ void d3d_hle_guest_switch_texture(
     stage = (method - NV097_SET_TEXTURE_OFFSET) >> 6;
     XRECOMP_CPU_RECORDER_ZONE_BEGIN(
         cpu_hle_texture_find_zone, "D3D HLE Texture Data Lookup");
-    texture = d3d_hle_guest_find_texture_data(data);
+    texture = d3d_hle_guest_find_resource(
+        g_hle_bindings.texture_resource[stage]);
+    if (!d3d_hle_guest_texture_data_candidate(texture, data))
+        texture = d3d_hle_guest_find_texture_data(data);
     XRECOMP_CPU_RECORDER_ZONE_END(cpu_hle_texture_find_zone);
     if (!texture)
         d3d_hle_guest_fatal("SwitchTexture unowned texture", E_NOTIMPL);
@@ -2838,7 +2868,7 @@ void d3d_hle_guest_switch_texture(
             return;
         }
         resolved_surfaces =
-            d3d8_PgraphDownloadSurfaceRange(texture->data_va, bytes);
+            d3d8_PgraphDownloadSurfaceRange(texture->data_va, bytes, 1);
         if (resolved_surfaces > 0)
             texture->version = ++g_hle_texture_version;
     }
@@ -2851,6 +2881,26 @@ void d3d_hle_guest_switch_texture(
             resolved_nonzero_bytes += resolved[i] != 0;
     }
 #endif
+    content_hash = fast_hash((const uint8_t *)pixels, bytes);
+    if (palette) {
+        uint32_t entry_count = xbox_d3d8_palette_entry_count(
+            d3d_hle_guest_read_u32(palette->object_va));
+        content_hash ^= fast_hash(
+            d3d_hle_guest_data_ptr(palette->data_va),
+            (size_t)entry_count * sizeof(uint32_t));
+    }
+    if (texture->uploaded_version &&
+        texture->uploaded_content_hash != content_hash) {
+        D3D_HLE_F2_LOG(
+            "hle texture-content-change obj=%08X data=%08X "
+            "hash=%016llX->%016llX ver=%llu->%llu",
+            texture->object_va, texture->data_va,
+            (unsigned long long)texture->uploaded_content_hash,
+            (unsigned long long)content_hash,
+            (unsigned long long)texture->version,
+            (unsigned long long)(g_hle_texture_version + 1u));
+        texture->version = ++g_hle_texture_version;
+    }
     memset(&binding, 0, sizeof(binding));
     binding.stage = stage;
     binding.guest_ptr = texture->object_va;
@@ -2980,6 +3030,7 @@ void d3d_hle_guest_switch_texture(
     binding.pixels = pixels;
     xgpu_plume_set_texture_ex(&binding);
     texture->uploaded_version = binding.version;
+    texture->uploaded_content_hash = content_hash;
     {
         uint32_t head[4] = {0};
         uint32_t head_bytes = bytes < sizeof(head) ? bytes : sizeof(head);
@@ -4379,6 +4430,7 @@ HRESULT d3d_hle_guest_copy_rects(
         d3d_hle_guest_adopt_resource(source_va);
     D3DHleGuestResource *destination =
         d3d_hle_guest_adopt_resource(destination_va);
+    XgpuSurfaceBinding destination_binding;
     uint32_t copy_count = count ? count : 1u;
     uint32_t bpp;
     uint32_t i;
@@ -4400,8 +4452,40 @@ HRESULT d3d_hle_guest_copy_rects(
         return S_OK;
     }
     bpp = d3d_hle_guest_format_bytes_per_pixel(source->format);
+    /* Keep a complete hosted surface copy on the GPU. The OpenGL backend uses
+     * this path to transfer MM3's alpha-only light mask before the lighting
+     * pass. Copying only guest RAM leaves Plume sampling the pre-copy surface.
+     * Partial and non-hosted copies retain the byte-exact CPU fallback below. */
+    memset(&destination_binding, 0, sizeof(destination_binding));
+    destination_binding.color_resource = destination->host_handle
+        ? destination->host_handle
+        : (destination->data_va == source->data_va
+            ? d3d_hle_guest_surface_resource(destination)
+            : destination->data_va);
+    destination_binding.width = destination->width;
+    destination_binding.height = destination->height;
+    destination_binding.image_width = destination->width;
+    destination_binding.image_height = destination->height;
+    destination_binding.color_pitch =
+        d3d_hle_guest_surface_pitch(destination);
+    destination_binding.color_format = destination->format;
+    destination_binding.layout =
+        (destination->size ||
+         d3d_hle_guest_find_tile(destination->data_va))
+            ? XGPU_SURFACE_PITCH : XGPU_SURFACE_SWIZZLE;
+    destination_binding.sample_count = 1;
+    if (!count && bpp == 4u && source->width == destination->width &&
+        source->height == destination->height &&
+        xgpu_plume_blit_surface(
+            &destination_binding, destination->data_va,
+            source->host_handle ? source->host_handle : source->data_va,
+            source->data_va)) {
+        destination->version = ++g_hle_texture_version;
+        destination->uploaded_version = destination->version;
+        return S_OK;
+    }
     (void)d3d8_PgraphDownloadSurfaceRange(
-        source->data_va, source->data_bytes);
+        source->data_va, source->data_bytes, 0);
     for (i = 0; i < copy_count; ++i) {
         uint32_t left = 0, top = 0;
         uint32_t right = source->width, bottom = source->height;
@@ -4812,8 +4896,14 @@ HRESULT d3d_hle_guest_resource_register(
         data &= 0x0FFFFFFFu;
     d3d_hle_guest_write_u32(resource_va + 4u, data);
     resource = d3d_hle_guest_adopt_resource(resource_va);
-    if (resource)
+    if (resource) {
         resource->data_va = data & 0x0FFFFFFFu;
+        /* Register publishes the resource's current guest bytes. A streaming
+         * allocator may reuse the same header, data address, and descriptor
+         * for different contents, so metadata equality cannot preserve the
+         * previous hosted texture generation. */
+        resource->version = ++g_hle_texture_version;
+    }
     return S_OK;
 }
 

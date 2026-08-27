@@ -1,4 +1,11 @@
-"""Contract: draw paths must not abort on unresolvable guest index data.
+"""Contract: indexed draws must snapshot the complete guest index range.
+
+Xemu guest virtual pages may map to discontiguous physical pages, so a host
+pointer translated from the first byte is valid only through that guest page.
+MM3 EID 1195 exposed this by reading 1,512 index bytes at 0x01027B3A: the
+prefix was coherent, then the direct host-pointer walk crossed 0x01028000 and
+mixed unrelated memory into the mesh. The shared page-aware snapshot helper
+must copy the complete range before the index walk.
 
 Runtime evidence (RSC2, trace-armed run): after ~533K hooks of live menu/FMV
 rendering through Plume, the title issued DrawIndexedVertices with an index
@@ -43,17 +50,17 @@ def main():
     body = extract_function(text, "d3d_hle_guest_draw_indexed_vertices")
 
     probe = body.find("d3d_hle_guest_try_read_u32(resolved_indices_va")
-    deref = body.find("xbox_guest_ptr(resolved_indices_va)")
+    snapshot = body.find("d3d_hle_guest_snapshot_range(", probe)
     assert probe != -1, (
         "draw_indexed_vertices must probe the resolved index pointer with "
         "d3d_hle_guest_try_read_u32 before dereferencing: an unresolved "
         "offset (RSC2: 000001C0) reaches xbox_guest_ptr and aborts the "
         "whole process on guest-controlled data"
     )
-    assert deref != -1 and probe < deref, (
-        "the tolerant probe must precede the xbox_guest_ptr dereference"
+    assert snapshot != -1 and probe < snapshot, (
+        "the tolerant probe must precede the page-aware range snapshot"
     )
-    guard = body[probe:deref]
+    guard = body[probe:snapshot]
     assert "dropped indexed draw" in guard, (
         "the unreadable-index path must log a distinctive diagnostic "
         "('dropped indexed draw') carrying binding state so the "
@@ -81,6 +88,17 @@ def main():
     assert "index_count - 1u" in before_probe or "index_bytes" in before_probe, (
         "the last-word address must be derived from index_count so the "
         "probe scales with the draw"
+    )
+    snapshot_call = body[snapshot : snapshot + 240]
+    assert "resolved_indices_va" in snapshot_call, (
+        "the snapshot must start at the resolved index address"
+    )
+    assert "index_count" in snapshot_call and "sizeof(*indices)" in snapshot_call, (
+        "the snapshot must cover every index byte"
+    )
+    assert "xbox_guest_ptr(resolved_indices_va)" not in body, (
+        "a single translated host pointer must not be walked across guest "
+        "page boundaries"
     )
     print("d3d_hle_draw_index_resolution_contract: OK")
 

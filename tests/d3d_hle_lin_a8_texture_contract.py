@@ -43,19 +43,19 @@ def main():
         "unmapped it silently samples the white fallback (RSC2 creates a "
         "192x125 pitch-192 LIN_A8 texture at boot)"
     )
-    # The alpha-replication view swizzle (RGB=1, A=R) must cover LIN_A8
-    # wherever it covers A8.
-    swizzle_sites = [
-        m.start() for m in re.finditer(r"format\s*==\s*0x19[uU]?", text)
-    ]
-    assert swizzle_sites, "expected an A8 component-mapping special case"
-    for site in swizzle_sites:
-        window = text[site : site + 200]
-        assert re.search(r"0x1F[uU]?", window), (
-            "A8 special-case near offset %d does not also cover LIN_A8 "
-            "(0x1F); both formats need RGB=ONE, A=R component mapping"
-            % site
-        )
+    # The ordinary 2D alpha-replication view swizzle (RGB=1, A=R) must pair
+    # LIN_A8 with A8. Cube-only A8 handling is a separate legal path.
+    paired = re.search(
+        r"format\s*==\s*0x19[uU]?\s*\|\|\s*format\s*==\s*0x1F[uU]?",
+        text,
+    )
+    assert paired, "expected the 2D A8 component mapping to include LIN_A8"
+    window = text[paired.start() : paired.start() + 350]
+    assert re.search(
+        r"RenderSwizzle::ONE,\s*RenderSwizzle::ONE,\s*"
+        r"RenderSwizzle::ONE,\s*RenderSwizzle::R",
+        window,
+    ), "A8/LIN_A8 must sample as RGB=ONE, A=R"
     print("d3d_hle_lin_a8_texture_contract: OK")
 
 

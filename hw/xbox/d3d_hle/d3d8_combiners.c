@@ -1391,7 +1391,9 @@ static uint32_t register_combiner_shader(const NV2ACombinerState *state)
 {
     static const char prefix[] = "// XRECOMP_HLSL\n";
     char source[sizeof(prefix) + 16384];
+    uint32_t cube_texture_mask = 0;
     int length;
+    int i;
     memcpy(source, prefix, sizeof(prefix) - 1);
     length = d3d8_combiners_generate_hlsl(
         state, source + sizeof(prefix) - 1,
@@ -1399,7 +1401,11 @@ static uint32_t register_combiner_shader(const NV2ACombinerState *state)
     if (length < 0)
         return 0;
     source[sizeof(prefix) - 1 + (size_t)length] = '\0';
-    return xgpu_plume_create_pixel_shader(source);
+    for (i = 0; i < NV2A_MAX_TEXTURES; ++i) {
+        if (state->texture_cube[i])
+            cube_texture_mask |= 1u << i;
+    }
+    return xgpu_plume_create_pixel_shader(source, cube_texture_mask);
 }
 
 static uint32_t combiner_shader_handle(const NV2ACombinerState *state)

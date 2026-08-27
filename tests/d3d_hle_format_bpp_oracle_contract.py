@@ -87,7 +87,13 @@ UNDEFINED = {0x08, 0x09, 0x0A, 0x0D, 0x14, 0x15, 0x18,
 
 
 def extract_function(text, name):
-    start = text.index(f" {name}(")
+    match = re.search(
+        rf"(?m)^static\s+[^\n(]+\b{re.escape(name)}\s*"
+        rf"\([^;{{}}]*\)\s*{{",
+        text,
+    )
+    assert match, f"function definition not found: {name}"
+    start = match.start()
     brace = text.index("{", start)
     depth = 0
     for i in range(brace, len(text)):

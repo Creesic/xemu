@@ -18,6 +18,7 @@
 #include "plume_ui_canvas.h"
 #include "plume_vertex_stream.h"
 #include "xps_translate.h"
+#include "../d3d8_swizzle.h"
 #include "../d3d8_vsh.h"
 #include "../kernel/xbox_memory_layout.h"
 /* NV2A pgraph YUV oracle: BT.601 integer conversion shared with xemu's
@@ -725,6 +726,7 @@ bool PlumeDraw::reconfigureRenderExtent(
         surface.guestAddr = old.guestAddr;
         surface.guestPitch = old.guestPitch;
         surface.guestFormat = old.guestFormat;
+        surface.guestLayout = old.guestLayout;
         surface.contentSerial = old.contentSerial;
         surface.resolvedSerial = old.resolvedSerial;
         if (!plumeScaledExtent(surface.width, surface.height,
@@ -1088,13 +1090,21 @@ bool PlumeDraw::initPipelines(PlumeContext &ctx)
         /* 1x1 white fallback for unbound texture stages */
         m_whiteTex = ctx.device()->createTexture(
             RenderTextureDesc::Texture2D(1, 1, 1, RenderFormat::B8G8R8A8_UNORM));
+        m_whiteCubeTex = ctx.device()->createTexture(RenderTextureDesc::Texture(
+            RenderTextureDimension::TEXTURE_2D, 1, 1, 1, 1, 6,
+            RenderFormat::B8G8R8A8_UNORM, RenderTextureFlag::CUBE));
         if (m_whiteTex) {
             m_whiteView = m_whiteTex->createTextureView(
                 RenderTextureViewDesc::Texture2D(RenderFormat::B8G8R8A8_UNORM));
+            if (m_whiteCubeTex) {
+                m_whiteCubeView = m_whiteCubeTex->createTextureView(
+                    RenderTextureViewDesc::TextureCube(
+                        RenderFormat::B8G8R8A8_UNORM));
+            }
             uint8_t px[256] = { 255, 255, 255, 255 };
             std::unique_ptr<RenderBuffer> st =
                 ctx.device()->createBuffer(RenderBufferDesc::UploadBuffer(sizeof(px)));
-            if (m_whiteView && st &&
+            if (m_whiteView && m_whiteCubeView && st &&
                 copyToMappedBuffer(st.get(), px, sizeof(px))) {
                 RenderCommandList *up = ctx.uploadCmd();
                 up->begin();
@@ -1102,6 +1112,10 @@ bool PlumeDraw::initPipelines(PlumeContext &ctx)
                     RenderBarrierStage::COPY,
                     RenderTextureBarrier(
                         m_whiteTex.get(), RenderTextureLayout::COPY_DEST));
+                up->barriers(
+                    RenderBarrierStage::COPY,
+                    RenderTextureBarrier(
+                        m_whiteCubeTex.get(), RenderTextureLayout::COPY_DEST));
                 RenderTextureCopyLocation csrc =
                     RenderTextureCopyLocation::PlacedFootprint(
                         st.get(), RenderFormat::B8G8R8A8_UNORM,
@@ -1110,10 +1124,20 @@ bool PlumeDraw::initPipelines(PlumeContext &ctx)
                     RenderTextureCopyLocation::Subresource(
                         m_whiteTex.get(), 0, 0);
                 up->copyTextureRegion(cdst, csrc, 0, 0, 0, nullptr);
+                for (uint32_t face = 0; face < 6; ++face) {
+                    RenderTextureCopyLocation cubeDst =
+                        RenderTextureCopyLocation::Subresource(
+                            m_whiteCubeTex.get(), 0, face);
+                    up->copyTextureRegion(cubeDst, csrc, 0, 0, 0, nullptr);
+                }
                 up->barriers(
                     RenderBarrierStage::GRAPHICS,
                     RenderTextureBarrier(
                         m_whiteTex.get(), RenderTextureLayout::SHADER_READ));
+                up->barriers(
+                    RenderBarrierStage::GRAPHICS,
+                    RenderTextureBarrier(
+                        m_whiteCubeTex.get(), RenderTextureLayout::SHADER_READ));
                 up->end();
                 const RenderCommandList *cl = up;
                 ctx.queue()->executeCommandLists(
@@ -1126,6 +1150,8 @@ bool PlumeDraw::initPipelines(PlumeContext &ctx)
                              "[PLUME] white fallback upload unavailable\n");
                 m_whiteView.reset();
                 m_whiteTex.reset();
+                m_whiteCubeView.reset();
+                m_whiteCubeTex.reset();
             }
         }
 
@@ -1252,7 +1278,8 @@ bool PlumeDraw::initPipelines(PlumeContext &ctx)
         piPld.allowInputLayout = true;
         m_progIdxLayout = ctx.device()->createPipelineLayout(piPld);
 
-        m_progReady = vsok && m_whiteTex && m_whiteView && m_progSampler &&
+        m_progReady = vsok && m_whiteTex && m_whiteView &&
+                      m_whiteCubeTex && m_whiteCubeView && m_progSampler &&
                       m_progLayout && m_progIdxLayout;
         if (m_progReady) {
             PlumePixelShader fallback;
@@ -1429,7 +1456,9 @@ static bool plume_map_texfmt(uint32_t d3dfmt, RenderFormat &out)
     case 0x12: out = RenderFormat::B8G8R8A8_UNORM; return true;  /* LIN_A8R8G8B8 */
     case 0x1E: out = RenderFormat::B8G8R8A8_UNORM; return true;  /* LIN_X8R8G8B8 */
     case 0x19: out = RenderFormat::R8_UNORM;        return true;  /* A8 */
+    case 0x1A: out = RenderFormat::R8G8_UNORM;      return true;  /* A8L8 */
     case 0x1F: out = RenderFormat::R8_UNORM;        return true;  /* LIN_A8 */
+    case 0x20: out = RenderFormat::R8G8_UNORM;      return true;  /* LIN_A8L8 */
     case 0x24: out = RenderFormat::B8G8R8A8_UNORM;  return true;  /* YUY2, converted */
     case 0x25: out = RenderFormat::B8G8R8A8_UNORM;  return true;  /* UYVY, converted */
     case 0x35: out = RenderFormat::R16_UNORM;       return true;  /* LU_IMAGE_Y16 */
@@ -1876,12 +1905,8 @@ void PlumeDraw::uploadRecordedTexture(PlumeContext &ctx,
     if (cube) {
         /* NV2A cubemap: 6 consecutive faces (+X,-X,+Y,-Y,+Z,-Z), each face a
          * full mip chain, face stride rounded up to 128 bytes (xemu
-         * NV2A_CUBEMAP_FACE_ALIGNMENT). Block-compressed only — swizzled
-         * uncompressed cubes fail closed upstream. Face order matches the
-         * D3D12 cube array order 1:1. Accepting blockW==1 cubes here fed
-         * MM3 real cubemap content instead of the white fallback, but user
-         * QA (2026-08-02) reported odd lighting; verify uncompressed face
-         * order/format semantics before re-enabling. */
+         * NV2A_CUBEMAP_FACE_ALIGNMENT). A8 and A8L8 are captured uncompressed
+         * light cubes; other uncompressed cube formats remain fail-closed. */
         struct TextureMip {
             uint32_t width, height, rows, sourcePitch;
             uint32_t rowWidth, rowPitch;
@@ -1894,7 +1919,9 @@ void PlumeDraw::uploadRecordedTexture(PlumeContext &ctx,
         size_t faceStagingBytes = 0;
         uint32_t mw = w, mh = h;
 
-        if (dimensionality != 2 || blockW <= 1 || textureLevels > 16) {
+        if (dimensionality != 2 ||
+            (blockW <= 1 && format != 0x19u && format != 0x1Au) ||
+            textureLevels > 16) {
             clear_stage();
             return;
         }
@@ -1925,7 +1952,20 @@ void PlumeDraw::uploadRecordedTexture(PlumeContext &ctx,
             RenderTextureDimension::TEXTURE_2D, w, h, 1, textureLevels, 6, pf,
             RenderTextureFlag::CUBE));
         if (!t.tex) { clear_stage(); return; }
-        t.view = t.tex->createTextureView(RenderTextureViewDesc::TextureCube(pf));
+        RenderTextureViewDesc viewDesc =
+            RenderTextureViewDesc::TextureCube(pf);
+        if (format == 0x19u) {
+            /* A8 stores alpha in R; color channels sample as one. */
+            viewDesc.componentMapping = RenderComponentMapping(
+                RenderSwizzle::ONE, RenderSwizzle::ONE,
+                RenderSwizzle::ONE, RenderSwizzle::R);
+        } else if (format == 0x1Au) {
+            /* A8L8 stores L in R and A in G after unswizzling. */
+            viewDesc.componentMapping = RenderComponentMapping(
+                RenderSwizzle::R, RenderSwizzle::R,
+                RenderSwizzle::R, RenderSwizzle::G);
+        }
+        t.view = t.tex->createTextureView(viewDesc);
         if (!t.view) { clear_stage(); return; }
 
         std::unique_ptr<RenderBuffer> staging = ctx.device()->createBuffer(
@@ -2105,6 +2145,11 @@ void PlumeDraw::uploadRecordedTexture(PlumeContext &ctx,
                 viewDesc.componentMapping = RenderComponentMapping(
                     RenderSwizzle::ONE, RenderSwizzle::ONE,
                     RenderSwizzle::ONE, RenderSwizzle::R);
+            } else if (format == 0x1A || format == 0x20) {
+                /* A8L8 / LIN_A8L8: (L,L,L,A). */
+                viewDesc.componentMapping = RenderComponentMapping(
+                    RenderSwizzle::R, RenderSwizzle::R,
+                    RenderSwizzle::R, RenderSwizzle::G);
             } else if (format == 0x35) {
                 viewDesc.componentMapping = RenderComponentMapping(
                     RenderSwizzle::R, RenderSwizzle::R,
@@ -2868,42 +2913,66 @@ bool PlumeDraw::uploadColorSurface(PlumeContext &ctx, uint32_t guest,
     return true;
 }
 
-bool PlumeDraw::blitSurface(PlumeContext &ctx, uint32_t dstGuest,
-                            uint32_t srcGuest, uint32_t width, uint32_t height)
+bool PlumeDraw::blitSurface(PlumeContext &ctx,
+                            const XgpuSurfaceBinding &destination,
+                            uint32_t dstGuest, uint32_t srcResource,
+                            uint32_t srcGuest)
 {
-    if (!m_texReady || !dstGuest || !srcGuest || dstGuest == srcGuest)
+    if (!m_texReady || !destination.color_resource || !srcResource ||
+        destination.color_resource > UINT32_MAX ||
+        !destination.width || !destination.height)
         return false;
-    auto srcLatest = m_latestSurfaceGeneration.find(srcGuest);
-    if (srcLatest == m_latestSurfaceGeneration.end())
+    const uint32_t dstResource =
+        static_cast<uint32_t>(destination.color_resource);
+    dstGuest = dstGuest ? dstGuest : dstResource;
+    uint64_t srcGeneration = 0;
+    auto recordedSource = m_guestLatestSurfaceGeneration.find(srcResource);
+    if (recordedSource == m_guestLatestSurfaceGeneration.end() && srcGuest)
+        recordedSource = m_guestLatestSurfaceGeneration.find(srcGuest);
+    if (recordedSource != m_guestLatestSurfaceGeneration.end())
+        srcGeneration = recordedSource->second;
+    if (!srcGeneration) {
+        auto liveSource = m_latestSurfaceGeneration.find(srcResource);
+        if (liveSource == m_latestSurfaceGeneration.end() && srcGuest)
+            liveSource = m_latestSurfaceGeneration.find(srcGuest);
+        if (liveSource != m_latestSurfaceGeneration.end())
+            srcGeneration = liveSource->second;
+    }
+    if (!srcGeneration)
         return false;
-    auto srcIt = m_surfaceCache.find(srcLatest->second);
-    if (srcIt == m_surfaceCache.end() || srcIt->second.width != width ||
-        srcIt->second.height != height)
+    auto srcIt = m_surfaceCache.find(srcGeneration);
+    const uint32_t width = destination.image_width
+        ? destination.image_width : destination.width;
+    const uint32_t height = destination.image_height
+        ? destination.image_height : destination.height;
+    if (srcIt != m_surfaceCache.end() &&
+        (srcIt->second.width != width || srcIt->second.height != height))
         return false;
 
-    /* Mint a stable generation for the destination display buffer. */
-    XgpuSurfaceBinding binding = {};
-    binding.color_resource = dstGuest;
-    binding.width = width;
-    binding.height = height;
-    binding.color_pitch = width * 4u;
-    binding.color_format = 8;   /* A8R8G8B8-class, matches rendered surfaces */
-    binding.layout = 1;
-    binding.sample_count = 1;
-    PlumeSurfaceBindingIds ids = m_surfaceBindingTracker.bind(binding);
+    const PlumeSurfaceBindingIds ids =
+        m_surfaceBindingTracker.bind(destination);
+    if (ids.color_generation == srcGeneration)
+        return false;
     if (!ensureColorSurface(ctx, ids.color_generation, width, height))
         return false;
+    auto dstIt = m_surfaceCache.find(ids.color_generation);
+    dstIt->second.guestAddr = dstGuest;
+    dstIt->second.guestPitch = destination.color_pitch;
+    dstIt->second.guestFormat = destination.color_format;
+    dstIt->second.guestLayout = destination.layout;
 
     GeomDraw draw = {};
-    draw.blitSrcGeneration = srcLatest->second;
+    draw.blitSrcGeneration = srcGeneration;
     draw.blitDstGeneration = ids.color_generation;
-    draw.targetGuest = dstGuest;
-    draw.targetWidth = width;
-    draw.targetHeight = height;
+    draw.targetGuest = dstResource;
+    draw.targetWidth = destination.width;
+    draw.targetHeight = destination.height;
     draw.targetColorGeneration = ids.color_generation;
     draw.recordsColorWrite = 1;
     m_rec.draws.push_back(draw);
+    m_latestSurfaceGeneration[dstResource] = ids.color_generation;
     m_latestSurfaceGeneration[dstGuest] = ids.color_generation;
+    m_guestLatestSurfaceGeneration[dstResource] = ids.color_generation;
     m_guestLatestSurfaceGeneration[dstGuest] = ids.color_generation;
     m_guestSurfaceAddress[ids.color_generation] = dstGuest;
     return true;
@@ -2971,9 +3040,11 @@ bool PlumeDraw::applySurfaceBinding(
         return false;
     }
     auto colorIt = m_surfaceCache.find(ids.color_generation);
-    colorIt->second.guestAddr = (uint32_t)binding.color_resource;
+    colorIt->second.guestAddr =
+        static_cast<uint32_t>(binding.color_resource);
     colorIt->second.guestPitch = binding.color_pitch;
     colorIt->second.guestFormat = binding.color_format;
+    colorIt->second.guestLayout = binding.layout;
 
     auto zetaIt = m_zetaCache.end();
     if (ids.zeta_generation) {
@@ -3221,6 +3292,10 @@ template <class Draw>
     RenderTexture *textures[4] = {};
     RenderTextureView *views[4] = {};
     RenderSampler *samplers[4] = {};
+    uint8_t cubeTextureMask = 0;
+    const auto psIt = m_psReg.find(draw.psHandle);
+    if (psIt != m_psReg.end())
+        cubeTextureMask = psIt->second.cubeTextureMask;
     for (int s = 0; s < 4; s++) {
         if (draw.surfaceStage[s]) {
             auto it = m_surfaceCache.find(draw.surfaceStage[s]);
@@ -3244,7 +3319,9 @@ template <class Draw>
             draw.stageSamplerStateValid[s] != 0);
         if (!samplers[s])
             samplers[s] = m_progSampler.get();
-        key[s] = (uint64_t)(uintptr_t)textures[s];
+        key[s] = textures[s]
+            ? (uint64_t)(uintptr_t)textures[s]
+            : ((cubeTextureMask & (1u << s)) ? 1u : 0u);
         key[4 + s] = (uint64_t)(uintptr_t)samplers[s];
     }
     key[8] = constantOffset;
@@ -3266,6 +3343,10 @@ template <class Draw>
         if (textures[s])
             set->setTexture((uint32_t)s, textures[s],
                             RenderTextureLayout::SHADER_READ, views[s]);
+        else if (cubeTextureMask & (1u << s))
+            set->setTexture((uint32_t)s, m_whiteCubeTex.get(),
+                            RenderTextureLayout::SHADER_READ,
+                            m_whiteCubeView.get());
         else
             set->setTexture((uint32_t)s, m_whiteTex.get(),
                             RenderTextureLayout::SHADER_READ,
@@ -5022,7 +5103,8 @@ void PlumeDraw::consumeVertexPrograms(PlumeContext &ctx,
     recording.vertexPrograms.clear();
 }
 
-uint32_t PlumeDraw::createPixelShader(const char *text)
+uint32_t PlumeDraw::createPixelShader(const char *text,
+                                      uint32_t cubeTextureMask)
 {
     static const char kDirectHlslPrefix[] = "// XRECOMP_HLSL\n";
     if (!text || !*text) return 0;
@@ -5043,6 +5125,7 @@ uint32_t PlumeDraw::createPixelShader(const char *text)
     ps.combinerCB =
         tr.hlsl.find("cbuffer CombinerConsts") != std::string::npos ||
         tr.hlsl.find("cbuffer CombinerCB") != std::string::npos;
+    ps.cubeTextureMask = (uint8_t)(cubeTextureMask & 0xFu);
     ps.ok = !tr.hlsl.empty();
     if (ps.ok && m_pipelinesReady) {
         ps.compileFuture = queueShaderCompile(
@@ -7238,16 +7321,31 @@ void PlumeDraw::completeDownloadsFrom(
             s.downloadBuffer->unmap();
             continue;
         }
+        const uint32_t guestRowBytes =
+            xgpu_plume_guest_color_row_bytes(s.guestFormat, s.width);
         uint8_t *guest = xbox_guest_phys_ptr(
             s.guestAddr, static_cast<size_t>(s.guestPitch) * s.height);
         if (!guest) {
             s.downloadBuffer->unmap();
             continue;
         }
+        std::vector<uint8_t> packedLinear;
+        uint8_t *packTarget = guest;
+        uint32_t packPitch = s.guestPitch;
+        if (s.guestLayout == XGPU_SURFACE_SWIZZLE) {
+            packedLinear.resize(
+                static_cast<size_t>(guestRowBytes) * s.height);
+            packTarget = packedLinear.data();
+            packPitch = guestRowBytes;
+        }
         const bool packed = xgpu_plume_pack_guest_color_surface(
             s.guestFormat, logical.data(), logicalPitch,
-            guest, s.guestPitch,
+            packTarget, packPitch,
             s.width, s.height) != 0;
+        if (packed && s.guestLayout == XGPU_SURFACE_SWIZZLE) {
+            xbox_swizzle_rect(guest, packedLinear.data(), s.width, s.height,
+                              guestRowBytes / s.width);
+        }
         if (xgpu_plume_f2_active()) {
             /* Exposure-loop visibility: the game CPU-reads these small
              * surfaces to drive its next-frame gain. */

@@ -1078,11 +1078,12 @@ void xgpu_plume_set_sampler_ex(const XgpuSamplerBinding *binding)
     g_draw.setSampler(*binding);
 }
 
-extern "C" uint32_t xgpu_plume_create_pixel_shader(const char *text)
+extern "C" uint32_t xgpu_plume_create_pixel_shader(
+    const char *text, uint32_t cubeTextureMask)
 {
     /* Owner-state/RHI entry: finish any in-flight worker job first. */
     xgpu::plume::plume_render_worker_sync();
-    return g_draw.createPixelShader(text);
+    return g_draw.createPixelShader(text, cubeTextureMask);
 }
 
 extern "C" int xgpu_plume_set_vertex_program(const uint32_t *microcode,
@@ -1117,19 +1118,21 @@ xgpu_plume_record_prog_indexed_draw(const XgpuProgIndexedDraw *desc)
     return result;
 }
 
-extern "C" void xgpu_plume_blit_surface(uint32_t dst_guest, uint32_t src_guest,
-                                        uint32_t width, uint32_t height)
+extern "C" int xgpu_plume_blit_surface(
+    const XgpuSurfaceBinding *destination, uint32_t dst_guest,
+    uint32_t src_resource, uint32_t src_guest)
 {
     /* Owner-state/RHI entry: finish any in-flight worker job first. */
     xgpu::plume::plume_render_worker_sync();
-    if (!present_ensure_init())
-        return;
+    if (!destination || !present_ensure_init())
+        return 0;
     uint64_t perf_record_t0 = xgpu_plume_perf_begin();
     bool recorded = g_draw.blitSurface(
-        g_ctx, dst_guest, src_guest, width, height);
+        g_ctx, *destination, dst_guest, src_resource, src_guest);
     xgpu_plume_perf_end(XGPU_PLUME_PERF_RECORD, perf_record_t0);
     if (recorded)
         g_frame_dirty = true;
+    return recorded ? 1 : 0;
 }
 
 extern "C" int xgpu_plume_surface_known(uint32_t guest)
@@ -1206,6 +1209,7 @@ extern "C" int xgpu_plume_download_color_surface(
             return 0;
         plume_wait_ring_drain();
     }
+    g_draw.materializeRecordedSurfaces(g_ctx);
     return g_draw.downloadColorSurface(g_ctx, resource_id, pixels, width,
                                        height, pitch) ? 1 : 0;
 }
@@ -1262,6 +1266,7 @@ extern "C" int xgpu_plume_upload_color_surface(
     if (g_draw.hasQueuedWork() && !xgpu_plume_wait_for_idle(0))
         return 0;
     plume_wait_ring_drain();
+    g_draw.materializeRecordedSurfaces(g_ctx);
     uploaded = g_draw.uploadColorSurface(g_ctx, resource_id, pixels, width,
                                          height, pitch);
     g_surface_sync.recordSurfaceUpload(uploaded, resource_id);
