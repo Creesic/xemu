@@ -16,6 +16,17 @@ bool xemu_d3d_hle_owns_window(void)
     return false;
 }
 
+bool xemu_d3d_hle_set_surface_scale_factor(unsigned int scale)
+{
+    (void)scale;
+    return false;
+}
+
+unsigned int xemu_d3d_hle_get_surface_scale_factor(void)
+{
+    return 1;
+}
+
 XemuD3DHleStatus xemu_d3d_hle_status(void)
 {
     return XEMU_D3D_HLE_STATUS_UNAVAILABLE;

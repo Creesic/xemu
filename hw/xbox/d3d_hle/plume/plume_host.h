@@ -34,7 +34,7 @@ const char *xgpu_plume_get_active_backend_name(void);
 /* Set the logical output extent. After renderer startup this performs a
  * synchronized live resource transition. */
 int xgpu_plume_set_output_extent(uint32_t width, uint32_t height);
-/* Change the integer physical render-target scale immediately (1..6). */
+/* Change the integer physical render-target scale immediately (1..10). */
 int xgpu_plume_set_internal_resolution_scale(uint32_t scale);
 uint32_t xgpu_plume_get_internal_resolution_scale(void);
 

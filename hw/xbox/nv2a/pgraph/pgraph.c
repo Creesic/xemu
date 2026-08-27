@@ -21,6 +21,7 @@
 
 #include <math.h>
 
+#include "hw/xbox/d3d_hle/xemu_d3d_hle.h"
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "ui/xemu-notifications.h"
 #include "ui/xemu-settings.h"
@@ -385,6 +386,13 @@ void nv2a_set_surface_scale_factor(unsigned int scale)
 {
     NV2AState *d = g_nv2a;
 
+    scale = MAX(scale, 1u);
+    g_config.display.quality.surface_scale = scale;
+    if (xemu_d3d_hle_owns_window()) {
+        xemu_d3d_hle_set_surface_scale_factor(scale);
+        return;
+    }
+
     bql_unlock();
     qemu_mutex_lock(&d->pgraph.renderer_lock);
     if (d->pgraph.renderer->ops.set_surface_scale_factor) {
@@ -398,6 +406,10 @@ unsigned int nv2a_get_surface_scale_factor(void)
 {
     NV2AState *d = g_nv2a;
     int s = 1;
+
+    if (xemu_d3d_hle_owns_window()) {
+        return xemu_d3d_hle_get_surface_scale_factor();
+    }
 
     bql_unlock();
     qemu_mutex_lock(&d->pgraph.renderer_lock);

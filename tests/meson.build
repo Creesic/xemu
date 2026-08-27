@@ -111,6 +111,8 @@ d3d_hle_contracts = [
   ['d3d-hle-forza-attach-holes', files('d3d_hle_forza_attach_holes_contract.py')],
   ['d3d-hle-a8l8-texture', files('d3d_hle_a8l8_texture_contract.py')],
   ['d3d-hle-reactivation', files('d3d_hle_reactivation_contract.py')],
+  ['d3d-hle-resolution-scale-option',
+   files('d3d_hle_resolution_scale_option_contract.py')],
   ['d3d-hle-hook-policy', files('d3d_hle_hook_policy_contract.py')],
   ['d3d-hle-scanout-surface', files('d3d_hle_scanout_surface_contract.py')],
   ['d3d-hle-surface-download', files('d3d_hle_surface_download_contract.py')],

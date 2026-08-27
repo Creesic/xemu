@@ -31,6 +31,9 @@ void xemu_d3d_hle_session_reset(const char *why);
 
 /* True only after profile discovery and successful Plume startup. */
 bool xemu_d3d_hle_owns_window(void);
+/* Route Xemu's shared internal-resolution option to the active Plume owner. */
+bool xemu_d3d_hle_set_surface_scale_factor(unsigned int scale);
+unsigned int xemu_d3d_hle_get_surface_scale_factor(void);
 
 /* Live frontend state for UI/reporting. ACTIVE is reached only after the
  * loaded XBE has a usable D3D dispatch and Plume initialization succeeds. */

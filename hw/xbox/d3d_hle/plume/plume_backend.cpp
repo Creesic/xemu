@@ -540,7 +540,7 @@ extern "C" int xgpu_plume_set_internal_resolution_scale(uint32_t scale)
     xgpu::plume::plume_render_worker_sync();
     if (!xgpu::plume::plumeValidInternalResolutionScale(scale))
         return 0;
-    if (!g_ctx.ready()) {
+    if (!g_draw.ready()) {
         const uint32_t oldScale = g_internal_resolution_scale;
         g_internal_resolution_scale = scale;
         if (g_render_extent_configured) {
@@ -616,7 +616,7 @@ static bool present_ensure_init(void)
                 fprintf(stderr,
                         "[PLUME] invalid "
                         "XRECOMP_INTERNAL_RESOLUTION_SCALE='%s'; "
-                        "expected 1..6, using 1\n",
+                        "expected 1..10, using 1\n",
                         value);
                 g_internal_resolution_scale = 1;
             }

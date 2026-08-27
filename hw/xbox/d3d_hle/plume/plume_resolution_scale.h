@@ -14,7 +14,7 @@ namespace xgpu {
 namespace plume {
 
 static constexpr uint32_t kMinInternalResolutionScale = 1;
-static constexpr uint32_t kMaxInternalResolutionScale = 6;
+static constexpr uint32_t kMaxInternalResolutionScale = 10;
 
 bool plumeValidInternalResolutionScale(uint32_t scale);
 bool plumeScaledExtent(uint32_t logicalWidth, uint32_t logicalHeight,

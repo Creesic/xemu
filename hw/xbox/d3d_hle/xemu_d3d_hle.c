@@ -1636,11 +1636,26 @@ static HRESULT xemu_d3d_hle_activate_host_device_common(
     return S_OK;
 }
 
+static void xemu_d3d_hle_apply_surface_scale(void)
+{
+    int configured = g_config.display.quality.surface_scale;
+    uint32_t scale = configured > 0 ? (uint32_t)configured : 1u;
+
+    if (!xgpu_plume_set_internal_resolution_scale(scale)) {
+        fprintf(stderr,
+                "[D3D-HLE] invalid Plume internal resolution scale %u; "
+                "using 1x\n",
+                scale);
+        xgpu_plume_set_internal_resolution_scale(1u);
+    }
+}
+
 static HRESULT xemu_d3d_hle_activate_host_device(uint32_t parameters_va)
 {
     fprintf(stderr,
             "[D3D-HLE] CreateDevice: parameters=%08X window=%p\n",
             parameters_va, (void *)xemu_get_d3d_output_window_handle());
+    xemu_d3d_hle_apply_surface_scale();
     return xemu_d3d_hle_activate_host_device_common(
         d3d_hle_guest_start_host_device(
             parameters_va, xemu_get_d3d_output_window_handle()),
@@ -1652,6 +1667,7 @@ static HRESULT xemu_d3d_hle_reactivate_host_device(void)
     /* The recorded parameters_va pointed into the guest stack of the
      * original CreateDevice call and is long dead; restart from the
      * host-side present-parameter snapshot instead. */
+    xemu_d3d_hle_apply_surface_scale();
     return xemu_d3d_hle_activate_host_device_common(
         d3d_hle_guest_restart_host_device(
             xemu_get_d3d_output_window_handle()),
@@ -2291,6 +2307,46 @@ void xemu_d3d_hle_install(CPUState *cpu, MemoryRegion *ram,
 bool xemu_d3d_hle_owns_window(void)
 {
     return qatomic_read(&s_host_ready);
+}
+
+typedef struct XemuD3DHleSurfaceScaleRequest {
+    unsigned int scale;
+    bool success;
+} XemuD3DHleSurfaceScaleRequest;
+
+static void xemu_d3d_hle_set_surface_scale_factor_on_cpu(
+    CPUState *cpu, run_on_cpu_data data)
+{
+    XemuD3DHleSurfaceScaleRequest *request = data.host_ptr;
+
+    (void)cpu;
+    request->success = xgpu_plume_set_internal_resolution_scale(
+        request->scale);
+}
+
+bool xemu_d3d_hle_set_surface_scale_factor(unsigned int scale)
+{
+    XemuD3DHleSurfaceScaleRequest request = {
+        .scale = scale,
+    };
+
+    if (!qatomic_read(&s_host_ready) || !s_cpu) {
+        return false;
+    }
+
+    /* The menu runs on the display thread while D3D HLE rendering runs on
+     * the vCPU. BQL does not stop MTTCG execution, so perform the live RHI
+     * transition on the existing render owner instead of racing it. */
+    run_on_cpu(s_cpu, xemu_d3d_hle_set_surface_scale_factor_on_cpu,
+               RUN_ON_CPU_HOST_PTR(&request));
+    return request.success;
+}
+
+unsigned int xemu_d3d_hle_get_surface_scale_factor(void)
+{
+    return qatomic_read(&s_host_ready)
+               ? xgpu_plume_get_internal_resolution_scale()
+               : 1u;
 }
 
 XemuD3DHleStatus xemu_d3d_hle_status(void)
