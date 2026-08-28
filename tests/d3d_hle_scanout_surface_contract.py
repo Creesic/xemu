@@ -3,6 +3,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "hw/xbox/d3d_hle/d3d8_device.c").read_text()
 BACKEND = (ROOT / "hw/xbox/d3d_hle/plume/plume_backend.cpp").read_text()
+DRAW = (ROOT / "hw/xbox/d3d_hle/plume/plume_draw.cpp").read_text()
 GUEST = (ROOT / "hw/xbox/d3d_hle/d3d_hle_guest.c").read_text()
 
 start = SOURCE.index("int d3d8_PgraphPresentSurface(uint32_t offset)")
@@ -40,7 +41,7 @@ assert "g_hle_present_snapshot.SwapEffect == D3DSWAPEFFECT_COPY" in GUEST
 # CPU surface locks can complete between draw batches without another
 # SetRenderTarget. Their upload must happen before the next GPU draw, not at a
 # later present where it would overwrite every draw recorded in between.
-prepare_start = SOURCE.index("static void prepare_draw(void)")
+prepare_start = SOURCE.index("static BOOL prepare_draw(BOOL immediate)")
 prepare_end = SOURCE.index("\n}", prepare_start)
 prepare_body = SOURCE[prepare_start:prepare_end]
 sync = prepare_body.index("sync_cpu_surface(g_pgraph_current_surface,")
@@ -48,7 +49,52 @@ vsh = prepare_body.index("d3d8_vsh_prepare_draw")
 combiner = prepare_body.index("d3d8_combiners_prepare_draw")
 assert sync < vsh < combiner
 assert "color_write_mask != 0xFu" in prepare_body
-assert sum(line.strip() == "prepare_draw();" for line in SOURCE.splitlines()) == 3
+assert SOURCE.count("prepare_draw(immediate)") == 1
+assert SOURCE.count("prepare_draw(FALSE)") == 2
+
+# Xbox Swap resolves a multisampled backbuffer whose physical surface extent
+# is encoded in MultiSampleType's low nibbles. The HLE entry hook bypasses that
+# XDK implementation, so the shared memory-target binding must render the
+# resolved logical extent and Swap must classify the enlarged guest resource
+# as scanout rather than deferring the live frame forever.
+extent_start = GUEST.index(
+    "static int d3d_hle_guest_multisample_logical_extent(")
+extent_end = GUEST.index("\n}", extent_start)
+extent_body = GUEST[extent_start:extent_end]
+assert "(multisample >> 4) & 0xFu" in extent_body
+assert "multisample & 0xFu" in extent_body
+assert "(multisample & 0x3000u) == 0u" in extent_body
+assert "g_hle_present_snapshot.SwapEffect != D3DSWAPEFFECT_COPY" in extent_body
+assert "(uint64_t)backbuffer_width * sample_width" in extent_body
+assert "(uint64_t)backbuffer_height * sample_height" in extent_body
+
+bind_start = GUEST.index(
+    "static HRESULT d3d_hle_guest_bind_memory_render_target(")
+bind_end = GUEST.index("\n}", bind_start)
+bind_body = GUEST[bind_start:bind_end]
+normalize_color = bind_body.index(
+    "d3d_hle_guest_multisample_logical_extent(")
+bind_color = bind_body.index("binding.width = color_width;")
+assert normalize_color < bind_color
+assert "binding.image_width = color_width;" in bind_body
+assert "binding.zeta_width = zeta_width;" in bind_body
+
+swap_start = GUEST.index("HRESULT d3d_hle_guest_swap(uint32_t flags)")
+swap_end = GUEST.index("\n}", swap_start)
+swap_body = GUEST[swap_start:swap_end]
+classify_msaa = swap_body.index("target_is_multisampled_scanout")
+present_msaa = swap_body.index("d3d8_PgraphPresentSurfaceForSwap")
+assert classify_msaa < present_msaa
+assert "d3d_hle_guest_multisample_logical_extent(" in swap_body
+
+present_scale_start = DRAW.index("auto copyPresentTarget = [&]()")
+present_scale_end = DRAW.index("auto submitDescriptorBatch", present_scale_start)
+present_scale = DRAW[present_scale_start:present_scale_end]
+exact_copy = present_scale.index("cl->copyTexture(screenTexture")
+filtered_scale = present_scale.index("recordOutputScale(")
+assert exact_copy < filtered_scale
+assert "physicalOutputWidth()" in present_scale
+assert "physicalOutputHeight()" in present_scale
 
 # A partial clear cannot start from a zeroed host target: channels/pixels not
 # selected by the clear retain their guest-memory contents. MM3's lighting

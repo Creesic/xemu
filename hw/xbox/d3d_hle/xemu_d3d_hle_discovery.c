@@ -82,6 +82,7 @@ static void automatic_create_device_compact(void)
 #define MA5(api, entry_, a_, b_, c_, d_, e_) \
     ROW(XEMU_D3D_HLE_HOOK_NATIVE_THEN_MIRROR, api, entry_, 5, a_, b_, c_, d_, e_)
 #define N0(api) ROW(XEMU_D3D_HLE_HOOK_NATIVE_SAFE, api, NULL, 0, 0)
+#define N1(api) ROW(XEMU_D3D_HLE_HOOK_NATIVE_SAFE, api, NULL, 1, ST)
 #define N2(api) ROW(XEMU_D3D_HLE_HOOK_NATIVE_SAFE, api, NULL, 2, ST, ST)
 
 /*
@@ -146,8 +147,9 @@ static const XemuD3DHleBinding bindings[] = {
     B1(D3DDevice_SetPixelShaderProgram,
        d3d_hle_device_set_pixel_shader_program_std),
     B1(D3DDevice_SetSwapCallback, d3d_hle_device_set_swap_callback_std),
-    B1(D3DDevice_SetVerticalBlankCallback,
-       d3d_hle_device_set_vertical_blank_callback_std),
+    /* The native setter only stores the guest callback on the XDK device;
+     * preserving it lets the existing VBlank interrupt path invoke it. */
+    N1(D3DDevice_SetVerticalBlankCallback),
     B3(D3DDevice_InsertCallback, d3d_hle_device_insert_callback_std),
     B1(D3D_LazySetPointParams, d3d_hle_lazy_set_point_params_std),
     /*
@@ -165,8 +167,9 @@ static const XemuD3DHleBinding bindings[] = {
     B2(D3D_MakeRequestedSpace, d3d_hle_make_requested_space_std),
     /* Forza refused attach on these symbols after the push family bound.
      * Create* manufacture guest objects the same way CreateSurface2 does;
-     * AllocContiguousMemory is Mm, not GPU. PersistDisplay and SetStipple
-     * stay unbound until their state semantics are implemented. */
+     * AllocContiguousMemory is Mm, not GPU. PersistDisplay's native memory
+     * orchestration is safe because its nested CopyRects/idle calls remain
+     * hooked, while SetStipple is renderer-owned state. */
     B1(D3DDevice_CreatePalette2, d3d_hle_device_create_palette2_std),
     B4(D3DDevice_CreateImageSurface,
        d3d_hle_device_create_image_surface_std),
@@ -174,6 +177,8 @@ static const XemuD3DHleBinding bindings[] = {
        d3d_hle_device_create_image_surface_std),
     N2(D3D_AllocContiguousMemory),
     N0(D3DDevice_BlockUntilVerticalBlank),
+    N0(D3DDevice_PersistDisplay),
+    B1(D3DDevice_SetStipple, d3d_hle_device_set_stipple_std),
     B1(D3DDevice_SetRenderState_FogColor,
        d3d_hle_device_set_render_state_fog_color),
     B1(D3DDevice_SetRenderState_CullMode,
@@ -271,7 +276,7 @@ static const XemuD3DHleBinding bindings[] = {
     A2(D3DDevice_SelectVertexShader,
        d3d_hle_device_select_vertex_shader, AX, BX),
     A2(D3DDevice_SelectVertexShaderDirect,
-       d3d_hle_device_select_vertex_shader, AX, BX),
+       d3d_hle_device_select_vertex_shader_direct, AX, BX),
     B1(D3DDevice_SetShaderConstantMode,
        d3d_hle_device_set_shader_constant_mode_std),
     M4(D3DDevice_CreateVertexShader,

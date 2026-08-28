@@ -324,7 +324,7 @@ void f2_dump_linear_bgra8(uint32_t guest, const void *pixels,
     std::vector<uint8_t> alphaRow;
 
     if (!xgpu_plume_f2_active() || !guest || !pixels || !width || !height ||
-        (format != 0x12u && format != 0x1Eu))
+        (format != 0x06u && format != 0x12u && format != 0x1Eu))
         return;
     if (!pitch)
         pitch = width * 4u;
@@ -369,7 +369,7 @@ void f2_dump_linear_bgra8(uint32_t guest, const void *pixels,
             rgbRow[x * 3u] = pixel[2];
             rgbRow[x * 3u + 1u] = pixel[1];
             rgbRow[x * 3u + 2u] = pixel[0];
-            alphaRow[x] = format == 0x12u ? pixel[3] : 255u;
+            alphaRow[x] = format == 0x1Eu ? 255u : pixel[3];
         }
         std::fwrite(rgbRow.data(), 1, rgbRow.size(), rgbFile);
         std::fwrite(alphaRow.data(), 1, alphaRow.size(), alphaFile);
@@ -1683,7 +1683,8 @@ void PlumeDraw::setTexture(uint32_t stage, uint32_t guest, const void *pixels,
     if (format == 0x11u && depth == 1u && !cube)
         f2_dump_linear_r5g6b5(
             guest, pixels, w, h, pitch, bytes, version);
-    if ((format == 0x12u || format == 0x1Eu) && depth == 1u && !cube)
+    if ((format == 0x06u || format == 0x12u || format == 0x1Eu) &&
+        depth == 1u && !cube)
         f2_dump_linear_bgra8(
             guest, pixels, w, h, pitch, bytes, format, version);
     if (depth == 1u && !cube &&
@@ -3126,7 +3127,6 @@ void PlumeDraw::clearTarget(float r, float g, float b, float a,
                             uint32_t colorWriteMask,
                             const XgpuRect *rect)
 {
-    m_stickyHostFrame = false;
     colorWriteMask &= 0xFu;
     if (!colorWriteMask)
         return;
@@ -3355,7 +3355,8 @@ template <class Draw>
     for (int s = 0; s < 4; s++) {                     /* flat indices: samp 4-7 */
         set->setSampler((uint32_t)(4 + s), samplers[s]);
     }
-    set->setBuffer(8, constantBuffer, 512, nullptr, nullptr, constantOffset);
+    set->setBuffer(8, constantBuffer, kProgramConstantStride,
+                   nullptr, nullptr, constantOffset);
     if (vertexConstantBuffer && vertexConstantBufferSize) {
         const RenderBufferStructuredView float4View(4u * sizeof(float));
         set->setBuffer(9, vertexConstantBuffer, vertexConstantBufferSize,
@@ -3466,7 +3467,7 @@ void PlumeDraw::pollPixelShaderOverrides(PlumeContext &ctx)
         }
 
         if (ps.shader)
-            m_liveRetiredPixelShaders.push_back(std::move(ps.shader));
+            m_liveRetiredShaders.push_back(std::move(ps.shader));
         for (auto &pipeline : m_progPsos)
             m_liveRetiredPipelines.push_back(std::move(pipeline.second));
         m_progPsos.clear();
@@ -3796,10 +3797,18 @@ std::array<float, 16> PlumeDraw::snapshotProgramTextureScales() const
     return scales;
 }
 
-std::array<float, 100> PlumeDraw::snapshotProgramConstants(
-    bool combinerCB, const std::array<float, 16> &textureScales) const
+std::array<float, kProgramConstantFloatCount>
+PlumeDraw::snapshotProgramConstants(
+    bool combinerCB, const std::array<float, 16> &textureScales,
+    const XgpuPlumeRenderState &renderState) const
 {
-    std::array<float, 100> constants = {};
+    std::array<float, kProgramConstantFloatCount> constants = {};
+    const uint32_t control[4] = {
+        renderState.stipple_enable,
+        std::max(m_internalResolutionScale, 1u),
+        0u,
+        0u,
+    };
     if (combinerCB)
         std::memcpy(constants.data(), m_combinerConst,
                     sizeof(m_combinerConst));
@@ -3807,10 +3816,14 @@ std::array<float, 100> PlumeDraw::snapshotProgramConstants(
         std::memcpy(constants.data(), m_psConst, sizeof(m_psConst));
     std::memcpy(constants.data() + 21u * 4u, textureScales.data(),
                 textureScales.size() * sizeof(float));
+    std::memcpy(constants.data() + 25u * 4u, renderState.stipple_pattern,
+                sizeof(renderState.stipple_pattern));
+    std::memcpy(constants.data() + 33u * 4u, control, sizeof(control));
     return constants;
 }
 
-uint32_t PlumeDraw::internProgramConstants(bool combinerCB)
+uint32_t PlumeDraw::internProgramConstants(
+    bool combinerCB, const XgpuPlumeRenderState &renderState)
 {
     const std::array<float, 16> textureScales =
         snapshotProgramTextureScales();
@@ -3819,15 +3832,16 @@ uint32_t PlumeDraw::internProgramConstants(bool combinerCB)
     const uint64_t cacheVersion =
         (sourceVersion << 1u) | (combinerCB ? 1u : 0u);
     uint32_t index = UINT32_MAX;
-    if (m_rec.frameProgConstCache.lookup(
+    if (!renderState.stipple_enable && m_rec.frameProgConstCache.lookup(
             cacheVersion, textureScales, index))
         return index;
-    const std::array<float, 100> constants =
-        snapshotProgramConstants(combinerCB, textureScales);
+    const std::array<float, kProgramConstantFloatCount> constants =
+        snapshotProgramConstants(combinerCB, textureScales, renderState);
     index = internFrameConstants(
         m_rec.frameProgConsts, m_rec.frameProgConstBuckets, constants);
-    m_rec.frameProgConstCache.remember(
-        cacheVersion, textureScales, index);
+    if (!renderState.stipple_enable)
+        m_rec.frameProgConstCache.remember(
+            cacheVersion, textureScales, index);
     return index;
 }
 
@@ -3850,10 +3864,6 @@ void PlumeDraw::recordDraw(PlumeContext &ctx, uint32_t primType, uint32_t primCo
      * drops valid packed streams before that validation can run. */
     if (!vsH && stride < 16u)
         return;
-    /* Guest geometry replaces a sticky host FMV blit. */
-    if (!m_recordingHostFrame)
-        m_stickyHostFrame = false;
-
     uint32_t vc = 0;
     uint8_t topo = 0;
     switch ((D3DPRIMITIVETYPE)primType) {
@@ -3988,9 +3998,9 @@ void PlumeDraw::recordDraw(PlumeContext &ctx, uint32_t primType, uint32_t primCo
                 requestedPS == m_fixedFallbackPSW) {
                 const std::array<float, 16> textureScales =
                     snapshotProgramTextureScales();
-                std::array<float, 100> constants =
+                std::array<float, kProgramConstantFloatCount> constants =
                     snapshotProgramConstants(
-                        psIt->second.combinerCB, textureScales);
+                        psIt->second.combinerCB, textureScales, drawState);
                 uint32_t writesTexcoordMask = 0;
                 const uint32_t tf = drawState.fixed_texture_factor;
                 const auto vsIt = m_vsReg.find(vsH);
@@ -4046,7 +4056,7 @@ void PlumeDraw::recordDraw(PlumeContext &ctx, uint32_t primType, uint32_t primCo
                     m_rec.frameProgConstBuckets, constants);
             } else {
                 progConstIndex = internProgramConstants(
-                    psIt->second.combinerCB);
+                    psIt->second.combinerCB, drawState);
             }
             psH = requestedPS;
         }
@@ -4641,7 +4651,8 @@ XgpuPlumeGpuDrawResult PlumeDraw::recordProgIndexedDraw(
     d.vsConstIndex = internFrameConstants(
         m_rec.frameVSConsts, m_rec.frameVSConstBuckets, vsConst);
 
-    d.progConstIndex = internProgramConstants(psIt->second.combinerCB);
+    d.progConstIndex = internProgramConstants(
+        psIt->second.combinerCB, d.renderState);
 
     d.recordsZetaWrite =
         d.renderState.depth_enable && d.renderState.depth_write ? 1u : 0u;
@@ -4832,7 +4843,7 @@ bool PlumeDraw::queueHostOutputOverlay(
 
 void PlumeDraw::ensureStickyHostFrame(PlumeContext &ctx)
 {
-    if (!m_stickyHostFrame || !m_rec.draws.empty() || !m_texReady)
+    if (!m_stickyHostFrame || !m_texReady)
         return;
 
     auto *entry = m_textures.current(kHostFrameGuest);
@@ -5195,8 +5206,16 @@ bool PlumeDraw::registerVertexShader(
     shader.ok = true;
     shader.compileFuture = queueShaderCompile(
         m_recordShaderTarget, shader.hlsl, "vs_6_0");
+    auto existing = m_vsReg.find(handle);
+    if (existing != m_vsReg.end()) {
+        if (existing->second.shader)
+            m_liveRetiredShaders.push_back(
+                std::move(existing->second.shader));
+        for (auto &pipeline : m_progPsos)
+            m_liveRetiredPipelines.push_back(std::move(pipeline.second));
+        m_progPsos.clear();
+    }
     m_vsReg[handle] = std::move(shader);
-    m_progPsos.clear();
     return true;
 }
 
@@ -5369,7 +5388,7 @@ void PlumeDraw::spanSliceInto(PlumeSpanPacket &packet)
                 if (it != psDedup.end()) {
                     ref.psWindowIndex = it->second;
                 } else {
-                    const std::array<float, 100> &ps =
+                    const std::array<float, kProgramConstantFloatCount> &ps =
                         m_rec.frameProgConsts[g.progConstIndex];
                     ref.psWindowIndex =
                         static_cast<uint32_t>(packet.psWindows.size());
@@ -5431,7 +5450,7 @@ void PlumeDraw::spanSliceInto(PlumeSpanPacket &packet)
             if (it != psDedup.end()) {
                 ref.psWindowIndex = it->second;
             } else {
-                const std::array<float, 100> &ps =
+                const std::array<float, kProgramConstantFloatCount> &ps =
                     m_rec.frameProgConsts[g.progConstIndex];
                 ref.psWindowIndex =
                     static_cast<uint32_t>(packet.psWindows.size());
@@ -5535,7 +5554,7 @@ bool PlumeDraw::spanTryReplay(uint32_t key)
     }
     std::vector<uint32_t> psMap(packet->psWindows.size());
     for (size_t wi = 0; wi < packet->psWindows.size(); ++wi) {
-        std::array<float, 100> ps{};
+        std::array<float, kProgramConstantFloatCount> ps{};
         std::memcpy(ps.data(), packet->psWindows[wi].data(),
                     ps.size() * sizeof(float));
         psMap[wi] = internFrameConstants(
@@ -5673,7 +5692,8 @@ void PlumeDraw::replayRecording(
         /* Combiner-constant contents per interned slot (kc[0..15], fc0/fc1,
          * misc): the cc=slot:hash draw fields refer to these. */
         for (size_t ci = 0; ci < rec.frameProgConsts.size(); ci++) {
-            const std::array<float, 100> &cv = rec.frameProgConsts[ci];
+            const std::array<float, kProgramConstantFloatCount> &cv =
+                rec.frameProgConsts[ci];
             char line[1600];
             size_t off = 0;
             for (size_t k = 0; k < cv.size() && off + 16 < sizeof line; k++) {
@@ -5825,9 +5845,10 @@ void PlumeDraw::replayRecording(
     if (!rec.frameProgConsts.empty()) {
         XRECOMP_TRACY_ZONE_BEGIN(pixel_constants_upload_zone,
                                 "Plume Upload Pixel Constants");
-        const size_t constantsNeed = rec.frameProgConsts.size() * 512u;
+        const size_t constantsNeed =
+            rec.frameProgConsts.size() * kProgramConstantStride;
         if (constantsNeed > sub.progCBCap) {
-            size_t cap = 512u;
+            size_t cap = kProgramConstantStride;
             while (cap < constantsNeed) cap <<= 1;
             {
                 XRECOMP_TRACY_ZONE_SCOPED("Plume Create Upload Buffer");
@@ -5856,7 +5877,7 @@ void PlumeDraw::replayRecording(
             {
                 XRECOMP_TRACY_ZONE_SCOPED("Plume Buffer Memcpy");
                 for (size_t i = 0; i < rec.frameProgConsts.size(); i++)
-                    std::memcpy(constants + i * 512u,
+                    std::memcpy(constants + i * kProgramConstantStride,
                                 rec.frameProgConsts[i].data(),
                                 rec.frameProgConsts[i].size() * sizeof(float));
             }
@@ -6026,25 +6047,47 @@ void PlumeDraw::replayRecording(
                        ? latest->second : 0);
             auto presentIt = generation
                 ? m_surfaceCache.find(generation) : m_surfaceCache.end();
-            if (presentIt != m_surfaceCache.end() &&
-                presentIt->second.width == m_outputWidth &&
-                presentIt->second.height == m_outputHeight) {
-                transitionSurface(presentIt->second,
+            if (presentIt != m_surfaceCache.end()) {
+                PlumeColorSurface &present = presentIt->second;
+                if (present.width == m_outputWidth &&
+                    present.height == m_outputHeight) {
+                    transitionSurface(present,
                                   RenderTextureLayout::COPY_SOURCE, false);
-                cl->barriers(
-                    RenderBarrierStage::COPY,
-                    RenderTextureBarrier(
-                        screenTexture, RenderTextureLayout::COPY_DEST));
-                screenLayout = RenderTextureLayout::COPY_DEST;
-                cl->copyTexture(
-                    screenTexture, presentIt->second.texture.get());
-                if (f2On)
-                    xgpu_plume_f2_log(
-                        "presentcopy tgt=%08X gen=%llu %ux%u",
-                        presentTarget,
-                        (unsigned long long)generation,
-                        presentIt->second.width,
-                        presentIt->second.height);
+                    cl->barriers(
+                        RenderBarrierStage::COPY,
+                        RenderTextureBarrier(
+                            screenTexture, RenderTextureLayout::COPY_DEST));
+                    screenLayout = RenderTextureLayout::COPY_DEST;
+                    cl->copyTexture(screenTexture, present.texture.get());
+                    if (f2On)
+                        xgpu_plume_f2_log(
+                            "presentcopy tgt=%08X gen=%llu %ux%u",
+                            presentTarget,
+                            (unsigned long long)generation,
+                            present.width, present.height);
+                } else {
+                    transitionSurface(present,
+                                      RenderTextureLayout::SHADER_READ, false);
+                    if (screenLayout != RenderTextureLayout::COLOR_WRITE) {
+                        cl->barriers(
+                            RenderBarrierStage::GRAPHICS,
+                            RenderTextureBarrier(
+                                screenTexture,
+                                RenderTextureLayout::COLOR_WRITE));
+                        screenLayout = RenderTextureLayout::COLOR_WRITE;
+                    }
+                    if (recordOutputScale(
+                            ctx, cl, present.texture.get(), present.view.get(),
+                            screenFramebuffer, physicalOutputWidth(),
+                            physicalOutputHeight()) && f2On) {
+                        xgpu_plume_f2_log(
+                            "presentscale tgt=%08X gen=%llu %ux%u -> %ux%u",
+                            presentTarget,
+                            (unsigned long long)generation,
+                            present.width, present.height,
+                            m_outputWidth, m_outputHeight);
+                    }
+                }
             } else if (f2On) {
                 xgpu_plume_f2_log(
                     "presentcopy MISS tgt=%08X gen=%llu found=%d",
@@ -6222,7 +6265,8 @@ void PlumeDraw::replayRecording(
         const uint64_t descT0 = spikeT0 ? xrecomp_host_monotonic_ns() : 0;
         RenderDescriptorSet *set = createProgDrawDescriptorSet(
             ctx, pd, sub.progCB.get(),
-            static_cast<uint64_t>(pd.progConstIndex) * 512u,
+            static_cast<uint64_t>(pd.progConstIndex) *
+                kProgramConstantStride,
             sub.vsCB.get(), sub.vsCBCap);
         if (descT0) {
             nsDesc += xrecomp_host_monotonic_ns() - descT0;
@@ -6603,7 +6647,8 @@ void PlumeDraw::replayRecording(
             const uint64_t descT0 = spikeT0 ? xrecomp_host_monotonic_ns() : 0;
             progSet = createProgDrawDescriptorSet(
                 ctx, d, sub.progCB.get(),
-                static_cast<uint64_t>(d.progConstIndex) * 512u,
+                static_cast<uint64_t>(d.progConstIndex) *
+                    kProgramConstantStride,
                 d.vsHandle ? sub.vsCB.get() : nullptr,
                 d.vsHandle ? sub.vsCBCap : 0);
             if (descT0) {
@@ -6889,6 +6934,7 @@ void PlumeDraw::replayRecording(
             if (vb && d.vsHandle && d.stride >= 16u) {
                 const uint32_t count = d.vertexCount < 6u
                     ? d.vertexCount : 6u;
+                const auto shader = m_vsReg.find(d.vsHandle);
                 for (uint32_t v = 0; v < count; ++v) {
                     const uint8_t *bytes =
                         vb + static_cast<size_t>(v) * d.stride;
@@ -6901,6 +6947,30 @@ void PlumeDraw::replayRecording(
                         bytes[4], bytes[5], bytes[6], bytes[7],
                         bytes[8], bytes[9], bytes[10], bytes[11],
                         bytes[12], bytes[13], bytes[14], bytes[15]);
+                    if (shader == m_vsReg.end())
+                        continue;
+                    for (uint32_t attr = 3u; attr <= 4u; ++attr) {
+                        const uint32_t offset = shader->second.offset[attr];
+                        if (!(shader->second.attributesPresent &
+                              (1u << attr)) ||
+                            offset > d.stride ||
+                            16u > d.stride - offset)
+                            continue;
+                        const uint8_t *attribute = bytes + offset;
+                        xgpu_plume_f2_log(
+                            "pattr %zu v%u a%u "
+                            "%02X%02X%02X%02X %02X%02X%02X%02X "
+                            "%02X%02X%02X%02X %02X%02X%02X%02X",
+                            di, v, attr,
+                            attribute[0], attribute[1],
+                            attribute[2], attribute[3],
+                            attribute[4], attribute[5],
+                            attribute[6], attribute[7],
+                            attribute[8], attribute[9],
+                            attribute[10], attribute[11],
+                            attribute[12], attribute[13],
+                            attribute[14], attribute[15]);
+                    }
                 }
             }
             /* MM3's compact UI batches put S1 position at byte 0 and

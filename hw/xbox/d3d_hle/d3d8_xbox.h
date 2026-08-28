@@ -206,6 +206,7 @@ typedef enum D3DRENDERSTATETYPE {
     D3DRS_STENCILMASK              = 58,
     D3DRS_STENCILWRITEMASK         = 59,
     D3DRS_TEXTUREFACTOR            = 60,
+    D3DRS_STIPPLEENABLE            = 83,
     D3DRS_WRAP0                    = 128,
     D3DRS_WRAP1                    = 129,
     D3DRS_WRAP2                    = 130,
@@ -798,6 +799,9 @@ IDirect3D8 *xbox_Direct3DCreate8(UINT SDKVersion);
  * Get the current D3D device (Xbox uses a global device pointer).
  */
 IDirect3DDevice8 *xbox_GetD3DDevice(void);
+
+/* Replace the Xbox 32x32 polygon stipple pattern. */
+void d3d8_SetStipple(const DWORD *pattern);
 
 /* Resize the live device-owned backbuffer/depth surfaces and default viewport
  * while preserving object identity held by guest-facing interfaces. */

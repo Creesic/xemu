@@ -92,6 +92,7 @@ void d3d_hle_guest_set_front_face(uint32_t xbox_front_face);
 void d3d_hle_guest_set_fill_mode(uint32_t xbox_fill_mode);
 void d3d_hle_guest_set_render_state(D3DRENDERSTATETYPE state,
                                     uint32_t value);
+void d3d_hle_guest_set_stipple(uint32_t pattern_va);
 void d3d_hle_guest_set_texture_stage_state(
     uint32_t stage, D3DTEXTURESTAGESTATETYPE state, uint32_t value);
 void d3d_hle_guest_set_vertex_shader_constant(
@@ -235,6 +236,8 @@ void d3d_hle_guest_lock_3d_surface(
 void d3d_hle_guest_note_resource_cpu_write(uint32_t resource_va);
 void d3d_hle_guest_select_vertex_shader(
     uint32_t shader_handle, uint32_t address);
+void d3d_hle_guest_select_vertex_shader_direct(
+    uint32_t declaration_va, uint32_t address);
 void d3d_hle_guest_delete_vertex_shader(uint32_t shader_handle);
 HRESULT d3d_hle_guest_set_vertex_shader(uint32_t shader_handle);
 void d3d_hle_guest_draw_vertices_up(
@@ -376,6 +379,7 @@ void d3d_hle_lock_2d_surface(void);
 void d3d_hle_lock_3d_surface(void);
 void d3d_hle_device_get_stream_source2(void);
 void d3d_hle_device_select_vertex_shader(void);
+void d3d_hle_device_select_vertex_shader_direct(void);
 void d3d_hle_device_delete_vertex_shader(void);
 void d3d_hle_device_set_vertex_shader(void);
 void d3d_hle_device_set_vertex_shader_constant_not_inline(void);
@@ -477,6 +481,7 @@ void d3d_hle_device_set_render_target_fast_std(void);
 void d3d_hle_device_create_palette2_std(void);
 void d3d_hle_device_create_image_surface_std(void);
 void d3d_hle_device_end_push_buffer_std(void);
+void d3d_hle_device_set_stipple_std(void);
 void d3d_hle_cdevice_kickoff_std(void);
 void d3d_hle_destroy_resource_std(void);
 void d3d_hle_noop_std_0(void);

@@ -191,6 +191,8 @@ typedef struct XgpuPlumeRenderState {
     uint32_t scissor_y;
     uint32_t scissor_width;
     uint32_t scissor_height;
+    uint32_t stipple_enable;
+    uint32_t stipple_pattern[32];
 } XgpuPlumeRenderState;
 
 typedef struct XgpuTextureBinding {

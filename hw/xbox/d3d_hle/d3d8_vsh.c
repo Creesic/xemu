@@ -96,6 +96,7 @@ static int g_vsh_slot_count = 0;
 static NV2AVSConstants g_vsh_constants;
 static BOOL g_vsh_constants_dirty = TRUE;
 static BOOL g_vsh_registered[NV2A_VS_MAX_SLOTS];
+static BOOL g_vsh_immediate_registered[NV2A_VS_MAX_SLOTS];
 static float g_vsh_vertex_data[NV2A_VS_MAX_INPUTS][4];
 
 /* ================================================================
@@ -1598,6 +1599,8 @@ HRESULT d3d8_vsh_init(void)
         free(g_vsh_slots[i].parsed_program);
     memset(g_vsh_slots, 0, sizeof(g_vsh_slots));
     memset(g_vsh_registered, 0, sizeof(g_vsh_registered));
+    memset(g_vsh_immediate_registered, 0,
+           sizeof(g_vsh_immediate_registered));
     memset(&g_vsh_constants, 0, sizeof(g_vsh_constants));
     memset(g_vsh_vertex_data, 0, sizeof(g_vsh_vertex_data));
     for (int i = 0; i < NV2A_VS_MAX_INPUTS; ++i)
@@ -1613,6 +1616,8 @@ void d3d8_vsh_shutdown(void)
         free(g_vsh_slots[i].parsed_program);
     memset(g_vsh_slots, 0, sizeof(g_vsh_slots));
     memset(g_vsh_registered, 0, sizeof(g_vsh_registered));
+    memset(g_vsh_immediate_registered, 0,
+           sizeof(g_vsh_immediate_registered));
     memset(&g_vsh_constants, 0, sizeof(g_vsh_constants));
     memset(g_vsh_vertex_data, 0, sizeof(g_vsh_vertex_data));
     g_vsh_slot_count = 0;
@@ -1655,6 +1660,7 @@ HRESULT d3d8_vsh_create_shader(const DWORD *microcode, int num_insns,
     g_vsh_slots[slot].parsed_program = NULL;
     g_vsh_slots[slot].in_use = 1;
     g_vsh_registered[slot] = FALSE;
+    g_vsh_immediate_registered[slot] = FALSE;
     g_vsh_slot_count++;
 
     /* Host shader handles use a narrow range so high FVF texture-coordinate
@@ -1683,6 +1689,7 @@ HRESULT d3d8_vsh_delete_shader(DWORD handle)
         g_vsh_slots[slot].parsed_program = NULL;
         g_vsh_slots[slot].in_use = 0;
         g_vsh_registered[slot] = FALSE;
+        g_vsh_immediate_registered[slot] = FALSE;
         g_vsh_slot_count--;
     }
 
@@ -1718,12 +1725,13 @@ void d3d8_vsh_set_vertex_data4f(uint32_t reg, const float *value)
            sizeof(g_vsh_vertex_data[reg]));
 }
 
-BOOL d3d8_vsh_calculate_position_bounds(DWORD handle,
-                                         const void *vertices,
-                                         uint32_t vertex_count,
-                                         uint32_t stride,
-                                         float *minimum_x,
-                                         float *maximum_x)
+static BOOL vsh_calculate_position_bounds(DWORD handle,
+                                           const void *vertices,
+                                           uint32_t vertex_count,
+                                           uint32_t stride,
+                                           BOOL immediate,
+                                           float *minimum_x,
+                                           float *maximum_x)
 {
     NV2AVshSlot *slot;
     NV2AVshProgram *program;
@@ -1735,7 +1743,7 @@ BOOL d3d8_vsh_calculate_position_bounds(DWORD handle,
         !vertex_count || !stride || !minimum_x || !maximum_x)
         return FALSE;
     slot = &g_vsh_slots[handle - NV2A_VS_HANDLE_BASE];
-    if (!slot->in_use || !slot->declaration.valid)
+    if (!slot->in_use || (!immediate && !slot->declaration.valid))
         return FALSE;
     program = vsh_parsed_program(slot);
     if (!program)
@@ -1747,8 +1755,18 @@ BOOL d3d8_vsh_calculate_position_bounds(DWORD handle,
         for (uint32_t attr = 0; attr < 16; ++attr) {
             memcpy(inputs[attr].v, g_vsh_vertex_data[attr],
                    sizeof(inputs[attr].v));
-            if (!(program->inputs_read & (1u << attr)) ||
-                !(slot->declaration.attributes_present & (1u << attr)))
+            if (!(program->inputs_read & (1u << attr)))
+                continue;
+            if (immediate) {
+                uint32_t offset = attr * 4u * sizeof(float);
+                if (offset > stride || sizeof(inputs[attr].v) > stride - offset)
+                    return FALSE;
+                memcpy(inputs[attr].v,
+                       vertex_bytes + (size_t)vertex * stride + offset,
+                       sizeof(inputs[attr].v));
+                continue;
+            }
+            if (!(slot->declaration.attributes_present & (1u << attr)))
                 continue;
             if (slot->declaration.stream[attr] != 0)
                 return FALSE;
@@ -1777,13 +1795,34 @@ BOOL d3d8_vsh_calculate_position_bounds(DWORD handle,
     return TRUE;
 }
 
+BOOL d3d8_vsh_calculate_position_bounds(DWORD handle,
+                                         const void *vertices,
+                                         uint32_t vertex_count,
+                                         uint32_t stride,
+                                         float *minimum_x,
+                                         float *maximum_x)
+{
+    return vsh_calculate_position_bounds(
+        handle, vertices, vertex_count, stride, FALSE,
+        minimum_x, maximum_x);
+}
+
+BOOL d3d8_vsh_calculate_immediate_position_bounds(
+    DWORD handle, const void *vertices, uint32_t vertex_count,
+    uint32_t stride, float *minimum_x, float *maximum_x)
+{
+    return vsh_calculate_position_bounds(
+        handle, vertices, vertex_count, stride, TRUE,
+        minimum_x, maximum_x);
+}
+
 BOOL d3d8_vsh_is_programmable(DWORD handle)
 {
     return handle >= NV2A_VS_HANDLE_BASE &&
            handle < NV2A_VS_HANDLE_LIMIT ? TRUE : FALSE;
 }
 
-BOOL d3d8_vsh_prepare_draw(DWORD handle)
+static BOOL vsh_prepare_draw_variant(DWORD handle, BOOL immediate)
 {
     int slot;
     NV2AVshSlot *vsh;
@@ -1791,6 +1830,9 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
     XgpuPlumeVertexDeclaration plume_declaration;
     const XgpuPlumeVertexDeclaration *plume_declaration_ptr = NULL;
     uint32_t vertex_format[NV2A_VS_MAX_INPUTS];
+    const uint32_t *vertex_format_ptr = NULL;
+    BOOL *registered;
+    DWORD plume_handle;
     char *source = NULL;
     int length;
 
@@ -1807,13 +1849,27 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
     vsh = &g_vsh_slots[slot];
     if (!vsh->in_use)
         return FALSE;
+    registered = immediate ? &g_vsh_immediate_registered[slot]
+                           : &g_vsh_registered[slot];
+    plume_handle = immediate
+        ? (DWORD)(NV2A_VS_IMMEDIATE_HANDLE_BASE + (uint32_t)slot)
+        : handle;
 
-    if (!g_vsh_registered[slot]) {
+    if (!*registered) {
         int i;
         program = vsh_parsed_program(vsh);
         if (!program)
             return FALSE;
-        if (vsh->declaration.valid) {
+        if (immediate) {
+            memset(&plume_declaration, 0, sizeof(plume_declaration));
+            plume_declaration.attributes_present = program->inputs_read;
+            for (i = 0; i < NV2A_VS_MAX_INPUTS; ++i) {
+                plume_declaration.format[i] = 0x42u; /* FLOAT4 */
+                plume_declaration.offset[i] =
+                    (uint16_t)(i * 4u * sizeof(float));
+            }
+            plume_declaration_ptr = &plume_declaration;
+        } else if (vsh->declaration.valid) {
             memset(&plume_declaration, 0, sizeof(plume_declaration));
             plume_declaration.attributes_present =
                 vsh->declaration.attributes_present;
@@ -1827,21 +1883,21 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
                     vsh->declaration.offset[i];
             }
             plume_declaration_ptr = &plume_declaration;
+            vertex_format_ptr = vertex_format;
         }
         length = d3d8_vsh_generate_hlsl(
-            program, vsh->declaration.valid ? vertex_format : NULL, NULL, 0);
+            program, vertex_format_ptr, NULL, 0);
         if (length <= 0)
             return FALSE;
         source = (char *)malloc((size_t)length + 1);
         if (!source)
             return FALSE;
         if (d3d8_vsh_generate_hlsl(
-                program, vsh->declaration.valid ? vertex_format : NULL,
-                source, length + 1) != length) {
+                program, vertex_format_ptr, source, length + 1) != length) {
             free(source);
             return FALSE;
         }
-        if (!xgpu_plume_register_vertex_shader(handle, source,
+        if (!xgpu_plume_register_vertex_shader(plume_handle, source,
                                                 program->inputs_read,
                                                 program->outputs_written,
                                                 plume_declaration_ptr)) {
@@ -1850,13 +1906,23 @@ BOOL d3d8_vsh_prepare_draw(DWORD handle)
         }
         free(source);
         source = NULL;
-        g_vsh_registered[slot] = TRUE;
+        *registered = TRUE;
     }
     if (g_vsh_constants_dirty) {
         xgpu_plume_set_vertex_shader_constants(
             (const float *)&g_vsh_constants, NV2A_VS_MAX_CONSTANTS);
         g_vsh_constants_dirty = FALSE;
     }
-    xgpu_plume_set_active_vertex_shader(handle);
+    xgpu_plume_set_active_vertex_shader(plume_handle);
     return TRUE;
+}
+
+BOOL d3d8_vsh_prepare_draw(DWORD handle)
+{
+    return vsh_prepare_draw_variant(handle, FALSE);
+}
+
+BOOL d3d8_vsh_prepare_immediate_draw(DWORD handle)
+{
+    return vsh_prepare_draw_variant(handle, TRUE);
 }

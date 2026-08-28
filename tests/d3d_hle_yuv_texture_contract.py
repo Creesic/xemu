@@ -108,6 +108,21 @@ def main():
     assert "if (!value || !*value)\n            return true;" in pipeline
     assert 'ascii_equal_ignore_case(value, "false")' in pipeline
     assert "xgpu_plume_present_host_frame_format" in backend
+    present = extract_function(backend, "void xgpu_plume_owner_execute_present")
+    assert "retireStickyHostFrame" not in present, (
+        "ordinary backbuffer presents must not retire an active movie overlay; "
+        "EnableOverlay(false) owns that transition"
+    )
+    assert "present_reason != PLUME_PRESENT_HOST_FRAME" in present
+
+    record_draw = extract_function(text, "void PlumeDraw::recordDraw")
+    assert "m_stickyHostFrame = false" not in record_draw
+    clear_target = extract_function(text, "void PlumeDraw::clearTarget")
+    assert "m_stickyHostFrame = false" not in clear_target
+    sticky = extract_function(text, "void PlumeDraw::ensureStickyHostFrame")
+    assert "!m_rec.draws.empty()" not in sticky, (
+        "queued guest clears or draws must stay underneath an enabled overlay"
+    )
     print("d3d_hle_yuv_texture_contract: OK")
 
 

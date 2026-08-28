@@ -49,6 +49,7 @@ typedef struct D3D8DeviceState {
     UINT height;
     D3DFORMAT backbuffer_format;
     DWORD render_states[MAX_RENDER_STATES];
+    DWORD stipple_pattern[32];
     DWORD tss[MAX_TEXTURE_STAGES][MAX_TSS_STATES];
     BOOL fixed_state_valid;
     D3DMATRIX transforms[MAX_TRANSFORMS];
@@ -494,7 +495,7 @@ static int sync_cpu_surface(PgraphHostSurface *surface,
     return 1;
 }
 
-static void prepare_draw(void)
+static BOOL prepare_draw(BOOL immediate)
 {
     uint32_t color_write_mask =
         g_device_state.render_states[D3DRS_COLORWRITEENABLE] & 0xFu;
@@ -507,8 +508,14 @@ static void prepare_draw(void)
      * while clearing and drawing RGB only. */
     sync_cpu_surface(g_pgraph_current_surface,
                      color_write_mask != 0xFu);
-    (void)d3d8_vsh_prepare_draw(g_device_state.vertex_shader);
+    if (immediate) {
+        if (!d3d8_vsh_prepare_immediate_draw(g_device_state.vertex_shader))
+            return FALSE;
+    } else {
+        (void)d3d8_vsh_prepare_draw(g_device_state.vertex_shader);
+    }
     (void)d3d8_combiners_prepare_draw();
+    return TRUE;
 }
 
 static void rebaseline_cpu_surfaces_after_gpu_download(uint32_t start,
@@ -1326,6 +1333,8 @@ static void init_default_states(D3D8DeviceState *state)
     state->render_states[D3DRS_ALPHAFUNC] = D3DCMP_ALWAYS;
     state->render_states[D3DRS_COLORWRITEENABLE] = 0x0f;
     state->render_states[D3DRS_TEXTUREFACTOR] = 0xFFFFFFFFu;
+    for (i = 0; i < 32; ++i)
+        state->stipple_pattern[i] = 0xFFFFFFFFu;
     for (i = 0; i < MAX_TEXTURE_STAGES; ++i) {
         state->tss[i][D3DTSS_COLOROP] = i == 0 ? D3DTOP_MODULATE : D3DTOP_DISABLE;
         state->tss[i][D3DTSS_COLORARG0] = D3DTA_CURRENT;
@@ -1415,6 +1424,9 @@ static XgpuPlumeRenderState snapshot_render_state(void)
     state.scissor_y = g_device_state.pgraph_scissor_y;
     state.scissor_width = g_device_state.pgraph_scissor_width;
     state.scissor_height = g_device_state.pgraph_scissor_height;
+    state.stipple_enable = rs[D3DRS_STIPPLEENABLE] != 0;
+    memcpy(state.stipple_pattern, g_device_state.stipple_pattern,
+           sizeof(state.stipple_pattern));
     return state;
 }
 
@@ -1588,7 +1600,7 @@ static HRESULT transform_fixed_xyz(const void *source, UINT vertex_count,
 }
 
 static HRESULT submit_draw(D3DPRIMITIVETYPE type, UINT primitive_count,
-                           const void *vertices, UINT stride)
+                           const void *vertices, UINT stride, BOOL immediate)
 {
     const void *draw_vertices = vertices;
     void *converted = NULL;
@@ -1628,7 +1640,11 @@ static HRESULT submit_draw(D3DPRIMITIVETYPE type, UINT primitive_count,
     }
     XRECOMP_CPU_RECORDER_ZONE_BEGIN(
         cpu_compat_prepare_zone, "D3D Compat Prepare Draw");
-    prepare_draw();
+    if (!prepare_draw(immediate)) {
+        XRECOMP_CPU_RECORDER_ZONE_END(cpu_compat_prepare_zone);
+        free(converted);
+        return E_FAIL;
+    }
     XRECOMP_CPU_RECORDER_ZONE_END(cpu_compat_prepare_zone);
     if (!d3d8_vsh_is_programmable(g_device_state.vertex_shader)) {
         const DWORD position =
@@ -1661,10 +1677,15 @@ static HRESULT submit_draw(D3DPRIMITIVETYPE type, UINT primitive_count,
     render_state = snapshot_render_state();
     if (d3d8_vsh_is_programmable(g_device_state.vertex_shader) &&
         xgpu_plume_ui_canvas_active() &&
-        d3d8_vsh_calculate_position_bounds(
-            g_device_state.vertex_shader, draw_vertices, vertex_count,
-            draw_stride, &render_state.programmable_position_min_x,
-            &render_state.programmable_position_max_x)) {
+        (immediate
+             ? d3d8_vsh_calculate_immediate_position_bounds(
+                   g_device_state.vertex_shader, draw_vertices, vertex_count,
+                   draw_stride, &render_state.programmable_position_min_x,
+                   &render_state.programmable_position_max_x)
+             : d3d8_vsh_calculate_position_bounds(
+                   g_device_state.vertex_shader, draw_vertices, vertex_count,
+                   draw_stride, &render_state.programmable_position_min_x,
+                   &render_state.programmable_position_max_x))) {
         render_state.programmable_position_bounds_valid = 1u;
     }
     xgpu_plume_record_draw((uint32_t)draw_type, draw_primitive_count,
@@ -1734,7 +1755,8 @@ static HRESULT submit_persistent_indexed_draw(
         return S_FALSE;
     draw_vertices = vertices + (size_t)vertex_offset;
 
-    prepare_draw();
+    if (!prepare_draw(FALSE))
+        goto done;
     if (!d3d8_vsh_is_programmable(g_device_state.vertex_shader)) {
         const DWORD position =
             g_device_state.vertex_shader & D3DFVF_POSITION_MASK;
@@ -1856,7 +1878,8 @@ static HRESULT submit_native_indexed_draw(
         normalized[i] = (uint32_t)indices16[i] - range.minimum;
     draw_vertices = vertices + (size_t)vertex_offset;
 
-    prepare_draw();
+    if (!prepare_draw(FALSE))
+        return E_FAIL;
     if (!d3d8_vsh_is_programmable(g_device_state.vertex_shader)) {
         const DWORD position =
             g_device_state.vertex_shader & D3DFVF_POSITION_MASK;
@@ -2389,7 +2412,7 @@ static HRESULT __stdcall dev_DrawPrimitive(IDirect3DDevice8 *self,
     if (start > buffer->size || bytes > buffer->size - start)
         return E_INVALIDARG;
     return submit_draw(type, primitive_count, buffer->sys_mem + start,
-                       g_cur_vb_stride);
+                       g_cur_vb_stride, FALSE);
 }
 
 static HRESULT __stdcall dev_DrawIndexedPrimitive(
@@ -2423,7 +2446,8 @@ static HRESULT __stdcall dev_DrawIndexedPrimitive(
                             g_cur_vb_stride, &expanded);
     if (FAILED(result))
         return result;
-    result = submit_draw(type, primitive_count, expanded, g_cur_vb_stride);
+    result = submit_draw(type, primitive_count, expanded, g_cur_vb_stride,
+                         FALSE);
     free(expanded);
     return result;
 }
@@ -2439,7 +2463,20 @@ static HRESULT __stdcall dev_DrawPrimitiveUP(IDirect3DDevice8 *self,
     InterlockedIncrement(&g_draw_count);
     XRECOMP_CPU_RECORDER_ZONE_BEGIN(
         cpu_compat_draw_zone, "D3D Compat Record Draw");
-    result = submit_draw(type, primitive_count, vertices, stride);
+    result = submit_draw(type, primitive_count, vertices, stride, FALSE);
+    XRECOMP_CPU_RECORDER_ZONE_END(cpu_compat_draw_zone);
+    return result;
+}
+
+HRESULT d3d8_DrawImmediate(D3DPRIMITIVETYPE type, UINT primitive_count,
+                           const void *vertices, UINT stride)
+{
+    HRESULT result;
+
+    InterlockedIncrement(&g_draw_count);
+    XRECOMP_CPU_RECORDER_ZONE_BEGIN(
+        cpu_compat_draw_zone, "D3D Compat Record Immediate Draw");
+    result = submit_draw(type, primitive_count, vertices, stride, TRUE);
     XRECOMP_CPU_RECORDER_ZONE_END(cpu_compat_draw_zone);
     return result;
 }
@@ -2490,7 +2527,7 @@ static HRESULT __stdcall dev_DrawIndexedPrimitiveUP(
     }
     XRECOMP_CPU_RECORDER_ZONE_BEGIN(
         cpu_compat_record_zone, "D3D Compat Record Draw");
-    result = submit_draw(type, primitive_count, expanded, stride);
+    result = submit_draw(type, primitive_count, expanded, stride, FALSE);
     XRECOMP_CPU_RECORDER_ZONE_END(cpu_compat_record_zone);
     free(expanded);
     XRECOMP_CPU_RECORDER_ZONE_END(cpu_compat_indexed_zone);
@@ -2780,6 +2817,13 @@ static const IDirect3DDevice8Vtbl g_device_vtbl = {
 IDirect3DDevice8 *xbox_GetD3DDevice(void)
 {
     return g_device_initialized ? &g_device : NULL;
+}
+
+void d3d8_SetStipple(const DWORD *pattern)
+{
+    if (pattern)
+        memcpy(g_device_state.stipple_pattern, pattern,
+               sizeof(g_device_state.stipple_pattern));
 }
 
 int d3d8_SetOutputExtent(UINT width, UINT height)

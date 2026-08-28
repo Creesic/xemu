@@ -1533,10 +1533,6 @@ void xgpu_plume_owner_execute_present(uint32_t present_reason)
     const uint32_t present_guest = g_draw.presentGuest();
 
     const bool has_queued_work = g_draw.hasQueuedWork();
-    const bool uploaded_present_surface =
-        g_surface_sync.hasUploadedSurface(present_guest);
-    if (uploaded_present_surface)
-        g_draw.retireStickyHostFrame();
     const bool needs_sticky_frame = g_draw.needsStickyHostFrame();
     const bool sync_needs_present = g_surface_sync.needsPresent(
         has_queued_work, needs_sticky_frame);
@@ -1625,7 +1621,11 @@ void xgpu_plume_owner_execute_present(uint32_t present_reason)
      * so it uses its own dedicated upload buffers. */
     g_draw.setCurrentSub(xgpu::plume::PlumeDraw::kPresentSub);
     g_draw.materializeRecordedSurfaces(g_ctx);
-    g_draw.ensureStickyHostFrame(g_ctx);
+    /* queueHostFrame already recorded this present's movie blit.  On every
+     * other present, replay the enabled overlay after any guest work so
+     * clears or background draws cannot flash through between video frames. */
+    if (present_reason != PLUME_PRESENT_HOST_FRAME)
+        g_draw.ensureStickyHostFrame(g_ctx);
     g_draw.ensurePresentSurfaceComposite(g_ctx);
     if (g_debug_overlay_provider_count) {
         std::array<uint32_t, XGPU_PLUME_MAX_DEBUG_OVERLAY_PROVIDERS> order = {};

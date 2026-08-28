@@ -534,6 +534,16 @@ void d3d_hle_device_select_vertex_shader(void)
     d3d_hle_guest_select_vertex_shader(handle, address);
 }
 
+extern void d3d_hle_device_select_vertex_shader_direct_gen_unused(void);
+void d3d_hle_device_select_vertex_shader_direct(void)
+{
+    uint32_t declaration = g_eax;
+    uint32_t address = g_ebx;
+    HLE_FALLBACK(d3d_hle_device_select_vertex_shader_direct);
+    d3d_hle_guest_stdcall_return(0);
+    d3d_hle_guest_select_vertex_shader_direct(declaration, address);
+}
+
 extern void d3d_hle_device_load_vertex_shader_program_gen_unused(void);
 void d3d_hle_device_load_vertex_shader_program(void)
 {
@@ -1027,6 +1037,8 @@ DEFINE_STD_WRAPPER(d3d_hle_device_create_palette2_std, 1,
     RET(d3d_hle_guest_create_palette2(a[0])))
 DEFINE_STD_WRAPPER(d3d_hle_device_create_image_surface_std, 4,
     RET(d3d_hle_guest_create_image_surface(a[0], a[1], a[2], a[3])))
+DEFINE_STD_WRAPPER(d3d_hle_device_set_stipple_std, 1,
+    d3d_hle_guest_set_stipple(a[0]))
 
 /* BeginPush(Count) returns the write pointer in eax. */
 extern void d3d_hle_device_begin_push_std_gen_unused(void);

@@ -34,6 +34,9 @@ int                  d3d8_PgraphRefreshSurface(uint32_t offset);
 int                  d3d8_PgraphPresentSurfaceForSwap(uint32_t offset);
 uint32_t             d3d8_HlePresentCount(void);
 uint32_t             d3d8_HleDrawCount(void);
+HRESULT              d3d8_DrawImmediate(D3DPRIMITIVETYPE type,
+                                        UINT primitive_count,
+                                        const void *vertices, UINT stride);
 void                 d3d8_SetVblankScanoutCallback(
                          D3D8VblankScanoutCallback callback);
 int                  d3d8_VblankScanout(void);

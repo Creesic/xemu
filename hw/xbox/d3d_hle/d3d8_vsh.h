@@ -75,6 +75,7 @@ extern "C" {
 /** Internal host handles occupy one bounded range above the FVF namespace. */
 #define NV2A_VS_HANDLE_BASE          0x10000u
 #define NV2A_VS_HANDLE_LIMIT         (NV2A_VS_HANDLE_BASE + NV2A_VS_MAX_SLOTS)
+#define NV2A_VS_IMMEDIATE_HANDLE_BASE 0x20000u
 
 /** Shader cache size (hashed microcode -> compiled shader). */
 #define NV2A_VS_CACHE_SIZE          64
@@ -414,6 +415,12 @@ BOOL d3d8_vsh_calculate_position_bounds(DWORD handle,
                                          float *minimum_x,
                                          float *maximum_x);
 
+/* Begin/End supplies a complete float4 v0-v15 latch snapshot per vertex,
+ * independent of the shader object's ordinary stream declaration. */
+BOOL d3d8_vsh_calculate_immediate_position_bounds(
+    DWORD handle, const void *vertices, uint32_t vertex_count,
+    uint32_t stride, float *minimum_x, float *maximum_x);
+
 /**
  * Check if a shader handle refers to a programmable vertex shader
  * (as opposed to an FVF code).
@@ -436,6 +443,7 @@ BOOL d3d8_vsh_is_programmable(DWORD handle);
  * @return TRUE if a programmable VS was bound, FALSE on fallback
  */
 BOOL d3d8_vsh_prepare_draw(DWORD handle);
+BOOL d3d8_vsh_prepare_immediate_draw(DWORD handle);
 
 /**
  * Parse NV2A vertex shader microcode into intermediate representation.

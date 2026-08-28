@@ -536,6 +536,21 @@ static D3DHleGuestResource *d3d_hle_guest_find_resource(uint32_t object_va)
     return NULL;
 }
 
+static D3DHleGuestResource *d3d_hle_guest_find_vertex_shader_resource(
+    uint32_t shader_handle)
+{
+    uint32_t object_va = shader_handle & ~1u;
+    D3DHleGuestResource *shader =
+        d3d_hle_guest_find_resource(object_va);
+
+    /* Some native XDK paths pass the attribute table at object + 0x14. */
+    if ((!shader || shader->kind != D3D_HLE_RESOURCE_VERTEX_SHADER) &&
+        !(shader_handle & 1u) && object_va >= 0x14u)
+        shader = d3d_hle_guest_find_resource(object_va - 0x14u);
+    return shader && shader->kind == D3D_HLE_RESOURCE_VERTEX_SHADER
+               ? shader : NULL;
+}
+
 static bool d3d_hle_guest_texture_data_candidate(
     D3DHleGuestResource *resource, uint32_t data_va)
 {
@@ -1488,6 +1503,19 @@ void d3d_hle_guest_set_render_state(D3DRENDERSTATETYPE state,
     result = device->lpVtbl->SetRenderState(device, state, value);
     if (result != S_OK)
         d3d_hle_guest_fatal("SetRenderState", result);
+}
+
+void d3d_hle_guest_set_stipple(uint32_t pattern_va)
+{
+    const DWORD *pattern;
+
+    if (!xbox_GetD3DDevice())
+        d3d_hle_guest_fatal("SetStipple (device unavailable)", E_FAIL);
+    if (!pattern_va)
+        d3d_hle_guest_fatal("SetStipple (null pattern)", E_INVALIDARG);
+    pattern = (const DWORD *)d3d_hle_guest_snapshot_range(
+        0, pattern_va, 32u * sizeof(*pattern));
+    d3d8_SetStipple(pattern);
 }
 
 void d3d_hle_guest_set_texture_stage_state(
@@ -3558,6 +3586,83 @@ static HRESULT d3d_hle_guest_adopt_native_vertex_shader_layout(
     return S_OK;
 }
 
+static HRESULT d3d_hle_guest_adopt_direct_vertex_shader(
+    uint32_t declaration_va, uint32_t address)
+{
+    const D3DHleGuestLoadedVertexProgram *loaded;
+    NV2AVshDeclaration declaration;
+    D3DHleGuestResource *shader;
+    DWORD host_handle;
+    uint64_t content_serial = UINT64_C(1469598103934665603);
+    unsigned attribute;
+    HRESULT result;
+
+    if (!declaration_va ||
+        address >= sizeof(g_hle_loaded_vertex_programs) /
+                       sizeof(g_hle_loaded_vertex_programs[0]))
+        return E_INVALIDARG;
+    loaded = &g_hle_loaded_vertex_programs[address];
+    if (!loaded->instruction_count)
+        return E_INVALIDARG;
+
+    memset(&declaration, 0, sizeof(declaration));
+    memset(declaration.format, 0x02, sizeof(declaration.format));
+    for (attribute = 0; attribute < NV2A_VS_MAX_INPUTS; ++attribute) {
+        uint32_t slot = declaration_va + attribute * 16u;
+        uint32_t stream = d3d_hle_guest_read_u32(slot + 0u);
+        uint32_t offset = d3d_hle_guest_read_u32(slot + 4u);
+        uint32_t format = d3d_hle_guest_read_u32(slot + 8u);
+        uint32_t tessellation = d3d_hle_guest_read_u32(slot + 12u);
+        uint32_t fields[] = { stream, offset, format, tessellation };
+        unsigned field;
+
+        if (stream >= XBOX_D3D_MAX_STREAMS || offset > UINT16_MAX ||
+            format > UINT8_MAX)
+            return E_INVALIDARG;
+        for (field = 0; field < sizeof(fields) / sizeof(fields[0]); ++field) {
+            content_serial ^= fields[field];
+            content_serial *= UINT64_C(1099511628211);
+        }
+        declaration.stream[attribute] = (uint8_t)stream;
+        declaration.offset[attribute] = (uint16_t)offset;
+        declaration.format[attribute] = (uint8_t)format;
+        if (format != 0x02u)
+            declaration.attributes_present |= (uint16_t)(1u << attribute);
+    }
+    declaration.valid = 1;
+    content_serial ^= address;
+    content_serial *= UINT64_C(1099511628211);
+    content_serial ^= loaded->generation;
+    content_serial *= UINT64_C(1099511628211);
+
+    shader = d3d_hle_guest_find_resource(declaration_va);
+    if (shader && shader->kind != D3D_HLE_RESOURCE_VERTEX_SHADER)
+        return E_INVALIDARG;
+    if (shader && shader->content_serial == content_serial)
+        return S_OK;
+
+    result = d3d8_vsh_create_shader(
+        loaded->microcode, (int)loaded->instruction_count, &declaration,
+        &host_handle);
+    if (result != S_OK)
+        return result;
+    shader = d3d_hle_guest_register_resource(
+        D3D_HLE_RESOURCE_VERTEX_SHADER, declaration_va);
+    if (!shader || shader->kind != D3D_HLE_RESOURCE_VERTEX_SHADER) {
+        d3d8_vsh_delete_shader(host_handle);
+        return E_INVALIDARG;
+    }
+    if (shader->host_handle)
+        d3d8_vsh_delete_shader(shader->host_handle);
+    shader->data_va = 0;
+    shader->data_bytes = loaded->instruction_count * 16u;
+    shader->host_handle = (uint32_t)host_handle;
+    shader->load_address = address;
+    shader->content_serial = content_serial;
+    shader->owned_object = 0;
+    return S_OK;
+}
+
 static HRESULT d3d_hle_guest_adopt_native_vertex_shader(
     uint32_t shader_handle, uint32_t address)
 {
@@ -4022,6 +4127,31 @@ static void d3d_hle_guest_read_present_parameters(
         d3d_hle_guest_read_u32(parameters_va + 48u);
 }
 
+static int d3d_hle_guest_multisample_logical_extent(
+    uint32_t storage_width, uint32_t storage_height,
+    uint32_t *logical_width, uint32_t *logical_height)
+{
+    const uint32_t multisample = g_hle_present_snapshot_valid
+        ? (uint32_t)g_hle_present_snapshot.MultiSampleType : 0u;
+    const uint32_t sample_width = (multisample >> 4) & 0xFu;
+    const uint32_t sample_height = multisample & 0xFu;
+    const uint32_t backbuffer_width = g_hle_present_snapshot_valid
+        ? g_hle_present_snapshot.BackBufferWidth : 0u;
+    const uint32_t backbuffer_height = g_hle_present_snapshot_valid
+        ? g_hle_present_snapshot.BackBufferHeight : 0u;
+
+    if (!logical_width || !logical_height || !sample_width ||
+        !sample_height || !backbuffer_width || !backbuffer_height ||
+        ((multisample & 0x3000u) == 0u &&
+         g_hle_present_snapshot.SwapEffect != D3DSWAPEFFECT_COPY) ||
+        storage_width != (uint64_t)backbuffer_width * sample_width ||
+        storage_height != (uint64_t)backbuffer_height * sample_height)
+        return 0;
+    *logical_width = backbuffer_width;
+    *logical_height = backbuffer_height;
+    return 1;
+}
+
 HRESULT d3d_hle_guest_register_vertex_shader_snapshot(
     const uint32_t *declaration_source, size_t declaration_dwords,
     const uint32_t *program_source, size_t program_dwords,
@@ -4109,8 +4239,8 @@ HRESULT d3d_hle_guest_register_pixel_shader(
 void d3d_hle_guest_unregister_vertex_shader(uint32_t shader_handle)
 {
     D3DHleGuestResource *shader =
-        d3d_hle_guest_find_resource(shader_handle & ~1u);
-    if (!shader || shader->kind != D3D_HLE_RESOURCE_VERTEX_SHADER)
+        d3d_hle_guest_find_vertex_shader_resource(shader_handle);
+    if (!shader)
         return;
     if (g_hle_vertex_shader == shader_handle)
         (void)d3d_hle_guest_set_vertex_shader(0);
@@ -4206,12 +4336,19 @@ static HRESULT d3d_hle_guest_bind_memory_render_target(
     int attach_default_depth)
 {
     XgpuSurfaceBinding binding;
+    uint32_t color_width = color->width;
+    uint32_t color_height = color->height;
     memset(&binding, 0, sizeof(binding));
+    /* Plume currently renders a single resolved image. Xbox multisample
+     * surfaces expose their enlarged sample-storage extent in the resource,
+     * but rasterization and Swap operate on the logical backbuffer extent. */
+    (void)d3d_hle_guest_multisample_logical_extent(
+        color->width, color->height, &color_width, &color_height);
     binding.color_resource = color->data_va;
-    binding.width = color->width;
-    binding.height = color->height;
-    binding.image_width = color->width;
-    binding.image_height = color->height;
+    binding.width = color_width;
+    binding.height = color_height;
+    binding.image_width = color_width;
+    binding.image_height = color_height;
     binding.color_pitch = d3d_hle_guest_surface_pitch(color);
     binding.color_format = color->format;
     binding.layout = (color->size ||
@@ -4219,11 +4356,15 @@ static HRESULT d3d_hle_guest_bind_memory_render_target(
         XGPU_SURFACE_PITCH : XGPU_SURFACE_SWIZZLE;
     binding.sample_count = 1;
     if (depth) {
+        uint32_t zeta_width = depth->width;
+        uint32_t zeta_height = depth->height;
+        (void)d3d_hle_guest_multisample_logical_extent(
+            depth->width, depth->height, &zeta_width, &zeta_height);
         binding.zeta_resource = depth->host_handle
             ? depth->host_handle : depth->data_va;
         binding.zeta_guest_address = depth->data_va;
-        binding.zeta_width = depth->width;
-        binding.zeta_height = depth->height;
+        binding.zeta_width = zeta_width;
+        binding.zeta_height = zeta_height;
         binding.zeta_pitch = d3d_hle_guest_surface_pitch(depth);
         binding.zeta_format =
             (depth->format == D3DFMT_D16 ||
@@ -5047,11 +5188,22 @@ HRESULT d3d_hle_guest_swap(uint32_t flags)
     /* A widescreen host backbuffer does not change the Xbox scanout panel.
      * Accept both the host-extended device extent and the native 640x480
      * memory surface; Plume composites the latter to the output extent. */
+    uint32_t multisample_width;
+    uint32_t multisample_height;
+    /* Xbox multisample modes encode their storage scale in the low nibbles.
+     * The XDK Swap path resolves this enlarged render surface before scanout;
+     * an entry hook must therefore treat that exact extent as the scanout
+     * source too, rather than indefinitely deferring it as an offscreen RT. */
+    const int target_is_multisampled_scanout = target &&
+        d3d_hle_guest_multisample_logical_extent(
+            target->width, target->height,
+            &multisample_width, &multisample_height);
     const int target_is_scanout = target &&
         ((target->width == d3d8_GetBackbufferWidth() &&
           target->height == d3d8_GetBackbufferHeight()) ||
          (target->width == XGPU_PANEL_WIDTH &&
-          target->height == XGPU_PANEL_HEIGHT));
+          target->height == XGPU_PANEL_HEIGHT) ||
+         target_is_multisampled_scanout);
     if (target_is_scanout && !target->host_object && target->data_va &&
         d3d8_PgraphPresentSurfaceForSwap(target->data_va))
         return S_OK;
@@ -5275,18 +5427,33 @@ void d3d_hle_guest_select_vertex_shader(
     (void)d3d_hle_guest_set_vertex_shader(shader_handle);
 }
 
+void d3d_hle_guest_select_vertex_shader_direct(
+    uint32_t declaration_va, uint32_t address)
+{
+    HRESULT result;
+
+    if (!declaration_va) {
+        d3d_hle_guest_select_vertex_shader(0, address);
+        return;
+    }
+    result = d3d_hle_guest_adopt_direct_vertex_shader(
+        declaration_va, address);
+    if (result == S_OK)
+        result = d3d_hle_guest_set_vertex_shader(declaration_va);
+    if (result != S_OK)
+        d3d_hle_guest_fatal("SelectVertexShaderDirect", result);
+}
+
 void d3d_hle_guest_delete_vertex_shader(uint32_t shader_handle)
 {
-    uint32_t object_va = shader_handle & 1u ?
-        shader_handle - 1u : shader_handle;
     D3DHleGuestResource *shader =
-        d3d_hle_guest_find_resource(object_va);
-    if (!shader || shader->kind != D3D_HLE_RESOURCE_VERTEX_SHADER)
+        d3d_hle_guest_find_vertex_shader_resource(shader_handle);
+    if (!shader)
         return;
     if (g_hle_vertex_shader == shader_handle)
         (void)d3d_hle_guest_set_vertex_shader(0);
     d3d8_vsh_delete_shader(shader->host_handle);
-    (void)d3d_hle_guest_resource_release(object_va);
+    (void)d3d_hle_guest_resource_release(shader->object_va);
 }
 
 HRESULT d3d_hle_guest_set_vertex_shader(uint32_t shader_handle)
@@ -5294,17 +5461,16 @@ HRESULT d3d_hle_guest_set_vertex_shader(uint32_t shader_handle)
     IDirect3DDevice8 *device =
         d3d_hle_guest_require_device("SetVertexShader device");
     DWORD host_handle = shader_handle;
-    if (shader_handle & 1u) {
-        D3DHleGuestResource *shader =
-            d3d_hle_guest_find_resource(shader_handle - 1u);
-        if (!shader &&
-            d3d_hle_guest_adopt_native_vertex_shader(
-                shader_handle, 0) == S_OK)
-            shader = d3d_hle_guest_find_resource(shader_handle - 1u);
-        if (!shader || shader->kind != D3D_HLE_RESOURCE_VERTEX_SHADER)
-            return E_INVALIDARG;
+    D3DHleGuestResource *shader =
+        d3d_hle_guest_find_vertex_shader_resource(shader_handle);
+
+    if (!shader && (shader_handle & 1u) &&
+        d3d_hle_guest_adopt_native_vertex_shader(shader_handle, 0) == S_OK)
+        shader = d3d_hle_guest_find_vertex_shader_resource(shader_handle);
+    if (shader)
         host_handle = shader->host_handle;
-    }
+    else if (shader_handle & 1u)
+        return E_INVALIDARG;
     if (device->lpVtbl->SetVertexShader(
             device, host_handle) != S_OK)
         return E_FAIL;
@@ -5488,26 +5654,26 @@ void d3d_hle_guest_set_vertex_data2s(uint32_t reg, uint32_t a, uint32_t b)
 
 void d3d_hle_guest_set_vertex_data_color(uint32_t reg, uint32_t color)
 {
-    float components[4];
-    uint32_t bits[4];
-    unsigned i;
-
-    components[0] = (float)(color & 0xFFu) / 255.0f;
-    components[1] = (float)((color >> 8) & 0xFFu) / 255.0f;
-    components[2] = (float)((color >> 16) & 0xFFu) / 255.0f;
-    components[3] = (float)((color >> 24) & 0xFFu) / 255.0f;
-    for (i = 0; i < 4; ++i)
-        memcpy(&bits[i], &components[i], sizeof(bits[i]));
-    d3d_hle_guest_set_vertex_data4f(
-        reg, bits[0], bits[1], bits[2], bits[3]);
+    d3d_hle_guest_set_vertex_data4ub(
+        reg, (color >> 16) & 0xFFu, (color >> 8) & 0xFFu,
+        color & 0xFFu, (color >> 24) & 0xFFu);
 }
 
 void d3d_hle_guest_set_vertex_data4ub(
     uint32_t reg, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
 {
-    uint32_t packed = (a & 0xFFu) | ((b & 0xFFu) << 8) |
-                      ((c & 0xFFu) << 16) | ((d & 0xFFu) << 24);
-    d3d_hle_guest_set_vertex_data_color(reg, packed);
+    float components[4];
+    uint32_t bits[4];
+    unsigned i;
+
+    components[0] = (float)(a & 0xFFu) / 255.0f;
+    components[1] = (float)(b & 0xFFu) / 255.0f;
+    components[2] = (float)(c & 0xFFu) / 255.0f;
+    components[3] = (float)(d & 0xFFu) / 255.0f;
+    for (i = 0; i < 4; ++i)
+        memcpy(&bits[i], &components[i], sizeof(bits[i]));
+    d3d_hle_guest_set_vertex_data4f(
+        reg, bits[0], bits[1], bits[2], bits[3]);
 }
 
 void d3d_hle_guest_begin(uint32_t primitive_type)
@@ -5535,9 +5701,11 @@ void d3d_hle_guest_end(void)
     static int warned_unmatched_end;
     IDirect3DDevice8 *device;
     const uint32_t supported_mask = 0x1u | 0x8u | 0x10u | 0x1E00u;
+    DWORD host_shader;
     uint32_t fvf;
     uint32_t tex_count = 0;
     uint32_t floats_per_vertex;
+    uint32_t primitive_count;
     uint32_t out = 0;
     uint32_t v;
     int transformed = 0;
@@ -5557,21 +5725,36 @@ void d3d_hle_guest_end(void)
     g_hle_imm_active = 0;
     if (g_hle_imm_vert_count == 0)
         return;
+    device = d3d_hle_guest_require_device("Begin/End device");
+    result = device->lpVtbl->GetVertexShader(device, &host_shader);
+    if (result != S_OK)
+        d3d_hle_guest_fatal("Begin/End GetVertexShader", result);
+    primitive_count = d3d_hle_guest_primitive_count(
+        (D3DPRIMITIVETYPE)g_hle_imm_primitive, g_hle_imm_vert_count);
+    D3D_HLE_F2_LOG(
+        "immend guestvs=%08X hostvs=%08lX attrs=%04X verts=%u "
+        "p0=(%.3f,%.3f,%.3f,%.3f) mode=%s",
+        g_hle_vertex_shader, (unsigned long)host_shader,
+        g_hle_imm_attr_mask, g_hle_imm_vert_count,
+        g_hle_imm_verts[0][0][0], g_hle_imm_verts[0][0][1],
+        g_hle_imm_verts[0][0][2], g_hle_imm_verts[0][0][3],
+        d3d8_vsh_is_programmable(host_shader) ? "programmable" : "fixed");
+    if (d3d8_vsh_is_programmable(host_shader)) {
+        result = d3d8_DrawImmediate(
+            (D3DPRIMITIVETYPE)g_hle_imm_primitive, primitive_count,
+            g_hle_imm_verts, sizeof(g_hle_imm_verts[0]));
+        if (result != S_OK)
+            d3d_hle_guest_fatal("Begin/End programmable draw", result);
+        d3d_hle_guest_note_gpu_draw();
+        g_hle_imm_vert_count = 0;
+        g_hle_imm_attr_mask = 0;
+        return;
+    }
     if (!(g_hle_imm_attr_mask & 0x1u) ||
         (g_hle_imm_attr_mask & ~supported_mask))
         d3d_hle_guest_fatal("Begin/End unsupported attribute mask",
                             E_NOTIMPL);
-    device = d3d_hle_guest_require_device("Begin/End device");
-    if (!d3d8_vsh_is_programmable(g_hle_vertex_shader)) {
-        transformed = (g_hle_vertex_shader & 0x00Eu) == D3DFVF_XYZRHW;
-    } else {
-        for (v = 0; v < g_hle_imm_vert_count; ++v) {
-            if (g_hle_imm_verts[v][0][3] != 1.0f) {
-                transformed = 1;
-                break;
-            }
-        }
-    }
+    transformed = (g_hle_vertex_shader & 0x00Eu) == D3DFVF_XYZRHW;
     while (tex_count < 4u &&
            (g_hle_imm_attr_mask & (0x200u << tex_count)))
         ++tex_count;
@@ -5613,9 +5796,7 @@ void d3d_hle_guest_end(void)
     if (result == S_OK) {
         result = device->lpVtbl->DrawPrimitiveUP(
             device, (D3DPRIMITIVETYPE)g_hle_imm_primitive,
-            d3d_hle_guest_primitive_count(
-                (D3DPRIMITIVETYPE)g_hle_imm_primitive,
-                g_hle_imm_vert_count),
+            primitive_count,
             packed, floats_per_vertex * 4u);
     }
     if (result == S_OK)

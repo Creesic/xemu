@@ -728,6 +728,8 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     EMIT("    float  fog_end;\n");
     EMIT("    float  fog_density;\n");
     EMIT("    float4 texcoord_scale[4];\n");
+    EMIT("    uint4 stipple_pattern[8];\n");
+    EMIT("    uint4 stipple_control;\n");
     EMIT("};\n\n");
 
     /* ---- Input structure ---- */
@@ -791,6 +793,13 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
              " : SV_TARGET {\n");
     else
         EMIT("float4 main(PS_IN input) : SV_TARGET {\n");
+
+    EMIT("    uint2 stipple_pixel = uint2(input.pos.xy / "
+         "max(float(stipple_control.y), 1.0));\n");
+    EMIT("    uint stipple_row = stipple_pixel.y & 31u;\n");
+    EMIT("    if (stipple_control.x != 0u && "
+         "(stipple_pattern[stipple_row >> 2u][stipple_row & 3u] & "
+         "(1u << (stipple_pixel.x & 31u))) == 0u) discard;\n");
 
     /* Initialize register file */
     EMIT("    /* Register file initialization */\n");

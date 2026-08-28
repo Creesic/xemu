@@ -36,6 +36,9 @@ class PlumeContext;
 namespace xgpu {
 namespace plume {
 
+static constexpr size_t kProgramConstantFloatCount = 136u;
+static constexpr uint64_t kProgramConstantStride = 768u;
+
 class PlumeDraw {
 public:
     void reset();
@@ -622,7 +625,8 @@ public:
         /* The first 21 float4s cover the shared combiner/fixed/XPS prefix,
          * including the table-fog parameters in row 20. Rows 21..24 carry
          * per-texture coordinate scale for Xbox linear textures. */
-        std::vector<std::array<float, 100>> frameProgConsts;
+        std::vector<std::array<float, kProgramConstantFloatCount>>
+            frameProgConsts;
         std::unordered_map<uint64_t, std::vector<uint32_t>>
             frameProgConstBuckets;
         /* Reuse the most recent pixel-constant snapshot while both its
@@ -783,11 +787,11 @@ private:
     std::unique_ptr<::plume::RenderTexture> m_whiteCubeTex;
     std::unique_ptr<::plume::RenderTextureView> m_whiteCubeView;
     std::unordered_map<uint64_t, std::unique_ptr<::plume::RenderPipeline>> m_progPsos;
-    /* Live-reload replacements can race up to three asynchronous WAIT
-     * submissions. Retain superseded GPU objects for the process lifetime so
-     * no backend observes a destroyed shader or PSO still in flight. */
+    /* Shader replacements can race up to three asynchronous WAIT submissions.
+     * Retain superseded GPU objects for the process lifetime so no backend
+     * observes a destroyed shader or PSO still in flight. */
     std::vector<std::unique_ptr<::plume::RenderShader>>
-        m_liveRetiredPixelShaders;
+        m_liveRetiredShaders;
     std::vector<std::unique_ptr<::plume::RenderPipeline>>
         m_liveRetiredPipelines;
     uint64_t m_liveShaderPollMs = 0;
@@ -848,9 +852,11 @@ private:
     uint64_t m_psConstVersion = 1;
     uint64_t m_combinerConstVersion = 1;
     std::array<float, 16> snapshotProgramTextureScales() const;
-    std::array<float, 100> snapshotProgramConstants(
-        bool combinerCB, const std::array<float, 16> &textureScales) const;
-    uint32_t internProgramConstants(bool combinerCB);
+    std::array<float, kProgramConstantFloatCount> snapshotProgramConstants(
+        bool combinerCB, const std::array<float, 16> &textureScales,
+        const XgpuPlumeRenderState &renderState) const;
+    uint32_t internProgramConstants(
+        bool combinerCB, const XgpuPlumeRenderState &renderState);
     std::unordered_map<uint32_t, PlumeVertexShader> m_vsReg;
     uint32_t m_activeVS = 0;
     float m_vsConst[192][4] = {{0}};
