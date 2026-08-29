@@ -63,6 +63,8 @@ typedef struct VoiceWorker {
 
 typedef struct VoiceWorkDispatch {
     QemuMutex lock;
+    QemuCond voice_idle;
+    uint64_t voices_processing[4];
     int num_workers;
     VoiceWorker *workers;
     bool workers_should_exit;

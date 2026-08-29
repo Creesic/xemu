@@ -26,6 +26,8 @@
 typedef struct PGRAPHGLSurfaceTextureLayout {
     bool surface_color;
     bool surface_swizzled;
+    uint32_t surface_color_format;
+    uint32_t surface_host_format;
     uint32_t surface_width;
     uint32_t surface_height;
     uint32_t surface_pitch;
@@ -34,6 +36,7 @@ typedef struct PGRAPHGLSurfaceTextureLayout {
     bool texture_cubemap;
     uint32_t texture_levels;
     uint32_t texture_color_format;
+    uint32_t texture_host_format;
     uint32_t texture_width;
     uint32_t texture_height;
     uint32_t texture_pitch;
@@ -41,6 +44,8 @@ typedef struct PGRAPHGLSurfaceTextureLayout {
 } PGRAPHGLSurfaceTextureLayout;
 
 bool pgraph_gl_zeta_to_y16_compatible(
+    const PGRAPHGLSurfaceTextureLayout *layout);
+bool pgraph_gl_color_surface_to_texture_compatible(
     const PGRAPHGLSurfaceTextureLayout *layout);
 
 #endif

@@ -43,3 +43,32 @@ bool pgraph_gl_zeta_to_y16_compatible(
            layout->surface_pitch == layout->texture_pitch &&
            surface_row_bytes == texture_row_bytes;
 }
+
+bool pgraph_gl_color_surface_to_texture_compatible(
+    const PGRAPHGLSurfaceTextureLayout *layout)
+{
+    bool same_host_format = layout->surface_host_format != 0 &&
+                            layout->surface_host_format ==
+                                layout->texture_host_format;
+    bool x8_texture =
+        layout->texture_color_format ==
+            NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_X8R8G8B8 ||
+        layout->texture_color_format ==
+            NV097_SET_TEXTURE_FORMAT_COLOR_SZ_X8R8G8B8;
+    bool x8_compatible = x8_texture &&
+        (layout->surface_color_format ==
+             NV097_SET_SURFACE_FORMAT_COLOR_LE_X8R8G8B8_Z8R8G8B8 ||
+         layout->surface_color_format ==
+             NV097_SET_SURFACE_FORMAT_COLOR_LE_A8R8G8B8);
+
+    return layout->surface_color &&
+           (layout->surface_swizzled ||
+            layout->surface_pitch == layout->texture_pitch) &&
+           !layout->texture_cubemap &&
+           layout->texture_levels == 1 &&
+           layout->surface_width == layout->texture_width &&
+           layout->surface_height == layout->texture_height &&
+           layout->surface_bytes_per_pixel ==
+               layout->texture_bytes_per_pixel &&
+           (same_host_format || x8_compatible);
+}

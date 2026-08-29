@@ -61,6 +61,7 @@ typedef struct SurfaceBinding {
     bool draw_dirty;
     bool download_pending;
     bool upload_pending;
+    GArray *cpu_write_ranges;
 
     GLuint gl_buffer;
     SurfaceFormatInfo fmt;
@@ -77,6 +78,7 @@ typedef struct TextureBinding {
     unsigned int addru;
     unsigned int addrv;
     unsigned int addrp;
+    uint32_t max_anisotropy;
     uint32_t border_color;
     bool border_color_set;
     GLenum gl_target;
@@ -234,6 +236,9 @@ typedef struct PGRAPHGLState {
 
     GLfloat supported_aliased_line_width_range[2];
     GLfloat supported_smooth_line_width_range[2];
+
+    bool draw_state_valid;
+    uint32_t draw_state_key[14];
 
     struct supported_extensions {
         GLboolean texture_filter_anisotropic;

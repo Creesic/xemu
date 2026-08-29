@@ -134,23 +134,27 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
 static void voice_lock(MCPXAPUState *d, uint16_t v, bool lock)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    qemu_mutex_lock(&d->lock);
+    VoiceWorkDispatch *vwd = &d->vp.voice_work_dispatch;
+    uint64_t mask = 1ULL << (v % 64);
 
-    uint64_t mask = 1LL << (v % 64);
+    qemu_mutex_lock(&vwd->lock);
     if (lock) {
-        d->vp.voice_locked[v / 64] |= mask;
+        qatomic_or(&d->vp.voice_locked[v / 64], mask);
+        while (vwd->voices_processing[v / 64] & mask) {
+            qemu_cond_wait(&vwd->voice_idle, &vwd->lock);
+        }
     } else {
-        d->vp.voice_locked[v / 64] &= ~mask;
+        qatomic_and(&d->vp.voice_locked[v / 64], ~mask);
     }
+    qemu_mutex_unlock(&vwd->lock);
 
     qemu_cond_signal(&d->cond);
-    qemu_mutex_unlock(&d->lock);
 }
 
 static bool is_voice_locked(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    uint64_t mask = 1LL << (v % 64);
+    uint64_t mask = 1ULL << (v % 64);
     return (qatomic_read(&d->vp.voice_locked[v / 64]) & mask) != 0;
 }
 
@@ -1725,9 +1729,11 @@ voice_work_dispatch(MCPXAPUState *d,
 
     int64_t start_time = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
+    qemu_mutex_lock(&vwd->lock);
     while (true) {
         if (qatomic_read(&d->pause_requested)) {
             vwd->queue_len = 0;
+            qemu_mutex_unlock(&vwd->lock);
             return;
         }
 
@@ -1735,19 +1741,30 @@ voice_work_dispatch(MCPXAPUState *d,
             break;
         }
 
+        qemu_mutex_unlock(&vwd->lock);
         qemu_cond_timedwait(&d->cond, &d->lock, 1);
+        qemu_mutex_lock(&vwd->lock);
     }
-
-    qemu_mutex_lock(&vwd->lock);
 
     if (vwd->queue_len) {
         memset(vwd->mixbins, 0, sizeof(vwd->mixbins));
+
+        for (int i = 0; i < vwd->queue_len; i++) {
+            int voice = vwd->queue[i].voice;
+            vwd->voices_processing[voice / 64] |= 1ULL << (voice % 64);
+        }
 
         // Signal workers and wait for completion
         voice_work_schedule(d);
         qemu_cond_broadcast(&vwd->work_pending);
         qemu_cond_wait(&vwd->work_finished, &vwd->lock);
         assert(!vwd->workers_pending);
+
+        for (int i = 0; i < vwd->queue_len; i++) {
+            int voice = vwd->queue[i].voice;
+            vwd->voices_processing[voice / 64] &= ~(1ULL << (voice % 64));
+        }
+        qemu_cond_broadcast(&vwd->voice_idle);
         vwd->queue_len = 0;
 
         // Add voice contributions
@@ -1774,11 +1791,13 @@ static void voice_work_init(MCPXAPUState *d)
     vwd->workers_should_exit = false;
     vwd->workers_pending = 0;
     vwd->queue_len = 0;
+    memset(vwd->voices_processing, 0, sizeof(vwd->voices_processing));
 
     g_dbg.vp.num_workers = vwd->num_workers;
 
     qemu_mutex_init(&vwd->lock);
     qemu_mutex_lock(&vwd->lock);
+    qemu_cond_init(&vwd->voice_idle);
     qemu_cond_init(&vwd->work_pending);
     qemu_cond_init(&vwd->work_finished);
     for (int i = 0; i < vwd->num_workers; i++) {
