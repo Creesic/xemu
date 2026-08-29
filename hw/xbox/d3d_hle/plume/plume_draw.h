@@ -82,7 +82,8 @@ public:
                            float depth, uint8_t stencil,
                            const XgpuRect *rect);
     bool setSurfaceTexture(uint32_t stage, uint32_t guest,
-                           uint32_t unnormalizedCoords);
+                           uint32_t unnormalizedCoords,
+                           uint32_t textureFormat);
     bool blitSurface(PlumeContext &ctx,
                      const XgpuSurfaceBinding &destination,
                      uint32_t dstGuest, uint32_t srcResource,
@@ -400,6 +401,8 @@ private:
 
     struct PlumeZetaSurface {
         std::unique_ptr<::plume::RenderTexture> texture;
+        std::unique_ptr<::plume::RenderTextureView> sampledView;
+        std::unique_ptr<::plume::RenderDescriptorSet> sampledDescSet;
         ::plume::RenderFormat format = ::plume::RenderFormat::UNKNOWN;
         ::plume::RenderTextureLayout layout = ::plume::RenderTextureLayout::UNKNOWN;
         uint32_t width = 0, height = 0;
@@ -763,6 +766,7 @@ private:
     bool applySurfaceBinding(
         PlumeContext &ctx,
         const SurfaceBindingCommand &command);
+    bool ensureZetaSampleView(PlumeContext &ctx, PlumeZetaSurface &zeta);
     uint64_t m_curSurfaceStage[4] = {};
     uint8_t m_curSurfaceUnnormalized[4] = {};
     uint32_t m_currentTarget = 0;
@@ -857,7 +861,12 @@ private:
         const XgpuPlumeRenderState &renderState) const;
     uint32_t internProgramConstants(
         bool combinerCB, const XgpuPlumeRenderState &renderState);
+    /* Guest D3D8 handles are reusable slots. Draws keep the immutable,
+     * content-deduplicated ID resolved from the slot at record time. */
     std::unordered_map<uint32_t, PlumeVertexShader> m_vsReg;
+    std::unordered_map<std::string, uint32_t> m_vsByKey;
+    std::unordered_map<uint32_t, uint32_t> m_vsHandleMap;
+    uint32_t m_vsNext = 1;
     uint32_t m_activeVS = 0;
     float m_vsConst[192][4] = {{0}};
     uint64_t m_vsConstVersion = 1;

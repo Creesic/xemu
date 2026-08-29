@@ -1495,6 +1495,11 @@ void d3d_hle_guest_set_render_state(D3DRENDERSTATETYPE state,
         value = 0;
     if ((uint32_t)state < XBOX_D3D_HLE_MAX_STATES)
         g_hle_state_cache[(uint32_t)state] = value;
+    if ((uint32_t)state == 311u) {
+        if (value < 0x200u || value > 0x207u)
+            d3d_hle_guest_fatal("SetRenderState ShadowFunc", E_INVALIDARG);
+        d3d8_combiners_set_shadow_func(value - 0x200u);
+    }
     if ((uint32_t)state >= 256u)
         return;
     if (!device)
@@ -2943,6 +2948,9 @@ void d3d_hle_guest_switch_texture(
     binding.format = texture->format;
     binding.version = texture->version > g_hle_palette_version[stage]
         ? texture->version : g_hle_palette_version[stage];
+    if (texture->uploaded_version && !has_host_color_mips &&
+        texture->uploaded_content_hash == content_hash)
+        binding.version = texture->uploaded_version;
     binding.cube = face_count == 6u;
     /*
      * A nonzero PixelContainer Size denotes pitch-linear storage. Its texture
@@ -2967,12 +2975,22 @@ void d3d_hle_guest_switch_texture(
      */
     XRECOMP_CPU_RECORDER_ZONE_BEGIN(
         cpu_hle_texture_cache_zone, "D3D HLE Texture Cache Bind");
-    texture_cache_hit =
-        !xgpu_plume_f2_active() &&
-        texture->format != D3DFMT_P8 &&
-        (!has_host_color_mips ||
-         texture->uploaded_version == binding.version) &&
-        xgpu_plume_bind_texture_if_cached(&binding);
+    {
+        XgpuTextureBinding cache_binding = binding;
+
+        /* Plume stores P8 uploads after palette expansion. Match that hosted
+         * identity so an unchanged palette rebind can reuse it too. */
+        if (texture->format == D3DFMT_P8 &&
+            bytes <= UINT32_MAX / 4u && pitch <= UINT32_MAX / 4u) {
+            cache_binding.format = D3DFMT_A8R8G8B8;
+            cache_binding.bytes = bytes * 4u;
+            cache_binding.pitch = pitch * 4u;
+        }
+        texture_cache_hit =
+            (!has_host_color_mips ||
+             texture->uploaded_version == binding.version) &&
+            xgpu_plume_bind_texture_if_cached(&cache_binding);
+    }
     XRECOMP_CPU_RECORDER_ZONE_END(cpu_hle_texture_cache_zone);
     if (texture_cache_hit) {
         XRECOMP_CPU_RECORDER_ZONE_END(cpu_hle_switch_texture_zone);

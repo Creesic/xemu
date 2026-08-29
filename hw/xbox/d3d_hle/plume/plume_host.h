@@ -121,7 +121,8 @@ void xgpu_plume_clear_target(float r, float g, float b, float a,
                              uint32_t color_write_mask,
                              const XgpuRect *rect);
 void xgpu_plume_set_surface_texture(uint32_t stage, uint32_t guest_ptr,
-                                    uint32_t unnormalized_coords);
+                                    uint32_t unnormalized_coords,
+                                    uint32_t texture_format);
 void xgpu_plume_set_present_surface(uint32_t guest_ptr);
 int xgpu_plume_wait_for_idle(uint32_t surface_sync_flags);
 

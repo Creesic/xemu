@@ -41,6 +41,13 @@ guard_body = GUEST[palette_guard:upload_begin]
 assert "D3D_HLE_RESOURCE_PALETTE" in guard_body
 assert "XRECOMP_CPU_RECORDER_ZONE_END" in guard_body
 assert "return;" in guard_body
+switch_end = GUEST.index("\n}\n\nstatic uint32_t d3d_hle_guest_compare_func", palette_guard)
+switch_texture = GUEST[palette_guard:switch_end]
+assert "XgpuTextureBinding cache_binding = binding;" in switch_texture
+assert "cache_binding.format = D3DFMT_A8R8G8B8;" in switch_texture
+assert "cache_binding.bytes = bytes * 4u;" in switch_texture
+assert "cache_binding.pitch = pitch * 4u;" in switch_texture
+assert "xgpu_plume_bind_texture_if_cached(&cache_binding)" in switch_texture
 create_palette = GUEST[GUEST.index("uint32_t d3d_hle_guest_create_palette2"):]
 create_palette = create_palette[:create_palette.index("\n}")]
 assert "xbox_d3d8_palette_entry_count(size << 30)" in create_palette

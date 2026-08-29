@@ -53,8 +53,10 @@ static DWORD g_definition[60];
 static NV2ACombinerState g_combiner_state;
 static uint8_t g_texture_dimensions[NV2A_MAX_TEXTURES];
 static uint8_t g_texture_cube[NV2A_MAX_TEXTURES];
+static uint8_t g_texture_shadow[NV2A_MAX_TEXTURES];
 static uint8_t g_texture_luminance[NV2A_MAX_TEXTURES];
 static uint8_t g_z_perspective;
+static uint8_t g_shadow_func;
 /* Authored Xbox D3D stage order: m00, m01, m10, m11, scale, offset. */
 static float g_bump_env[NV2A_MAX_TEXTURES][6];
 static uint8_t g_color_key_mode[NV2A_MAX_TEXTURES];
@@ -231,6 +233,8 @@ static uint32_t effective_texture_shader_mode(
         if (mode == 0x0Du || mode == 0x0Eu)
             return 0x0Eu;
     }
+    if (state->texture_shadow[stage] && mode == 1u)
+        return 2u;
     return mode;
 }
 
@@ -454,14 +458,14 @@ void d3d8_combiners_from_render_states(const DWORD *rs,
  * Generated shader structure:
  *   1. Texture sampler declarations
  *   2. Constant buffer (matches NV2APSConstants layout)
- *   3. Input struct (SV_POSITION, COLOR0, COLOR1, TEXCOORD0-3)
+ *   3. Input struct (SV_POSITION, COLOR0, COLOR1, TEXCOORD0-3, FOG)
  *   4. Input mapping helper function
  *   5. Output mapping helper function
  *   6. main():
  *      a. Initialize register file from inputs
  *      b. Execute each general combiner stage
  *      c. Execute final combiner
- *      d. Apply fog
+ *      d. Apply fallback fog when the final combiner does not own it
  *      e. Apply alpha test
  *      f. Return result
  * ================================================================ */
@@ -678,8 +682,19 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
         "dotmap_invalid", "dotmap_invalid", "dotmap_invalid",
         "dotmap_invalid", "dotmap_invalid",
     };
+    static const char *shadow_comparison[] = {
+        NULL, "<", "==", "<=", ">", "!=", ">=", NULL,
+    };
     int off = 0;
     int i;
+    int final_uses_fog = 0;
+
+    for (i = 0; i < 7; ++i) {
+        if (state->final_input[i].reg == NV2A_REG_FOG) {
+            final_uses_fog = 1;
+            break;
+        }
+    }
 
     /* ---- Texture samplers ---- */
     for (i = 0; i < NV2A_MAX_TEXTURES; i++) {
@@ -741,6 +756,7 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     EMIT("    float%d tc1     : TEXCOORD1;\n", state->use_texture_shader ? 4 : 2);
     EMIT("    float%d tc2     : TEXCOORD2;\n", state->use_texture_shader ? 4 : 2);
     EMIT("    float%d tc3     : TEXCOORD3;\n", state->use_texture_shader ? 4 : 2);
+    EMIT("    float  fog     : FOG;\n");
     EMIT("};\n\n");
 
     if (state->use_texture_shader) {
@@ -767,14 +783,12 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
 
     /*
      * NV2A fog register: rgb carries SET_FOG_COLOR, alpha carries the
-     * per-fragment fog factor.  MM3-class titles use table fog, whose
-     * factor the hardware derives from eye distance; eye-space W is the
-     * same quantity this translator already trusts for W-buffer depth.
-     * D3DFOGMODE: 1 = EXP, 2 = EXP2, 3 = LINEAR; anything else is
-     * unattenuated.  No VS-paired FOG input may be declared here.
+     * interpolated vertex fog factor. D3DFOG_NONE preserves programmable
+     * oFog; table modes derive their factor from eye distance instead.
      */
-    EMIT("float xrecomp_fog_factor(float w) {\n");
+    EMIT("float xrecomp_fog_factor(float w, float vertex_fog) {\n");
     EMIT("    float coord = max(w, 0.0);\n");
+    EMIT("    if (fog_mode == 0u) return saturate(vertex_fog);\n");
     EMIT("    if (fog_mode == 3u)\n");
     EMIT("        return saturate((fog_end - coord) /\n");
     EMIT("                        max(fog_end - fog_start, 1.0e-6));\n");
@@ -807,7 +821,8 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
     EMIT("    float4 r_c0   = c0[0];\n");
     EMIT("    float4 r_c1   = c1[0];\n");
     EMIT("    float4 r_fog  = float4(fog_color.rgb, "
-         "xrecomp_fog_factor(input.pos.w));\n");
+         "fog_enable != 0u ? xrecomp_fog_factor(input.pos.w, input.fog) "
+         ": 1.0);\n");
 
     /* Vertex colors: Xbox D3DCOLOR is BGRA in memory, the vertex shader
      * should have already swizzled to RGBA. */
@@ -835,8 +850,25 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
                          i, i, i, i, i, i);
                 }
             } else if (mode == 2) {
-                EMIT("    float4 r_t%d = tex%d.Sample(samp%d, (input.tc%d.xyz / input.tc%d.w) * texcoord_scale[%d].xyz);\n",
-                     i, i, i, i, i, i);
+                if (!state->texture_shadow[i]) {
+                    EMIT("    float4 r_t%d = tex%d.Sample(samp%d, (input.tc%d.xyz / input.tc%d.w) * texcoord_scale[%d].xyz);\n",
+                         i, i, i, i, i, i);
+                } else if (state->shadow_func == 0u ||
+                           state->shadow_func == 7u) {
+                    const char *value = state->shadow_func == 7u ? "1" : "0";
+                    EMIT("    float4 r_t%d = float4(%s, %s, %s, %s);\n",
+                         i, value, value, value, value);
+                    sampled = 0;
+                } else {
+                    EMIT("    float shadow_depth%d = tex%d.Sample(samp%d, (input.tc%d.xy / input.tc%d.w) * texcoord_scale[%d].xy).r * 16777215.0;\n",
+                         i, i, i, i, i, i);
+                    EMIT("    float shadow_ref%d = clamp(input.tc%d.z / input.tc%d.w, 0.0, 16777215.0);\n",
+                         i, i, i);
+                    EMIT("    float shadow_result%d = shadow_depth%d %s shadow_ref%d ? 1.0 : 0.0;\n",
+                         i, i, shadow_comparison[state->shadow_func], i);
+                    EMIT("    float4 r_t%d = float4(shadow_result%d, shadow_result%d, shadow_result%d, shadow_result%d);\n",
+                         i, i, i, i, i);
+                }
             } else if (mode == 3) {
                 if (state->texture_cube[i]) {
                     EMIT("    float4 r_t%d = tex%d.Sample(samp%d, input.tc%d.xyz);\n",
@@ -1351,11 +1383,14 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
         EMIT("    result = r_r0;\n\n");
     }
 
-    /* ---- Fog ---- */
-    EMIT("    /* Fog application */\n");
-    EMIT("    if (fog_enable) {\n");
-    EMIT("        result.rgb = lerp(fog_color.rgb, result.rgb, r_fog.a);\n");
-    EMIT("    }\n\n");
+    /* LazySetSpecFogCombiner normally folds fog into the final combiner.
+     * Retain the existing post-combiner bridge only for shaders whose final
+     * inputs do not already consume the fog register. */
+    if (!final_uses_fog) {
+        EMIT("    if (fog_enable) {\n");
+        EMIT("        result.rgb = lerp(fog_color.rgb, result.rgb, r_fog.a);\n");
+        EMIT("    }\n\n");
+    }
 
     /* ---- Alpha test ---- */
     EMIT("    /* Alpha test */\n");
@@ -1464,11 +1499,13 @@ HRESULT d3d8_combiners_init(void)
         g_color_key_mask[i] = UINT32_MAX;
     }
     memset(g_texture_cube, 0, sizeof(g_texture_cube));
+    memset(g_texture_shadow, 0, sizeof(g_texture_shadow));
     memset(g_texture_luminance, 0, sizeof(g_texture_luminance));
     memset(g_bump_env, 0, sizeof(g_bump_env));
     memset(g_color_key_mode, 0, sizeof(g_color_key_mode));
     memset(g_color_key, 0, sizeof(g_color_key));
     g_z_perspective = 0;
+    g_shadow_func = 0;
     g_ps_token = 0;
     g_definition_active = FALSE;
     memset(g_definition, 0, sizeof(g_definition));
@@ -1486,12 +1523,14 @@ void d3d8_combiners_shutdown(void)
     memset(&g_constants, 0, sizeof(g_constants));
     memset(g_texture_dimensions, 0, sizeof(g_texture_dimensions));
     memset(g_texture_cube, 0, sizeof(g_texture_cube));
+    memset(g_texture_shadow, 0, sizeof(g_texture_shadow));
     memset(g_texture_luminance, 0, sizeof(g_texture_luminance));
     memset(g_bump_env, 0, sizeof(g_bump_env));
     memset(g_color_key_mode, 0, sizeof(g_color_key_mode));
     memset(g_color_key, 0, sizeof(g_color_key));
     memset(g_color_key_mask, 0, sizeof(g_color_key_mask));
     g_z_perspective = 0;
+    g_shadow_func = 0;
     g_definition_active = FALSE;
     memset(g_definition, 0, sizeof(g_definition));
     g_dirty = TRUE;
@@ -1546,22 +1585,35 @@ void d3d8_combiners_set_texture_binding(
 {
     uint8_t normalized_dimension;
     uint8_t normalized_cube;
+    uint8_t normalized_shadow;
     uint8_t normalized_luminance;
     uint32_t color_key_mask;
     if (stage >= NV2A_MAX_TEXTURES)
         return;
     normalized_dimension = dimensionality == 3u ? 3u : 2u;
     normalized_cube = cube ? 1u : 0u;
+    normalized_shadow = format == 0x2Eu || format == 0x2Fu;
     normalized_luminance = luminance ? 1u : 0u;
     color_key_mask = xbox_d3d8_color_key_mask(format);
     if (g_texture_dimensions[stage] != normalized_dimension ||
         g_texture_cube[stage] != normalized_cube ||
+        g_texture_shadow[stage] != normalized_shadow ||
         g_texture_luminance[stage] != normalized_luminance ||
         g_color_key_mask[stage] != color_key_mask) {
         g_texture_dimensions[stage] = normalized_dimension;
         g_texture_cube[stage] = normalized_cube;
+        g_texture_shadow[stage] = normalized_shadow;
         g_texture_luminance[stage] = normalized_luminance;
         g_color_key_mask[stage] = color_key_mask;
+        g_dirty = TRUE;
+    }
+}
+
+void d3d8_combiners_set_shadow_func(UINT func)
+{
+    uint8_t normalized = (uint8_t)func;
+    if (g_shadow_func != normalized) {
+        g_shadow_func = normalized;
         g_dirty = TRUE;
     }
 }
@@ -1638,6 +1690,7 @@ BOOL d3d8_combiners_prepare_draw(void)
             g_combiner_state.texture_dimensions[i] =
                 g_texture_dimensions[i];
             g_combiner_state.texture_cube[i] = g_texture_cube[i];
+            g_combiner_state.texture_shadow[i] = g_texture_shadow[i];
             g_combiner_state.texture_luminance[i] =
                 g_texture_luminance[i];
             g_combiner_state.color_key_mode[i] = g_color_key_mode[i];
@@ -1654,6 +1707,7 @@ BOOL d3d8_combiners_prepare_draw(void)
             }
         }
         g_combiner_state.z_perspective = g_z_perspective;
+        g_combiner_state.shadow_func = g_shadow_func;
         g_current_shader_handle =
             combiner_shader_handle(&g_combiner_state);
         if (!g_current_shader_handle)

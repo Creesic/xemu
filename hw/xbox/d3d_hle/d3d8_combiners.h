@@ -241,6 +241,9 @@ typedef struct NV2ACombinerState {
      * independent. PROJECT2D, for example, samples a cube resource through
      * the Xbox 2D-projective-to-cube remap when CUBEMAP_ENABLE is set. */
     uint8_t texture_cube[NV2A_MAX_TEXTURES];
+    /* X8Y24 depth bindings turn PROJECT2D into PROJECT3D and return the
+     * configured shadow comparison replicated across RGBA. */
+    uint8_t texture_shadow[NV2A_MAX_TEXTURES];
     uint8_t dot_map[NV2A_MAX_TEXTURES];
     uint8_t input_texture[NV2A_MAX_TEXTURES];
     /* Single-channel luminance (LU_IMAGE_Y16) uploads as R16_UNORM, which
@@ -257,6 +260,7 @@ typedef struct NV2ACombinerState {
      * Requires invalidating the combiner shader when the bit toggles -- MM3
      * flips it ~16x/frame and SET_CONTROL0 is not a combiner register. */
     uint8_t z_perspective;
+    uint8_t shadow_func;
 
     /* Bump-environment state for texture-shader modes 6 (BUMPENVMAP) and
      * 7 (BUMPENVMAP_LUM), per stage: 2x2 texcoord perturbation matrix in
@@ -388,6 +392,9 @@ void d3d8_combiners_mark_constants_dirty(void);
  */
 void d3d8_combiners_set_texture_binding(
     UINT stage, UINT dimensionality, BOOL cube, BOOL luminance, UINT format);
+
+/** Record NV097_SET_SHADOW_DEPTH_FUNC (normalized hardware value 0..7). */
+void d3d8_combiners_set_shadow_func(UINT func);
 
 /** Record an immediate Xbox bump-environment texture-state leaf. */
 BOOL d3d8_combiners_set_bump_env(UINT stage, UINT type, DWORD value);

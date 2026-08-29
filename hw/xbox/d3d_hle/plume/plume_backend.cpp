@@ -827,7 +827,8 @@ void xgpu_plume_clear_depth_stencil(uint32_t clear_depth,
 }
 
 void xgpu_plume_set_surface_texture(uint32_t stage, uint32_t guest,
-                                    uint32_t unnormalized_coords)
+                                    uint32_t unnormalized_coords,
+                                    uint32_t texture_format)
 {
     if (stage >= 4u || !present_ensure_init())
         return;
@@ -840,7 +841,8 @@ void xgpu_plume_set_surface_texture(uint32_t stage, uint32_t guest,
             return;
         g_draw.ensureBackbufferMirror(g_ctx, guest);
     }
-    g_draw.setSurfaceTexture(stage, guest, unnormalized_coords);
+    g_draw.setSurfaceTexture(stage, guest, unnormalized_coords,
+                             texture_format);
     ++g_texture_binding_serial[stage];
 }
 

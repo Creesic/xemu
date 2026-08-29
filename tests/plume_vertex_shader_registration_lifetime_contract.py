@@ -1,10 +1,11 @@
-"""Contract: registering a new vertex shader cannot destroy in-flight PSOs."""
+"""Contract: reusable guest shader handles record immutable shader IDs."""
 
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DRAW = (ROOT / "hw/xbox/d3d_hle/plume/plume_draw.cpp").read_text()
+HEADER = (ROOT / "hw/xbox/d3d_hle/plume/plume_draw.h").read_text()
 
 
 def function(signature):
@@ -22,12 +23,22 @@ def function(signature):
 
 
 register = function("bool PlumeDraw::registerVertexShader(")
-replacement = register.index("if (existing != m_vsReg.end())")
-retire_shader = register.index("m_liveRetiredShaders.push_back", replacement)
-retire_pipelines = register.index("m_liveRetiredPipelines.push_back", replacement)
-clear_pipelines = register.index("m_progPsos.clear()", replacement)
-assert replacement < retire_shader < clear_pipelines
-assert replacement < retire_pipelines < clear_pipelines
-assert register.count("m_progPsos.clear()") == 1
+activate = function("void PlumeDraw::setActiveVertexShader(")
+record = function("void PlumeDraw::recordDraw(")
+
+assert "m_vsByKey" in HEADER
+assert "m_vsHandleMap" in HEADER
+assert "uint32_t m_vsNext = 1;" in HEADER
+assert "auto duplicate = m_vsByKey.find(key);" in register
+assert "m_vsHandleMap[handle] = duplicate->second;" in register
+assert "const uint32_t stableHandle = m_vsNext++;" in register
+assert "m_vsReg.emplace(stableHandle, std::move(shader));" in register
+assert "m_vsByKey.emplace(std::move(key), stableHandle);" in register
+assert "m_vsHandleMap[handle] = stableHandle;" in register
+assert "m_vsReg[handle]" not in register
+assert "m_progPsos.clear()" not in register
+assert "m_vsHandleMap.find(handle)" in activate
+assert "m_activeVS = shader != m_vsHandleMap.end() ? shader->second : 0;" in activate
+assert "const uint32_t vsH = m_vsReg.find(m_activeVS)" in record
 
 print("plume_vertex_shader_registration_lifetime_contract: OK")

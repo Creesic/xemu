@@ -385,6 +385,17 @@ static void vsh_write_masked(NV2AVshVec *destination,
     }
 }
 
+static uint8_t vsh_output_write_mask(NV2AVshOutputReg output,
+                                     uint8_t mask)
+{
+    static const uint8_t fog_mask[16] = {
+        0x0, 0x8, 0x8, 0xC, 0x8, 0xC, 0xC, 0xE,
+        0x8, 0xC, 0xC, 0xE, 0xC, 0xE, 0xE, 0xF,
+    };
+
+    return output == NV2A_VSH_OUT_FOG ? fog_mask[mask & 0xFu] : mask;
+}
+
 static void vsh_write_destination(const NV2AVshDstOperand *destination,
                                   const NV2AVshVec *value,
                                   NV2AVshVec temps[13],
@@ -401,8 +412,10 @@ static void vsh_write_destination(const NV2AVshDstOperand *destination,
     if (destination->output_reg != NV2A_VSH_OUT_NONE &&
         destination->output_reg < 16 &&
         destination->output_write_mask) {
+        uint8_t mask = vsh_output_write_mask(
+            destination->output_reg, destination->output_write_mask);
         vsh_write_masked(&outputs[destination->output_reg], value,
-                         destination->output_write_mask);
+                         mask);
     }
 }
 
@@ -802,10 +815,12 @@ static void emit_dest_assign(StrBuf *sb, const NV2AVshDstOperand *dst,
         dst->output_write_mask != 0) {
         const char *name = output_reg_name(dst->output_reg);
         if (name) {
+            uint8_t mask = vsh_output_write_mask(dst->output_reg,
+                                                 dst->output_write_mask);
             sb_append(sb, "    %s", name);
-            emit_write_mask(sb, dst->output_write_mask);
+            emit_write_mask(sb, mask);
             sb_append(sb, " = (%s)", rhs);
-            emit_write_mask(sb, dst->output_write_mask);
+            emit_write_mask(sb, mask);
             sb_append(sb, ";\n");
         }
     }
@@ -1104,8 +1119,8 @@ static void vsh_raw_input(uint32_t format, int attr,
         *decl = "float4";
         if (type == 1 && count == 3)
             /* S1 x3: no 16-bit 3-component DXGI format exists, so the layout
-             * binds R16G16B16A16_SNORM and over-reads a 4th short into .w;
-             * use .xyz and restore the decoder's w=1 default. */
+             * binds a host-repacked R16G16B16A16_SNORM element; use .xyz and
+             * restore the decoder's w=1 default. */
             snprintf(unpack, usz, "float4(input.v%d.xyz, 1.0)", attr);
         else
             snprintf(unpack, usz, "input.v%d", attr);

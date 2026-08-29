@@ -48,11 +48,16 @@ assert bound_lookup < bound_validation < global_fallback
 # bytes with QEMU's existing fast hash before accepting the cache hit, and bump
 # the shared generation when the published payload changed.
 content_hash = switch_texture.index("content_hash = fast_hash(")
-cache_bind = switch_texture.index("xgpu_plume_bind_texture_if_cached(&binding)")
+cache_bind = switch_texture.index(
+    "xgpu_plume_bind_texture_if_cached(&cache_binding)"
+)
 assert content_hash < cache_bind
 assert "texture->uploaded_content_hash != content_hash" in switch_texture
 assert "texture->version = ++g_hle_texture_version" in switch_texture
 assert "texture->uploaded_content_hash = content_hash" in switch_texture
+assert "texture->uploaded_content_hash == content_hash" in switch_texture
+assert "binding.version = texture->uploaded_version" in switch_texture
+assert "!xgpu_plume_f2_active()" not in switch_texture
 assert '#include "qemu/fast-hash.h"' in GUEST
 
 # Resource_Register is the publication boundary for caller-owned texture

@@ -15,6 +15,7 @@
 #include "plume/plume_host.h"
 #include "platform/host_events.h"
 #include "platform/cpu_recorder.h"
+#include "hw/xbox/nv2a/nv2a_regs.h"
 #include "xgpu_renderer.h"
 
 #include <limits.h>
@@ -133,6 +134,8 @@ typedef struct PgraphHostZeta {
     UINT width;
     UINT height;
     UINT pitch;
+    UINT format;
+    BOOL floating;
 } PgraphHostZeta;
 static PgraphHostZeta g_pgraph_zeta[PGRAPH_MAX_SURFACES];
 static UINT g_pgraph_zeta_count;
@@ -327,6 +330,15 @@ static PgraphHostSurface *find_surface(uint32_t offset)
     for (i = 0; i < g_pgraph_surface_count; ++i)
         if (g_pgraph_surfaces[i].offset == offset)
             return &g_pgraph_surfaces[i];
+    return NULL;
+}
+
+static PgraphHostZeta *find_zeta(uint32_t offset)
+{
+    UINT i;
+    for (i = 0; i < g_pgraph_zeta_count; ++i)
+        if (g_pgraph_zeta[i].offset == offset)
+            return &g_pgraph_zeta[i];
     return NULL;
 }
 
@@ -676,6 +688,8 @@ int d3d8_PgraphSetRenderTarget(const XgpuSurfaceBinding *binding)
                 zeta->height = binding->zeta_height
                     ? binding->zeta_height : image_height;
                 zeta->pitch = binding->zeta_pitch;
+                zeta->format = binding->zeta_format;
+                zeta->floating = binding->zeta_float != 0;
             }
         }
     }
@@ -690,8 +704,16 @@ int d3d8_PgraphBindSurfaceTextureStage(
     uint32_t texture_format)
 {
     PgraphHostSurface *surface = find_surface(offset);
+    PgraphHostZeta *zeta = find_zeta(offset);
     if (stage >= MAX_TEXTURE_STAGES)
         return 0;
+    if (texture_format ==
+            NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_X8_Y24_FIXED &&
+        zeta && zeta->format == XGPU_ZETA_Z24S8 && !zeta->floating) {
+        xgpu_plume_set_surface_texture(
+            stage, offset, unnormalized_coords, texture_format);
+        return 1;
+    }
     /*
      * One Xbox VRAM allocation may be rebound with a different logical
      * extent and then sampled immediately (for example, a 640x480 light
@@ -715,7 +737,7 @@ int d3d8_PgraphBindSurfaceTextureStage(
         return 0;
     }
     xgpu_plume_set_surface_texture(
-        stage, offset, unnormalized_coords);
+        stage, offset, unnormalized_coords, texture_format);
     return 1;
 }
 

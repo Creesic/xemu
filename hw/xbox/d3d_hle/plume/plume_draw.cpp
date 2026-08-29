@@ -21,6 +21,7 @@
 #include "../d3d8_swizzle.h"
 #include "../d3d8_vsh.h"
 #include "../kernel/xbox_memory_layout.h"
+#include "../../nv2a/nv2a_regs.h"
 /* NV2A pgraph YUV oracle: BT.601 integer conversion shared with xemu's
  * native texture path (convert_yuy2_to_rgb / convert_uyvy_to_rgb). */
 #include "../../nv2a/pgraph/util.h"
@@ -432,6 +433,122 @@ void f2_dump_pixel_shader(uint32_t handle, const std::string &hlsl)
 static ::plume::RenderFormat nv2a_attr_render_format(uint32_t format);
 static uint32_t nv2a_attr_host_size(uint32_t format);
 
+struct Nv2aVertexRepackLayout {
+    uint16_t mask = 0;
+    uint32_t offset[16] = {};
+    uint32_t minimumStride = 0;
+};
+
+static uint32_t nv2a_attr_guest_size(uint32_t format)
+{
+    switch (format & 0xFFu) {
+    case 0x31u: /* NORMSHORT3 */
+    case 0x35u: /* SHORT3 */
+        return 6;
+    case 0x34u: /* PBYTE3 */
+        return 3;
+    default:
+        return nv2a_attr_host_size(format);
+    }
+}
+
+template <typename Format, typename Offset>
+static bool nv2a_build_vertex_repack_layout(
+    const Format *format, const Offset *offset, const uint8_t *stream,
+    uint16_t attributesPresent, uint16_t inputsRead,
+    Nv2aVertexRepackLayout *layout)
+{
+    if (!format || !offset || !layout)
+        return false;
+
+    Nv2aVertexRepackLayout result;
+    const uint16_t used = attributesPresent & inputsRead;
+    bool needsRepack = false;
+    for (uint32_t attr = 0; attr < 16; ++attr) {
+        if (!(used & (uint16_t)(1u << attr)) ||
+            (stream && stream[attr] != 0))
+            continue;
+        const uint32_t guestSize = nv2a_attr_guest_size(format[attr]);
+        const uint32_t hostSize = nv2a_attr_host_size(format[attr]);
+        const uint32_t guestOffset = offset[attr];
+        if (!guestSize || !hostSize ||
+            guestOffset > UINT32_MAX - guestSize)
+            return false;
+        if (guestSize != hostSize)
+            needsRepack = true;
+    }
+    if (!needsRepack) {
+        *layout = result;
+        return true;
+    }
+
+    uint32_t cursor = 0;
+    for (uint32_t attr = 0; attr < 16; ++attr) {
+        if (!(used & (uint16_t)(1u << attr)) ||
+            (stream && stream[attr] != 0))
+            continue;
+        const uint32_t hostSize = nv2a_attr_host_size(format[attr]);
+        const uint32_t alignment =
+            (hostSize & (hostSize - 1u)) == 0u ? hostSize : 4u;
+        if (cursor > UINT32_MAX - (alignment - 1u))
+            return false;
+        cursor = (cursor + alignment - 1u) & ~(alignment - 1u);
+        result.mask |= (uint16_t)(1u << attr);
+        result.offset[attr] = cursor;
+        if (cursor > UINT32_MAX - hostSize)
+            return false;
+        cursor += hostSize;
+    }
+    result.minimumStride = cursor;
+    *layout = result;
+    return true;
+}
+
+template <typename Format, typename Offset>
+static bool nv2a_repack_vertex_array(
+    std::vector<uint8_t> &destination, const void *source,
+    uint32_t vertexCount, uint32_t sourceStride, const Format *format,
+    const Offset *guestOffset, const Nv2aVertexRepackLayout &layout,
+    uint32_t *destinationStride)
+{
+    if (!source || !vertexCount || !sourceStride || !format || !guestOffset ||
+        !layout.mask || !destinationStride)
+        return false;
+
+    for (uint32_t attr = 0; attr < 16; ++attr) {
+        if (!(layout.mask & (uint16_t)(1u << attr)))
+            continue;
+        const uint32_t guestSize = nv2a_attr_guest_size(format[attr]);
+        if (guestOffset[attr] > sourceStride ||
+            guestSize > sourceStride - guestOffset[attr])
+            return false;
+    }
+
+    const uint32_t stagedStride =
+        std::max(sourceStride, layout.minimumStride);
+    const uint64_t stagedBytes =
+        (uint64_t)vertexCount * (uint64_t)stagedStride;
+    if (stagedBytes > UINT32_MAX || stagedBytes > SIZE_MAX)
+        return false;
+
+    destination.assign((size_t)stagedBytes, 0u);
+    const uint8_t *sourceBytes = static_cast<const uint8_t *>(source);
+    for (uint32_t vertex = 0; vertex < vertexCount; ++vertex) {
+        uint8_t *staged = destination.data() + (size_t)vertex * stagedStride;
+        const uint8_t *guest = sourceBytes + (size_t)vertex * sourceStride;
+        for (uint32_t attr = 0; attr < 16; ++attr) {
+            if (!(layout.mask & (uint16_t)(1u << attr)))
+                continue;
+            std::memcpy(staged + layout.offset[attr],
+                        guest + guestOffset[attr],
+                        nv2a_attr_guest_size(format[attr]));
+        }
+    }
+
+    *destinationStride = stagedStride;
+    return true;
+}
+
 static void plume_upload_layout(RenderFormat pf, uint32_t widthPx,
                                 uint32_t *outRowWidthPx, uint32_t *outRowPitch)
 {
@@ -786,7 +903,7 @@ bool PlumeDraw::reconfigureRenderExtent(
             RenderTextureDesc::DepthTarget(zeta.physicalWidth,
                                            zeta.physicalHeight,
                                            zeta.format));
-        if (!zeta.texture)
+        if (!zeta.texture || !ensureZetaSampleView(ctx, zeta))
             return false;
         newZeta.emplace(entry.first, std::move(zeta));
     }
@@ -1162,23 +1279,23 @@ bool PlumeDraw::initPipelines(PlumeContext &ctx)
 
         const std::string kProgVS = std::string(ndcScaleHlslDeclaration()) +
             "struct VSOut { float4 pos:SV_Position; float4 col0:COLOR0; float4 col1:COLOR1;\n"
-            "  float4 uv0:TEXCOORD0; float4 uv1:TEXCOORD1; float4 uv2:TEXCOORD2; float4 uv3:TEXCOORD3; };\n"
+            "  float4 uv0:TEXCOORD0; float4 uv1:TEXCOORD1; float4 uv2:TEXCOORD2; float4 uv3:TEXCOORD3; float fog:FOG; };\n"
             "float4 xf(float4 p){ float w=ndcScale.homogeneous!=0.0&&abs(p.w)>1.0e-20?rcp(p.w):1.0; float4 o;\n"
             "  o.x=(p.x+ndcScale.screenSpaceOffset)/ndcScale.halfW-1.0;\n"
             "  o.y=1.0-(p.y+ndcScale.screenSpaceOffset)/ndcScale.halfH; o.z=p.z; o.xyz*=w; o.w=w; return o; }\n"
             "VSOut fill1(float4 pos, float4 col0, float4 col1, float4 uv){\n"
             "  VSOut o; o.pos=xf(pos); o.col0=col0; o.col1=col1;\n"
-            "  o.uv0=uv; o.uv1=uv; o.uv2=uv; o.uv3=uv; return o; }\n"
+            "  o.uv0=uv; o.uv1=uv; o.uv2=uv; o.uv3=uv; o.fog=col1.a; return o; }\n"
             "VSOut fill2(float4 pos, float4 col0, float4 col1, float4 uv0, float4 uv1){\n"
             "  VSOut o; o.pos=xf(pos); o.col0=col0; o.col1=col1;\n"
-            "  o.uv0=uv0; o.uv1=uv1; o.uv2=uv0; o.uv3=uv0; return o; }\n"
+            "  o.uv0=uv0; o.uv1=uv1; o.uv2=uv0; o.uv3=uv0; o.fog=col1.a; return o; }\n"
             "VSOut fill3(float4 pos, float4 col0, float4 col1, float4 uv0, float4 uv1, float4 uv2){\n"
             "  VSOut o; o.pos=xf(pos); o.col0=col0; o.col1=col1;\n"
-            "  o.uv0=uv0; o.uv1=uv1; o.uv2=uv2; o.uv3=uv0; return o; }\n"
+            "  o.uv0=uv0; o.uv1=uv1; o.uv2=uv2; o.uv3=uv0; o.fog=col1.a; return o; }\n"
             "VSOut fill4(float4 pos, float4 col0, float4 col1,\n"
             "            float4 uv0, float4 uv1, float4 uv2, float4 uv3){\n"
             "  VSOut o; o.pos=xf(pos); o.col0=col0; o.col1=col1;\n"
-            "  o.uv0=uv0; o.uv1=uv1; o.uv2=uv2; o.uv3=uv3; return o; }\n"
+            "  o.uv0=uv0; o.uv1=uv1; o.uv2=uv2; o.uv3=uv3; o.fog=col1.a; return o; }\n"
             "struct In000{ float4 pos:POSITION; };\n"
             "VSOut VS000(In000 i){ return fill1(i.pos,float4(1,1,1,1),float4(0,0,0,1),float4(0,0,0,1)); }\n"
             "struct In001{ float4 pos:POSITION; float4 uv:TEXCOORD0; };\n"
@@ -2300,6 +2417,37 @@ bool PlumeDraw::ensureColorSurface(PlumeContext &ctx, uint64_t generation,
     return true;
 }
 
+bool PlumeDraw::ensureZetaSampleView(PlumeContext &ctx,
+                                     PlumeZetaSurface &zeta)
+{
+    if (zeta.format != RenderFormat::D32_FLOAT_S8_UINT)
+        return true;
+    if (zeta.sampledView && zeta.sampledDescSet)
+        return true;
+
+    RenderTextureViewDesc viewDesc =
+        RenderTextureViewDesc::Texture2D(zeta.format);
+    viewDesc.componentMapping = RenderComponentMapping(
+        RenderSwizzle::R, RenderSwizzle::ONE,
+        RenderSwizzle::ZERO, RenderSwizzle::ZERO);
+    zeta.sampledView = zeta.texture->createTextureView(viewDesc);
+
+    const RenderSampler *immutableTexSampler = m_texSampler.get();
+    RenderDescriptorRange ranges[2] = {
+        RenderDescriptorRange(RenderDescriptorRangeType::TEXTURE, 0, 1),
+        RenderDescriptorRange(RenderDescriptorRangeType::SAMPLER, 1, 1,
+                              &immutableTexSampler),
+    };
+    zeta.sampledDescSet = ctx.device()->createDescriptorSet(
+        RenderDescriptorSetDesc(ranges, 2));
+    if (!zeta.sampledView || !zeta.sampledDescSet)
+        return false;
+    zeta.sampledDescSet->setTexture(
+        0, zeta.texture.get(), RenderTextureLayout::SHADER_READ,
+        zeta.sampledView.get());
+    return true;
+}
+
 bool PlumeDraw::ensureBackbufferMirror(PlumeContext &ctx, uint32_t guest)
 {
     /*
@@ -3077,6 +3225,8 @@ bool PlumeDraw::applySurfaceBinding(
             zetaIt = m_zetaCache.emplace(ids.zeta_generation,
                                          std::move(zeta)).first;
         }
+        if (!ensureZetaSampleView(ctx, zetaIt->second))
+            return false;
         /* Guest identity, refreshed every bind: a texture aliasing this
          * address needs the depth resolved back to guest memory. */
         zetaIt->second.guestAddr = binding.zeta_guest_address;
@@ -3219,7 +3369,8 @@ void PlumeDraw::clearDepthStencil(bool clearDepth, bool clearStencil,
 }
 
 bool PlumeDraw::setSurfaceTexture(uint32_t stage, uint32_t guest,
-                                  uint32_t unnormalizedCoords)
+                                  uint32_t unnormalizedCoords,
+                                  uint32_t textureFormat)
 {
     if (stage >= 4)
         return false;
@@ -3228,10 +3379,18 @@ bool PlumeDraw::setSurfaceTexture(uint32_t stage, uint32_t guest,
     m_curSurfaceUnnormalized[stage] = 0;
     if (!guest)
         return true;
-    auto latest = m_guestLatestSurfaceGeneration.find(guest);
-    if (latest == m_guestLatestSurfaceGeneration.end())
-        return false;
-    m_curSurfaceStage[stage] = latest->second;
+    if (textureFormat ==
+        NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_DEPTH_X8_Y24_FIXED) {
+        auto latest = m_guestLatestZetaGeneration.find(guest);
+        if (latest == m_guestLatestZetaGeneration.end())
+            return false;
+        m_curSurfaceStage[stage] = latest->second;
+    } else {
+        auto latest = m_guestLatestSurfaceGeneration.find(guest);
+        if (latest == m_guestLatestSurfaceGeneration.end())
+            return false;
+        m_curSurfaceStage[stage] = latest->second;
+    }
     m_curSurfaceUnnormalized[stage] = unnormalizedCoords ? 1u : 0u;
     return true;
 }
@@ -3306,6 +3465,12 @@ template <class Draw>
                                    : it->second.texture.get();
                 views[s] = self ? it->second.snapshotView.get()
                                 : it->second.view.get();
+            } else {
+                auto zeta = m_zetaCache.find(draw.surfaceStage[s]);
+                if (zeta != m_zetaCache.end()) {
+                    textures[s] = zeta->second.texture.get();
+                    views[s] = zeta->second.sampledView.get();
+                }
             }
         } else {
             PlumeTex *texture = resolveTextureBinding(draw.stageTexture[s]);
@@ -3583,6 +3748,16 @@ void PlumeDraw::pollPixelShaderOverrides(PlumeContext &ctx)
             return nullptr;
         }
         if (vsIt->second.hasDeclaration) {
+            Nv2aVertexRepackLayout repack;
+            if (!nv2a_build_vertex_repack_layout(
+                    vsIt->second.format.data(), vsIt->second.offset.data(),
+                    vsIt->second.stream.data(),
+                    vsIt->second.attributesPresent,
+                    vsIt->second.inputsRead, &repack)) {
+                if (failure)
+                    failure->reason = "invalid-declaration";
+                return nullptr;
+            }
             const uint16_t latchInputs =
                 (uint16_t)(vsIt->second.inputsRead &
                            (uint16_t)~vsIt->second.attributesPresent);
@@ -3598,6 +3773,11 @@ void PlumeDraw::pollPixelShaderOverrides(PlumeContext &ctx)
                 return nullptr;
             }
             const uint32_t sourceStride = stride - latchBytes;
+            if (repack.mask && sourceStride < repack.minimumStride) {
+                if (failure)
+                    failure->reason = "repack-stride";
+                return nullptr;
+            }
             uint32_t latchOffset = sourceStride;
             for (uint32_t input = 0; input < 16; ++input) {
                 if (!(vsIt->second.inputsRead & (1u << input)))
@@ -3623,7 +3803,8 @@ void PlumeDraw::pollPixelShaderOverrides(PlumeContext &ctx)
                     nv2a_attr_render_format(vsIt->second.format[input]);
                 uint32_t size =
                     nv2a_attr_host_size(vsIt->second.format[input]);
-                uint32_t offset = vsIt->second.offset[input];
+                uint32_t offset = repack.mask & (uint16_t)(1u << input)
+                    ? repack.offset[input] : vsIt->second.offset[input];
                 if (format == RenderFormat::UNKNOWN || size == 0) {
                     if (failure) {
                         failure->reason = "unsupported-format";
@@ -3787,6 +3968,13 @@ std::array<float, 16> PlumeDraw::snapshotProgramTextureScales() const
                 width = surface->second.width;
                 height = surface->second.height;
                 unnormalized = m_curSurfaceUnnormalized[stage];
+            } else {
+                auto zeta = m_zetaCache.find(m_curSurfaceStage[stage]);
+                if (zeta != m_zetaCache.end()) {
+                    width = zeta->second.width;
+                    height = zeta->second.height;
+                    unnormalized = m_curSurfaceUnnormalized[stage];
+                }
             }
         }
         const std::array<float, 4> textureScale =
@@ -3906,6 +4094,30 @@ void PlumeDraw::recordDraw(PlumeContext &ctx, uint32_t primType, uint32_t primCo
         vsH || !fixedTexcoordsValid ? 0u : fixedTexcoords.count;
     const uint8_t *src = (const uint8_t *)verts;
     const uint8_t hasUV = texCount >= 1u ? 1u : 0u;
+    std::vector<uint8_t> repackedVertices;
+    if (vsH) {
+        const auto vsIt = m_vsReg.find(vsH);
+        if (vsIt != m_vsReg.end() && vsIt->second.hasDeclaration) {
+            Nv2aVertexRepackLayout repack;
+            if (!nv2a_build_vertex_repack_layout(
+                    vsIt->second.format.data(), vsIt->second.offset.data(),
+                    vsIt->second.stream.data(),
+                    vsIt->second.attributesPresent,
+                    vsIt->second.inputsRead, &repack))
+                return;
+            if (repack.mask) {
+                uint32_t repackedStride = 0;
+                if (!nv2a_repack_vertex_array(
+                        repackedVertices, src, vc, stride,
+                        vsIt->second.format.data(),
+                        vsIt->second.offset.data(), repack,
+                        &repackedStride))
+                    return;
+                src = repackedVertices.data();
+                stride = repackedStride;
+            }
+        }
+    }
     std::vector<uint8_t> latchedVertices;
     if (vsH) {
         const auto vsIt = m_vsReg.find(vsH);
@@ -4334,9 +4546,35 @@ bool PlumeDraw::recordCachedIndexedDraw(PlumeContext &ctx,
     const uint8_t *uniqueVerts =
         static_cast<const uint8_t *>(draw.vertices) +
         (size_t)(minimum - draw.base_vertex) * draw.stride;
-    const uint32_t uniqueBytes = uniqueCount * draw.stride;
+    uint32_t cachedStride = draw.stride;
+    Nv2aVertexRepackLayout repack;
+    const auto vsIt = m_vsReg.find(m_activeVS);
+    if (vsIt != m_vsReg.end() && vsIt->second.hasDeclaration) {
+        if (!nv2a_build_vertex_repack_layout(
+                vsIt->second.format.data(), vsIt->second.offset.data(),
+                vsIt->second.stream.data(), vsIt->second.attributesPresent,
+                vsIt->second.inputsRead, &repack))
+            return false;
+        if (repack.mask)
+            cachedStride = std::max(cachedStride, repack.minimumStride);
+    }
+    const uint64_t uniqueBytes64 =
+        (uint64_t)uniqueCount * (uint64_t)cachedStride;
+    if (uniqueBytes64 > UINT32_MAX)
+        return false;
+    const uint32_t uniqueBytes = (uint32_t)uniqueBytes64;
 
     if (!id) {
+        std::vector<uint8_t> repackedVertices;
+        const uint8_t *cachedVertices = uniqueVerts;
+        if (repack.mask) {
+            if (!nv2a_repack_vertex_array(
+                    repackedVertices, uniqueVerts, uniqueCount, draw.stride,
+                    vsIt->second.format.data(), vsIt->second.offset.data(),
+                    repack, &cachedStride))
+                return false;
+            cachedVertices = repackedVertices.data();
+        }
         id = plume_mesh_cache_store(&key, draw.vb_generation,
                                     draw.ib_generation, uniqueCount,
                                     draw.index_count);
@@ -4353,7 +4591,7 @@ bool PlumeDraw::recordCachedIndexedDraw(PlumeContext &ctx,
                 (size_t)draw.index_count * sizeof(uint32_t),
                 RenderHeapType::UPLOAD));
         if (!mesh.vb || !mesh.ib ||
-            !copyToMappedBuffer(mesh.vb.get(), uniqueVerts, uniqueBytes) ||
+            !copyToMappedBuffer(mesh.vb.get(), cachedVertices, uniqueBytes) ||
             !copyToMappedBuffer(mesh.ib.get(), remapped.data(),
                                 remapped.size() * sizeof(uint32_t))) {
             mesh = CachedMeshGpu();
@@ -4361,7 +4599,7 @@ bool PlumeDraw::recordCachedIndexedDraw(PlumeContext &ctx,
         }
         mesh.vbBytes = uniqueBytes;
         mesh.indexCount = draw.index_count;
-        mesh.stride = draw.stride;
+        mesh.stride = cachedStride;
         m_cachedMisses++;
     } else {
         m_cachedHits++;
@@ -4433,10 +4671,10 @@ static ::plume::RenderFormat nv2a_attr_render_format(uint32_t format)
              : count == 2 ? RF::R32G32_FLOAT : RF::R32_FLOAT;
     case 0: return RF::B8G8R8A8_UNORM; /* UB_D3D (BGRA) */
     case 4: return RF::R8G8B8A8_UNORM; /* UB_OGL (RGBA) */
-    case 1: /* S1: normalized short (count 3 over-reads into .w) */
+    case 1: /* S1: normalized short (count 3 is host-repacked) */
         return count >= 3 ? RF::R16G16B16A16_SNORM
              : count == 2 ? RF::R16G16_SNORM : RF::R16_SNORM;
-    case 5: /* S32K: raw short (count 3 over-reads into .w) */
+    case 5: /* S32K: raw short (count 3 is host-repacked) */
         return count >= 3 ? RF::R16G16B16A16_SINT
              : count == 2 ? RF::R16G16_SINT : RF::R16_SINT;
     case 6: return RF::R32_SINT; /* CMP */
@@ -4456,14 +4694,14 @@ static uint32_t nv2a_attr_host_size(uint32_t format)
     case 0x45u: return 8;
     case 0x11u: return 2;
     case 0x21u: return 4;
-    case 0x31u: return 8;  /* no three-component DXGI short format */
+    case 0x31u: return 8;  /* repacked for four-component DXGI format */
     case 0x41u: return 8;
     case 0x16u: return 4;
     case 0x15u: return 2;
-    case 0x35u: return 8;  /* no three-component DXGI short format */
+    case 0x35u: return 8;  /* repacked for four-component DXGI format */
     case 0x14u: return 1;
     case 0x24u: return 2;
-    case 0x34u: return 4;  /* no three-component DXGI byte format */
+    case 0x34u: return 4;  /* repacked for four-component DXGI format */
     case 0x44u: return 4;
     case 0x72u: return 12;
     default: return 0;
@@ -4561,11 +4799,31 @@ XgpuPlumeGpuDrawResult PlumeDraw::recordProgIndexedDraw(
     if (!(fetchInputs | latchInputs))
         return XGPU_PLUME_GPU_FALLBACK_FORMAT;
 
+    const void *vertexData = desc.vertex_data;
+    size_t vertexBytes = desc.vertex_bytes;
+    uint32_t vertexStride = desc.stride;
+    std::vector<uint8_t> repackedVertices;
+    Nv2aVertexRepackLayout repack;
+    if (!nv2a_build_vertex_repack_layout(
+            desc.attr_format, desc.attr_offset, nullptr,
+            desc.attrs_used, fetchInputs, &repack))
+        return XGPU_PLUME_GPU_FALLBACK_FORMAT;
+    if (repack.mask) {
+        if (vertexBytes % vertexStride != 0 ||
+            !nv2a_repack_vertex_array(
+                repackedVertices, vertexData,
+                (uint32_t)(vertexBytes / vertexStride), vertexStride,
+                desc.attr_format, desc.attr_offset, repack, &vertexStride))
+            return XGPU_PLUME_GPU_FALLBACK_RECORD_REJECTION;
+        vertexData = repackedVertices.data();
+        vertexBytes = repackedVertices.size();
+    }
+
     ProgDraw d = {};
     d.afterGeom = (uint32_t)m_rec.draws.size();
     d.psHandle = m_activePS;
     d.vertexProgramKey = m_curVertexProgramKey;
-    d.stride = desc.stride;
+    d.stride = vertexStride;
     d.indexCount = desc.index_count;
     d.viewportZOffset = desc.viewport_z_offset;
     d.viewportZScale = desc.viewport_z_scale;
@@ -4575,7 +4833,8 @@ XgpuPlumeGpuDrawResult PlumeDraw::recordProgIndexedDraw(
     d.attrsUsed = (uint16_t)(fetchInputs | latchInputs);
     for (int i = 0; i < 16; i++) {
         d.attrFormat[i] = desc.attr_format[i];
-        d.attrOffset[i] = desc.attr_offset[i];
+        d.attrOffset[i] = repack.mask & (uint16_t)(1u << i)
+            ? repack.offset[i] : desc.attr_offset[i];
     }
     switch ((D3DPRIMITIVETYPE)desc.prim_type) {
     case D3DPT_TRIANGLESTRIP:
@@ -4614,8 +4873,8 @@ XgpuPlumeGpuDrawResult PlumeDraw::recordProgIndexedDraw(
     if (latchInputs) {
         LatchedVertexStream stream = {};
         if (!materializeLatchedVertexStream(
-                m_rec.frameRawVerts, m_rec.frameIndices, desc.vertex_data,
-                desc.vertex_bytes, desc.stride, desc.indices,
+                m_rec.frameRawVerts, m_rec.frameIndices, vertexData,
+                vertexBytes, vertexStride, desc.indices,
                 desc.index_count, latchInputs, desc.latched_inputs, &stream))
             return XGPU_PLUME_GPU_FALLBACK_RECORD_REJECTION;
         d.vbufOffset = stream.vertexOffset;
@@ -4630,16 +4889,13 @@ XgpuPlumeGpuDrawResult PlumeDraw::recordProgIndexedDraw(
             d.attrOffset[attr] = stream.latchOffsets[attr];
         }
     } else {
-        /* A few trailing pad bytes cover the over-read of a 4th short for
-         * 3-component S32K/S1 attributes. */
         size_t vbo = (m_rec.frameRawVerts.size() + 15u) & ~size_t(15u);
         m_rec.frameRawVerts.resize(vbo);
         d.vbufOffset = (uint32_t)vbo;
-        d.vbufBytes = desc.vertex_bytes;
-        const uint8_t *vsrc = (const uint8_t *)desc.vertex_data;
+        d.vbufBytes = (uint32_t)vertexBytes;
+        const uint8_t *vsrc = (const uint8_t *)vertexData;
         m_rec.frameRawVerts.insert(
-            m_rec.frameRawVerts.end(), vsrc, vsrc + desc.vertex_bytes);
-        m_rec.frameRawVerts.resize(m_rec.frameRawVerts.size() + 8u, 0u);
+            m_rec.frameRawVerts.end(), vsrc, vsrc + vertexBytes);
 
         d.ibufOffset = (uint32_t)m_rec.frameIndices.size();
         m_rec.frameIndices.insert(m_rec.frameIndices.end(), desc.indices,
@@ -5203,25 +5459,43 @@ bool PlumeDraw::registerVertexShader(
         }
         shader.hasDeclaration = true;
     }
+
+    std::string key = shader.hlsl;
+    key.push_back('\0');
+    key.append(reinterpret_cast<const char *>(&shader.inputsRead),
+               sizeof(shader.inputsRead));
+    key.append(reinterpret_cast<const char *>(&shader.outputsWritten),
+               sizeof(shader.outputsWritten));
+    key.append(reinterpret_cast<const char *>(&shader.attributesPresent),
+               sizeof(shader.attributesPresent));
+    key.append(reinterpret_cast<const char *>(shader.stream.data()),
+               shader.stream.size() * sizeof(shader.stream[0]));
+    key.append(reinterpret_cast<const char *>(shader.format.data()),
+               shader.format.size() * sizeof(shader.format[0]));
+    key.append(reinterpret_cast<const char *>(shader.offset.data()),
+               shader.offset.size() * sizeof(shader.offset[0]));
+    key.push_back(shader.hasDeclaration ? '\1' : '\0');
+
+    auto duplicate = m_vsByKey.find(key);
+    if (duplicate != m_vsByKey.end()) {
+        m_vsHandleMap[handle] = duplicate->second;
+        return true;
+    }
+
     shader.ok = true;
     shader.compileFuture = queueShaderCompile(
         m_recordShaderTarget, shader.hlsl, "vs_6_0");
-    auto existing = m_vsReg.find(handle);
-    if (existing != m_vsReg.end()) {
-        if (existing->second.shader)
-            m_liveRetiredShaders.push_back(
-                std::move(existing->second.shader));
-        for (auto &pipeline : m_progPsos)
-            m_liveRetiredPipelines.push_back(std::move(pipeline.second));
-        m_progPsos.clear();
-    }
-    m_vsReg[handle] = std::move(shader);
+    const uint32_t stableHandle = m_vsNext++;
+    m_vsReg.emplace(stableHandle, std::move(shader));
+    m_vsByKey.emplace(std::move(key), stableHandle);
+    m_vsHandleMap[handle] = stableHandle;
     return true;
 }
 
 void PlumeDraw::setActiveVertexShader(uint32_t handle)
 {
-    m_activeVS = handle;
+    auto shader = m_vsHandleMap.find(handle);
+    m_activeVS = shader != m_vsHandleMap.end() ? shader->second : 0;
 }
 
 void PlumeDraw::setVertexShaderConstants(const float *values,
@@ -6022,14 +6296,18 @@ void PlumeDraw::replayRecording(
         current = layout;
         mark("barrier");
     };
-    auto transitionDepth = [&](PlumeZetaSurface &surface) {
-        if (surface.layout == RenderTextureLayout::DEPTH_WRITE)
+    auto transitionZeta = [&](PlumeZetaSurface &surface,
+                              RenderTextureLayout layout) {
+        if (surface.layout == layout)
             return;
         cl->barriers(RenderBarrierStage::GRAPHICS,
                      RenderTextureBarrier(surface.texture.get(),
-                                          RenderTextureLayout::DEPTH_WRITE));
-        surface.layout = RenderTextureLayout::DEPTH_WRITE;
+                                          layout));
+        surface.layout = layout;
         mark("barrier-z");
+    };
+    auto transitionDepth = [&](PlumeZetaSurface &surface) {
+        transitionZeta(surface, RenderTextureLayout::DEPTH_WRITE);
     };
     bool presentSurfaceCopied = false;
     auto copyPresentTarget = [&]() {
@@ -6175,6 +6453,16 @@ void PlumeDraw::replayRecording(
                                &physicalTargetWidth,
                                &physicalTargetHeight))
             return;
+        for (uint32_t s = 0; s < 4; ++s) {
+            if (pd.targetZetaGeneration &&
+                pd.surfaceStage[s] == pd.targetZetaGeneration) {
+                if (f2On)
+                    xgpu_plume_f2_log(
+                        "p %zu SKIP zeta-feedback stage=%u zg=%llu", pi, s,
+                        (unsigned long long)pd.targetZetaGeneration);
+                return;
+            }
+        }
         if (target) {
             if (m_replayWritten.empty() ||
                 m_replayWritten.back() != pd.targetColorGeneration)
@@ -6251,6 +6539,11 @@ void PlumeDraw::replayRecording(
                 }
                 transitionSurface(sample, RenderTextureLayout::SHADER_READ,
                                   false);
+            } else {
+                auto zeta = m_zetaCache.find(pd.surfaceStage[s]);
+                if (zeta != m_zetaCache.end())
+                    transitionZeta(zeta->second,
+                                   RenderTextureLayout::SHADER_READ);
             }
         }
         cl->setFramebuffer(targetFramebuffer);
@@ -6456,6 +6749,21 @@ void PlumeDraw::replayRecording(
                                &physicalTargetHeight))
             continue;
 
+        bool zetaFeedback = false;
+        for (uint32_t s = 0; s < 4; ++s) {
+            if (d.targetZetaGeneration &&
+                d.surfaceStage[s] == d.targetZetaGeneration) {
+                zetaFeedback = true;
+                if (f2On)
+                    xgpu_plume_f2_log(
+                        "g %zu SKIP zeta-feedback stage=%u zg=%llu", di, s,
+                        (unsigned long long)d.targetZetaGeneration);
+                break;
+            }
+        }
+        if (zetaFeedback)
+            continue;
+
         if (d.clear || d.clearDepth || d.clearStencil || d.vertexCount) {
             if (target) {
                 if ((d.clear || d.vertexCount) &&
@@ -6550,8 +6858,13 @@ void PlumeDraw::replayRecording(
             if (!d.surfaceStage[s])
                 continue;
             auto sampleIt = m_surfaceCache.find(d.surfaceStage[s]);
-            if (sampleIt == m_surfaceCache.end())
+            if (sampleIt == m_surfaceCache.end()) {
+                auto zeta = m_zetaCache.find(d.surfaceStage[s]);
+                if (zeta != m_zetaCache.end())
+                    transitionZeta(zeta->second,
+                                   RenderTextureLayout::SHADER_READ);
                 continue;
+            }
             PlumeColorSurface &sample = sampleIt->second;
             if (d.surfaceStage[s] == d.targetColorGeneration && target) {
                 if (!selfCopied) {
@@ -6733,15 +7046,15 @@ void PlumeDraw::replayRecording(
                 ? boundTexture->descSet.get() : nullptr;
             if (d.surfaceStage[0]) {
                 auto sampleIt = m_surfaceCache.find(d.surfaceStage[0]);
-                if (sampleIt == m_surfaceCache.end()) {
-                    if (f2On)
-                        xgpu_plume_f2_log("g %zu SKIP sample S%llu", di,
-                                          (unsigned long long)d.surfaceStage[0]);
-                    continue;
+                if (sampleIt != m_surfaceCache.end()) {
+                    set = d.surfaceStage[0] == d.targetColorGeneration
+                              ? sampleIt->second.snapshotDescSet.get()
+                              : sampleIt->second.descSet.get();
+                } else {
+                    auto zeta = m_zetaCache.find(d.surfaceStage[0]);
+                    if (zeta != m_zetaCache.end())
+                        set = zeta->second.sampledDescSet.get();
                 }
-                set = d.surfaceStage[0] == d.targetColorGeneration
-                          ? sampleIt->second.snapshotDescSet.get()
-                          : sampleIt->second.descSet.get();
             }
             if (!set) {
                 if (f2On)
